@@ -1,6 +1,5 @@
 import os
 import json
-import logging
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from telegram import Update
@@ -92,29 +91,25 @@ def format_contact(r):
     followup_notes = r.get("Follow Up Notes", "")
     last_updated = r.get("Last Updated", "")
 
-    # Format age line
     if birthday and age:
         age_line = f"- Age: {age}, {format_date(birthday)}"
     elif age:
         age_line = f"- Age: {age}, (unknown birthday)"
     else:
-        age_line = f"- Age: Unknown"
+        age_line = "- Age: Unknown"
 
-    # Format notes as bullet points
     if notes_raw:
         note_items = [n.strip() for n in notes_raw.split(";") if n.strip()]
         notes_formatted = "- Notes:\n" + "\n".join(f"  - {n}" for n in note_items)
     else:
         notes_formatted = "- Notes:\n  - None"
 
-    # Format follow up
     followup_line = ""
     if followup_date:
         followup_line = f"\n- Follow Up: {format_date(followup_date)}"
         if followup_notes:
             followup_line += f"\n  - {followup_notes}"
 
-    # Last updated
     last_updated_line = f"\n_Last updated: {format_date(last_updated)}_" if last_updated else ""
 
     return (
@@ -252,7 +247,7 @@ def search_contacts(keyword):
         records = sheet.get_all_records()
         results = []
         for r in records:
-            if any(keyword.lower() in str(v).lower() for v in r.values()):
+            if any(keyword.modify() in str(v).lower() for v in r.values()):
                 results.append(r)
         if not results:
             return f"❌ No results for '{keyword}'"
@@ -437,41 +432,9 @@ def list_todos():
         return f"❌ Error listing tasks: {str(e)}"
 
 # --- Calendar Functions ---
-def add_calendar_event(data):
-    try:
-        parts = [p.strip() for p in data.split(",")]
-        if len(parts) < 3:
-            return "❌ Format: add event Title, DD/MM/YYYY HH:MM, DD/MM/YYYY HH:MM, calendar name (optional)"
-        title = parts[0]
-        start = datetime.strptime(parts[1], "%d/%m/%Y %H:%M")
-        end = datetime.strptime(parts[2], "%d/%m/%Y %H:%M")
-        notes = parts[3] if len(parts) > 3 else ""
-        cal_name = parts[4] if len(parts) > 4 else None
-        calendar = get_calendar(cal_name) if cal_name else get_calendar()
-        if not calendar:
-            return f"❌ Could not find calendar '{cal_name}'" if cal_name else "❌ Could not connect to iCloud Calendar"
-        ics = (
-            "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\n"
-            f"SUMMARY:{title}\n"
-            f"DTSTART:{start.strftime('%Y%m%dT%H%M%S')}\n"
-            f"DTEND:{end.strftime('%Y%m%dT%H%M%S')}\n"
-            f"DESCRIPTION:{notes}\n"
-            "END:VEVENT\nEND:VCALENDAR"
-        )
-        calendar.add_event(ics)
-        return (
-            f"✅ Event created!\n\n"
-            f"📅 *{title}*\n"
-            f"🕐 {start.strftime('%d %b %Y, %H:%M')} → {end.strftime('%H:%M')}\n"
-            f"📁 Calendar: {calendar.name}\n"
-            + (f"📝 {notes}" if notes else "")
-        )
-    except Exception as e:
-        return f"❌ Error creating event: {str(e)}"
-
 def get_events(days=1):
     try:
-        calendar = get_calendar()
+        calendar = get_calendar("Personal")
         if not calendar:
             return "❌ Could not connect to iCloud Calendar"
         start = datetime.now()
@@ -511,79 +474,7 @@ def delete_calendar_event(title):
     except Exception as e:
         return f"❌ Error deleting event: {str(e)}"
 
-# --- Scheduled Reminders ---
-async def send_followup_reminders(app):
-    try:
-        records = sheet.get_all_records()
-        today = date.today()
-        for r in records:
-            fu_date = r.get("Follow Up Date", "")
-            if fu_date:
-                try:
-                    fu = datetime.strptime(fu_date, "%d/%m/%Y").date()
-                    if fu == today:
-                        message = (
-                            f"🔔 *Follow up reminder!*\n\n"
-                            f"👤 *{r.get('Name')}*\n"
-                            f"📝 {r.get('Follow Up Notes') or 'No notes'}\n\n"
-                            f"Don't forget to reach out today!"
-                        )
-                        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=message, parse_mode="Markdown")
-                except:
-                    pass
-    except Exception as e:
-        print(f"Error sending follow up reminders: {e}")
-
-async def send_birthday_reminders(app):
-    try:
-        records = sheet.get_all_records()
-        today = date.today()
-        for r in records:
-            bday_str = r.get("Birthday", "")
-            if bday_str:
-                try:
-                    bday = datetime.strptime(bday_str, "%d/%m/%Y").date()
-                    this_year = bday.replace(year=today.year)
-                    if this_year < today:
-                        this_year = bday.replace(year=today.year + 1)
-                    days_away = (this_year - today).days
-                    age = calculate_age(bday_str)
-                    if days_away == 0:
-                        msg = f"🎉 *Happy Birthday {r.get('Name')}!* They're turning {age} today! Don't forget to wish them well!"
-                        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
-                    elif days_away == 3:
-                        msg = f"🎂 *Heads up!* {r.get('Name')}'s birthday is in 3 days ({format_date(bday_str)}) — they'll be turning {age}!"
-                        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
-                except:
-                    pass
-    except Exception as e:
-        print(f"Error sending birthday reminders: {e}")
-
-# --- Edit Session Handler ---
-async def handle_edit_session(user_id, text, update):
-    session = edit_sessions[user_id]
-    step = session["step"]
-    fields = ["birthday", "where we met", "notes", "follow up date", "follow up notes"]
-
-    if step == "choose_field":
-        field = text.lower().strip()
-        if field not in fields:
-            await update.message.reply_text(
-                f"Pick a field to edit:\n1. Birthday\n2. Where we met\n3. Notes\n4. Follow up date\n5. Follow up notes\n\nOr type *cancel* to exit.",
-                parse_mode="Markdown"
-            )
-            return
-        session["field"] = field
-        session["step"] = "enter_value"
-        await update.message.reply_text(f"Enter the new value for *{field.title()}*:", parse_mode="Markdown")
-
-    elif step == "enter_value":
-        field = session["field"]
-        name = session["name"]
-        result = update_field(f"{name}, {field}, {text}")
-        del edit_sessions[user_id]
-        await update.message.reply_text(result, parse_mode="Markdown")
-
+# --- Smart Calendar ---
 def smart_add_event(text, user_id):
     try:
         today = date.today()
@@ -664,6 +555,79 @@ Rules:
     except Exception as e:
         return f"❌ Error creating event: {str(e)}"
 
+# --- Edit Session Handler ---
+async def handle_edit_session(user_id, text, update):
+    session = edit_sessions[user_id]
+    step = session["step"]
+    fields = ["birthday", "where we met", "notes", "follow up date", "follow up notes"]
+
+    if step == "choose_field":
+        field = text.lower().strip()
+        if field not in fields:
+            await update.message.reply_text(
+                f"Pick a field to edit:\n1. Birthday\n2. Where we met\n3. Notes\n4. Follow up date\n5. Follow up notes\n\nOr type *cancel* to exit.",
+                parse_mode="Markdown"
+            )
+            return
+        session["field"] = field
+        session["step"] = "enter_value"
+        await update.message.reply_text(f"Enter the new value for *{field.title()}*:", parse_mode="Markdown")
+
+    elif step == "enter_value":
+        field = session["field"]
+        name = session["name"]
+        result = update_field(f"{name}, {field}, {text}")
+        del edit_sessions[user_id]
+        await update.message.reply_text(result, parse_mode="Markdown")
+
+# --- Scheduled Reminders ---
+async def send_followup_reminders(app):
+    try:
+        records = sheet.get_all_records()
+        today = date.today()
+        for r in records:
+            fu_date = r.get("Follow Up Date", "")
+            if fu_date:
+                try:
+                    fu = datetime.strptime(fu_date, "%d/%m/%Y").date()
+                    if fu == today:
+                        message = (
+                            f"🔔 *Follow up reminder!*\n\n"
+                            f"👤 *{r.get('Name')}*\n"
+                            f"📝 {r.get('Follow Up Notes') or 'No notes'}\n\n"
+                            f"Don't forget to reach out today!"
+                        )
+                        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=message, parse_mode="Markdown")
+                except:
+                    pass
+    except Exception as e:
+        print(f"Error sending follow up reminders: {e}")
+
+async def send_birthday_reminders(app):
+    try:
+        records = sheet.get_all_records()
+        today = date.today()
+        for r in records:
+            bday_str = r.get("Birthday", "")
+            if bday_str:
+                try:
+                    bday = datetime.strptime(bday_str, "%d/%m/%Y").date()
+                    this_year = bday.replace(year=today.year)
+                    if this_year < today:
+                        this_year = bday.replace(year=today.year + 1)
+                    days_away = (this_year - today).days
+                    age = calculate_age(bday_str)
+                    if days_away == 0:
+                        msg = f"🎉 *Happy Birthday {r.get('Name')}!* They're turning {age} today! Don't forget to wish them well!"
+                        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
+                    elif days_away == 3:
+                        msg = f"🎂 *Heads up!* {r.get('Name')}'s birthday is in 3 days ({format_date(bday_str)}) — they'll be turning {age}!"
+                        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
+                except:
+                    pass
+    except Exception as e:
+        print(f"Error sending birthday reminders: {e}")
+
 # --- Message Handler ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -731,7 +695,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = list_todos()
 
     # Calendar Commands
-elif lower.startswith("add event ") or lower.startswith("schedule ") or lower.startswith("create event "):
+    elif lower.startswith("add event") or lower.startswith("schedule ") or lower.startswith("create event"):
         reply = smart_add_event(text, user_id)
     elif lower == "events today":
         reply = get_events(1)
@@ -761,7 +725,8 @@ elif lower.startswith("add event ") or lower.startswith("schedule ") or lower.st
             "`soon` — next 7 days\n"
             "`lastcontact Name`\n\n"
             "*Calendar:*\n"
-            "`add event Title, DD/MM/YYYY HH:MM, DD/MM/YYYY HH:MM`\n"
+            "`add event Title tomorrow 6pm Work Meeting`\n"
+            "`schedule Title date time Calendar`\n"
             "`events today`\n"
             "`events week`\n"
             "`delete event Title`\n\n"
@@ -791,8 +756,8 @@ elif lower.startswith("add event ") or lower.startswith("schedule ") or lower.st
                 "- Helpful and focused — you're here to make life easier, not to chat\n"
                 "- Never say 'cool cool'\n"
                 "- Never use the shaka emoji\n"
-                "- Always capitalise the first letter of each sentence\n\n"
-  		"- Never use dashes or hyphens in your conversational replies — write in natural flowing sentences instead\n"
+                "- Always capitalise the first letter of each sentence\n"
+                "- Never use dashes or hyphens in conversational replies — write in natural flowing sentences instead\n"
                 "- Only use dashes when displaying CRM contact info in the required format\n\n"
                 "## Greetings & Sign-offs\n"
                 "- Mix it up — never sound repetitive\n"
