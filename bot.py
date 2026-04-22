@@ -16,8 +16,14 @@ ANTHROPIC_API_KEY = "sk-ant-api03-BSoaSPKC-eMU66eAMnvnZ0IOeHqx1cU15KegKRoO_B3ZSZ
 SHEET_ID = "1uoLlnBrgogkWgVnirA4WtlZafwpprWk_epZy9NPLSQc"
 
 # --- Google Sheets Setup ---
+import json
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+google_creds_env = os.getenv("GOOGLE_CREDENTIALS")
+if google_creds_env:
+    google_creds = json.loads(google_creds_env)
+    creds = Credentials.from_service_account_info(google_creds, scopes=SCOPES)
+else:
+    creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
 sheet = gc.open_by_key(SHEET_ID).sheet1
 
