@@ -8,7 +8,6 @@ from datetime import date, datetime, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaInMemoryUpload
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
 import caldav
@@ -128,8 +127,11 @@ def setup_drive():
 # Global Drive folder IDs (set during setup)
 DRIVE_FOLDERS = {}
 
-def setup_em_profile(settings_folder_id):
-    """Load em_profile.json from Drive, or create and upload it if missing."""
+def setup_em_profile():
+    """Load em_profile from Settings sheet, or create it if missing.
+    Stored as a single row: key='em_profile', value=JSON string.
+    Service accounts can't upload files to Drive, so we use Sheets instead.
+    """
     global em_profile
 
     default_profile = {
@@ -164,45 +166,38 @@ def setup_em_profile(settings_folder_id):
         "learned_style": {}
     }
 
-    # Check if file already exists in Drive
-    query = f"name='em_profile.json' and '{settings_folder_id}' in parents and trashed=false"
-    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
-    files = results.get("files", [])
+    try:
+        settings_sheet = spreadsheet.worksheet("Settings")
+        records = settings_sheet.get_all_records()
 
-    if files:
-        # Load existing profile
-        file_id = files[0]["id"]
-        content = drive_service.files().get_media(fileId=file_id).execute()
-        em_profile = json.loads(content.decode("utf-8"))
-        print("✅ Loaded em_profile.json from Drive")
-    else:
-        # Upload default profile
+        # Look for existing em_profile row
+        for i, r in enumerate(records):
+            if r.get("Key") == "em_profile":
+                em_profile = json.loads(r.get("Value", "{}"))
+                print("✅ Loaded em_profile from Settings sheet")
+                return
+
+        # Not found — write default
         em_profile = default_profile
-        content = json.dumps(default_profile, indent=2).encode("utf-8")
-        media = MediaInMemoryUpload(content, mimetype="application/json")
-        file_meta = {
-            "name": "em_profile.json",
-            "parents": [settings_folder_id]
-        }
-        drive_service.files().create(body=file_meta, media_body=media, fields="id").execute()
-        print("✅ Created and uploaded em_profile.json to Drive")
+        settings_sheet.append_row(["em_profile", json.dumps(default_profile)])
+        print("✅ Created em_profile in Settings sheet")
+
+    except Exception as e:
+        # Fallback to default in memory if sheet not ready yet
+        em_profile = default_profile
+        print(f"Warning: Could not load em_profile from sheet: {e}. Using defaults.")
 
 def save_em_profile():
-    """Save current em_profile back to Drive."""
+    """Save current em_profile back to Settings sheet."""
     try:
-        settings_id = DRIVE_FOLDERS.get("settings")
-        if not settings_id:
-            return
-        query = f"name='em_profile.json' and '{settings_id}' in parents and trashed=false"
-        results = drive_service.files().list(q=query, fields="files(id)").execute()
-        files = results.get("files", [])
-        content = json.dumps(em_profile, indent=2).encode("utf-8")
-        media = MediaInMemoryUpload(content, mimetype="application/json")
-        if files:
-            drive_service.files().update(fileId=files[0]["id"], media_body=media).execute()
-        else:
-            file_meta = {"name": "em_profile.json", "parents": [settings_id]}
-            drive_service.files().create(body=file_meta, media_body=media, fields="id").execute()
+        settings_sheet = spreadsheet.worksheet("Settings")
+        records = settings_sheet.get_all_records()
+        for i, r in enumerate(records):
+            if r.get("Key") == "em_profile":
+                settings_sheet.update_cell(i + 2, 2, json.dumps(em_profile))
+                return
+        # Not found — append it
+        settings_sheet.append_row(["em_profile", json.dumps(em_profile)])
     except Exception as e:
         print(f"Error saving em_profile: {e}")
 
@@ -212,7 +207,7 @@ def run_infrastructure_setup():
     print("Running infrastructure setup...")
     setup_sheets()
     DRIVE_FOLDERS = setup_drive()
-    setup_em_profile(DRIVE_FOLDERS["settings"])
+    setup_em_profile()
     print("✅ Infrastructure setup complete")
 
 # --- Sheet References (after setup) ---
