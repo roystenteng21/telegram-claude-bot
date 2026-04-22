@@ -695,7 +695,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = list_todos()
 
     # Calendar Commands
-    elif lower.startswith("add event") or lower.startswith("schedule ") or lower.startswith("create event"):
+elif (lower.startswith("add event") or lower.startswith("schedule ") or 
+          lower.startswith("create event") or lower.startswith("add ") and 
+          any(word in lower for word in ["meeting", "dinner", "lunch", "appointment", 
+          "call", "event", "session", "catch up", "catchup"])):
         reply = smart_add_event(text, user_id)
     elif lower == "events today":
         reply = get_events(1)
@@ -757,7 +760,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "- Never say 'cool cool'\n"
                 "- Never use the shaka emoji\n"
                 "- Always capitalise the first letter of each sentence\n"
-                "- Never use dashes or hyphens in conversational replies — write in natural flowing sentences instead\n"
+                "- NEVER use dashes or hyphens in conversational replies — write in natural flowing sentences instead\n"
                 "- Only use dashes when displaying CRM contact info in the required format\n\n"
                 "## Greetings & Sign-offs\n"
                 "- Mix it up — never sound repetitive\n"
