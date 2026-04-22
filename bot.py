@@ -474,6 +474,19 @@ def delete_calendar_event(title):
     except Exception as e:
         return f"❌ Error deleting event: {str(e)}"
 
+def is_calendar_request(text):
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=10,
+            messages=[{"role": "user", "content": f"""Is this message asking to add, schedule, create, book, set up, pencil in, or block out a calendar event? Reply with only YES or NO.
+
+Message: "{text}" """}]
+        )
+        return response.content[0].text.strip().upper() == "YES"
+    except:
+        return False
+
 # --- Smart Calendar ---
 def smart_add_event(text, user_id):
     try:
@@ -742,7 +755,10 @@ elif (lower.startswith("add event") or lower.startswith("schedule ") or
 
     # Claude Chat
     else:
-        if user_id not in conversation_histories:
+        if is_calendar_request(text):
+            reply = smart_add_event(text, user_id)
+        else:
+            if user_id not in conversation_histories:
             conversation_histories[user_id] = []
         conversation_histories[user_id].append({"role": "user", "content": text})
         response = client.messages.create(
