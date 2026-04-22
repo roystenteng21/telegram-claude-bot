@@ -47,7 +47,7 @@ conversation_histories = {}
 edit_sessions = {}
 
 # --- iCloud Calendar Setup ---
-def get_calendar():
+def get_calendar(name=None):
     try:
         caldav_client = caldav.DAVClient(
             url="https://caldav.icloud.com",
@@ -56,6 +56,11 @@ def get_calendar():
         )
         principal = caldav_client.principal()
         calendars = principal.calendars()
+        if name:
+            for cal in calendars:
+                if name.lower() in cal.name.lower():
+                    return cal
+            return None
         return calendars[0] if calendars else None
     except Exception as e:
         return None
@@ -436,14 +441,15 @@ def add_calendar_event(data):
     try:
         parts = [p.strip() for p in data.split(",")]
         if len(parts) < 3:
-            return "❌ Format: add event Title, DD/MM/YYYY HH:MM, DD/MM/YYYY HH:MM"
+            return "❌ Format: add event Title, DD/MM/YYYY HH:MM, DD/MM/YYYY HH:MM, calendar name (optional)"
         title = parts[0]
         start = datetime.strptime(parts[1], "%d/%m/%Y %H:%M")
         end = datetime.strptime(parts[2], "%d/%m/%Y %H:%M")
         notes = parts[3] if len(parts) > 3 else ""
-        calendar = get_calendar()
+        cal_name = parts[4] if len(parts) > 4 else None
+        calendar = get_calendar(cal_name) if cal_name else get_calendar()
         if not calendar:
-            return "❌ Could not connect to iCloud Calendar"
+            return f"❌ Could not find calendar '{cal_name}'" if cal_name else "❌ Could not connect to iCloud Calendar"
         ics = (
             "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\n"
             f"SUMMARY:{title}\n"
@@ -457,6 +463,7 @@ def add_calendar_event(data):
             f"✅ Event created!\n\n"
             f"📅 *{title}*\n"
             f"🕐 {start.strftime('%d %b %Y, %H:%M')} → {end.strftime('%H:%M')}\n"
+            f"📁 Calendar: {calendar.name}\n"
             + (f"📝 {notes}" if notes else "")
         )
     except Exception as e:
