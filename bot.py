@@ -1058,7 +1058,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conversation_histories[user_id].append({"role": "assistant", "content": reply})
 
     if reply:
-        await update.message.reply_text(reply, parse_mode="Markdown")
+        try:
+            await update.message.reply_text(reply, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(reply)
 
 # --- Main ---
 async def post_init(app):
