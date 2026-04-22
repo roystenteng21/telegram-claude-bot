@@ -2,6 +2,7 @@ anthropic
 python-telegram-bot
 gspread
 google-auth
+google-api-python-client
 python-dotenv
 apscheduler
 pytz

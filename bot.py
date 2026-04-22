@@ -7,6 +7,8 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 from datetime import date, datetime, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
 import caldav
@@ -21,24 +23,212 @@ ICLOUD_USERNAME = os.getenv("ICLOUD_USERNAME")
 ICLOUD_PASSWORD = os.getenv("ICLOUD_PASSWORD")
 YOUR_CHAT_ID = 281095850
 
-# --- Google Sheets Setup ---
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# --- Google Sheets + Drive Setup ---
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
 google_creds_env = os.getenv("GOOGLE_CREDENTIALS")
 if google_creds_env:
     google_creds = json.loads(google_creds_env)
     creds = Credentials.from_service_account_info(google_creds, scopes=SCOPES)
 else:
     creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+
 gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SHEET_ID)
-sheet = spreadsheet.sheet1
+drive_service = build("drive", "v3", credentials=creds)
 
-# --- Todo Sheet ---
-try:
-    todo_sheet = spreadsheet.worksheet("Todos")
-except:
-    todo_sheet = spreadsheet.add_worksheet(title="Todos", rows=100, cols=3)
-    todo_sheet.append_row(["Task", "Status", "Added"])
+# --- em_profile (loaded at startup, updated by setup) ---
+em_profile = {}
+
+# --- Infrastructure Setup ---
+def setup_sheets():
+    """Rename Sheet1 to CRM if needed, create all required tabs."""
+    existing = [ws.title for ws in spreadsheet.worksheets()]
+
+    # Rename sheet1 -> CRM if CRM doesn't exist yet
+    if "CRM" not in existing:
+        try:
+            sheet1 = spreadsheet.worksheet("Sheet1")
+            sheet1.update_title("CRM")
+            print("Renamed Sheet1 -> CRM")
+        except Exception:
+            # Sheet1 already renamed or doesn't exist, create CRM fresh
+            if "CRM" not in [ws.title for ws in spreadsheet.worksheets()]:
+                ws = spreadsheet.add_worksheet(title="CRM", rows=1000, cols=10)
+                ws.append_row(["Name", "Birthday", "Age", "Where We Met", "Notes",
+                               "Follow Up Date", "Follow Up Notes", "Last Updated"])
+                print("Created CRM tab")
+
+    # Todos tab
+    if "Todos" not in existing:
+        ws = spreadsheet.add_worksheet(title="Todos", rows=500, cols=3)
+        ws.append_row(["Task", "Status", "Added"])
+        print("Created Todos tab")
+
+    # All other required tabs
+    required_tabs = {
+        "Meeting Notes": ["Event Name", "Topic", "Summary", "Action Items", "Date"],
+        "Expenses": ["Date", "Merchant", "Amount", "Currency", "SGD Amount", "Category",
+                     "Card", "Receipt Link", "Reconciled", "Notes"],
+        "Bills": ["Name", "Bank", "Due Date", "Estimated Amount", "Notes"],
+        "Cards": ["Card Name", "Bank", "Type", "Notes"],
+        "Merchant Map": ["Merchant", "Category", "Card"],
+        "Restaurants": ["Name", "Location", "Country", "Tags", "Notes"],
+        "Portfolio": ["Stock", "Quantity", "Buy Price", "Buy Date", "Notes"],
+        "Settings": ["Key", "Value"]
+    }
+
+    existing_now = [ws.title for ws in spreadsheet.worksheets()]
+    for tab_name, headers in required_tabs.items():
+        if tab_name not in existing_now:
+            ws = spreadsheet.add_worksheet(title=tab_name, rows=500, cols=len(headers))
+            ws.append_row(headers)
+            print(f"Created tab: {tab_name}")
+
+    print("✅ Sheets setup complete")
+
+def get_or_create_drive_folder(name, parent_id=None):
+    """Get a Drive folder by name (under parent), or create it."""
+    query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get("files", [])
+    if files:
+        return files[0]["id"]
+    # Create it
+    meta = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder"
+    }
+    if parent_id:
+        meta["parents"] = [parent_id]
+    folder = drive_service.files().create(body=meta, fields="id").execute()
+    print(f"Created Drive folder: {name}")
+    return folder["id"]
+
+def setup_drive():
+    """Create Em's Drive folder structure."""
+    em_id = get_or_create_drive_folder("Em")
+    receipts_id = get_or_create_drive_folder("Receipts", em_id)
+    meeting_notes_id = get_or_create_drive_folder("Meeting Notes", em_id)
+    backups_id = get_or_create_drive_folder("Backups", em_id)
+    settings_id = get_or_create_drive_folder("Settings", em_id)
+    print("✅ Drive folders setup complete")
+    return {
+        "em": em_id,
+        "receipts": receipts_id,
+        "meeting_notes": meeting_notes_id,
+        "backups": backups_id,
+        "settings": settings_id
+    }
+
+# Global Drive folder IDs (set during setup)
+DRIVE_FOLDERS = {}
+
+def setup_em_profile(settings_folder_id):
+    """Load em_profile.json from Drive, or create and upload it if missing."""
+    global em_profile
+
+    default_profile = {
+        "version": "1.0",
+        "created": date.today().strftime("%d/%m/%Y"),
+        "tone": "warm, casual, never formal",
+        "no_dashes_in_conversation": True,
+        "emoji_style": "contextual and varied, never overdone",
+        "greeting_options": ["hey", "yo", "alright", "aite", "sup", "oi"],
+        "closing_style": "varied, natural, never repetitive",
+        "no_repeat_phrases": True,
+        "info_per_line": True,
+        "silent_tracking": True,
+        "language": "natural flowing sentences, no bullet dumps",
+        "forbidden_phrases": ["cool cool", "certainly", "of course", "absolutely", "great question"],
+        "forbidden_emojis": ["🤙"],
+        "response_length": "concise by default, elaborate only when asked",
+        "multi_language": True,
+        "dnd_active": False,
+        "dnd_held_messages": [],
+        "overseas_mode": False,
+        "overseas_destination": "",
+        "overseas_currency": "SGD",
+        "overseas_return_date": "",
+        "preferences": {
+            "birthday_greeting_style": "warm and casual, opens with Happy birthday",
+            "expense_confirmation_emoji": "contextual and varied",
+            "reminder_default_time": "09:00",
+            "weekly_market_summary_day": "Monday",
+            "weekly_market_summary_time": "08:00"
+        },
+        "learned_style": {}
+    }
+
+    # Check if file already exists in Drive
+    query = f"name='em_profile.json' and '{settings_folder_id}' in parents and trashed=false"
+    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get("files", [])
+
+    if files:
+        # Load existing profile
+        file_id = files[0]["id"]
+        content = drive_service.files().get_media(fileId=file_id).execute()
+        em_profile = json.loads(content.decode("utf-8"))
+        print("✅ Loaded em_profile.json from Drive")
+    else:
+        # Upload default profile
+        em_profile = default_profile
+        content = json.dumps(default_profile, indent=2).encode("utf-8")
+        media = MediaInMemoryUpload(content, mimetype="application/json")
+        file_meta = {
+            "name": "em_profile.json",
+            "parents": [settings_folder_id]
+        }
+        drive_service.files().create(body=file_meta, media_body=media, fields="id").execute()
+        print("✅ Created and uploaded em_profile.json to Drive")
+
+def save_em_profile():
+    """Save current em_profile back to Drive."""
+    try:
+        settings_id = DRIVE_FOLDERS.get("settings")
+        if not settings_id:
+            return
+        query = f"name='em_profile.json' and '{settings_id}' in parents and trashed=false"
+        results = drive_service.files().list(q=query, fields="files(id)").execute()
+        files = results.get("files", [])
+        content = json.dumps(em_profile, indent=2).encode("utf-8")
+        media = MediaInMemoryUpload(content, mimetype="application/json")
+        if files:
+            drive_service.files().update(fileId=files[0]["id"], media_body=media).execute()
+        else:
+            file_meta = {"name": "em_profile.json", "parents": [settings_id]}
+            drive_service.files().create(body=file_meta, media_body=media, fields="id").execute()
+    except Exception as e:
+        print(f"Error saving em_profile: {e}")
+
+def run_infrastructure_setup():
+    """Run all setup steps on startup. Idempotent — safe to run every time."""
+    global DRIVE_FOLDERS
+    print("Running infrastructure setup...")
+    setup_sheets()
+    DRIVE_FOLDERS = setup_drive()
+    setup_em_profile(DRIVE_FOLDERS["settings"])
+    print("✅ Infrastructure setup complete")
+
+# --- Sheet References (after setup) ---
+def get_sheet(name):
+    try:
+        return spreadsheet.worksheet(name)
+    except Exception as e:
+        print(f"Warning: Could not get sheet '{name}': {e}")
+        return None
+
+# We reference these after setup runs
+def crm_sheet():
+    return get_sheet("CRM")
+
+def todo_sheet():
+    return get_sheet("Todos")
 
 # --- Anthropic Setup ---
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -122,6 +312,7 @@ def format_contact(r):
     )
 
 def find_row(name):
+    sheet = crm_sheet()
     records = sheet.get_all_records()
     for i, r in enumerate(records):
         if name.lower() in r.get("Name", "").lower():
@@ -129,6 +320,7 @@ def find_row(name):
     return None, None
 
 def find_all_rows(name):
+    sheet = crm_sheet()
     records = sheet.get_all_records()
     results = []
     for i, r in enumerate(records):
@@ -139,6 +331,7 @@ def find_all_rows(name):
 # --- CRM Functions ---
 def save_contact(data):
     try:
+        sheet = crm_sheet()
         parts = [p.strip() for p in data.split(",")]
         while len(parts) < 7:
             parts.append("")
@@ -173,6 +366,7 @@ def find_contact(name):
 
 def add_note(data):
     try:
+        sheet = crm_sheet()
         parts = data.split("-", 1)
         if len(parts) < 2:
             return "❌ Format: note Name - your note here"
@@ -191,6 +385,7 @@ def add_note(data):
 
 def set_followup(data):
     try:
+        sheet = crm_sheet()
         parts = [p.strip() for p in data.split(",", 2)]
         if len(parts) < 2:
             return "❌ Format: followup Name, DD/MM/YYYY, notes"
@@ -209,6 +404,7 @@ def set_followup(data):
 
 def update_field(data):
     try:
+        sheet = crm_sheet()
         parts = [p.strip() for p in data.split(",", 2)]
         if len(parts) < 3:
             return "❌ Format: update Name, field, new value"
@@ -234,6 +430,7 @@ def update_field(data):
 
 def delete_contact(name):
     try:
+        sheet = crm_sheet()
         row_num, record = find_row(name)
         if not record:
             return f"❌ No contact found for '{name}'"
@@ -244,10 +441,11 @@ def delete_contact(name):
 
 def search_contacts(keyword):
     try:
+        sheet = crm_sheet()
         records = sheet.get_all_records()
         results = []
         for r in records:
-            if any(keyword.modify() in str(v).lower() for v in r.values()):
+            if any(keyword.lower() in str(v).lower() for v in r.values()):  # Fixed bug: was keyword.modify()
                 results.append(r)
         if not results:
             return f"❌ No results for '{keyword}'"
@@ -257,6 +455,7 @@ def search_contacts(keyword):
 
 def list_contacts():
     try:
+        sheet = crm_sheet()
         records = sheet.get_all_records()
         if not records:
             return "❌ No contacts found"
@@ -269,6 +468,7 @@ def list_contacts():
 
 def get_stats():
     try:
+        sheet = crm_sheet()
         records = sheet.get_all_records()
         today = date.today()
         total = len(records)
@@ -305,6 +505,7 @@ def get_stats():
 
 def upcoming_followups():
     try:
+        sheet = crm_sheet()
         records = sheet.get_all_records()
         today = date.today()
         upcoming = []
@@ -332,6 +533,7 @@ def upcoming_followups():
 
 def overdue_followups():
     try:
+        sheet = crm_sheet()
         records = sheet.get_all_records()
         today = date.today()
         overdue = []
@@ -360,6 +562,7 @@ def overdue_followups():
 
 def upcoming_birthdays(days=30):
     try:
+        sheet = crm_sheet()
         records = sheet.get_all_records()
         today = date.today()
         upcoming = []
@@ -402,17 +605,19 @@ def last_contact(name):
 # --- Todo Functions ---
 def add_todo(task):
     try:
-        todo_sheet.append_row([task, "Pending", date.today().strftime("%d/%m/%Y")])
+        sheet = todo_sheet()
+        sheet.append_row([task, "Pending", date.today().strftime("%d/%m/%Y")])
         return f"✅ Added to your to-do list: _{task}_"
     except Exception as e:
         return f"❌ Error adding task: {str(e)}"
 
 def complete_todo(task):
     try:
-        records = todo_sheet.get_all_records()
+        sheet = todo_sheet()
+        records = sheet.get_all_records()
         for i, r in enumerate(records):
             if task.lower() in r.get("Task", "").lower() and r.get("Status") == "Pending":
-                todo_sheet.update_cell(i + 2, 2, "Done")
+                sheet.update_cell(i + 2, 2, "Done")
                 return f"✅ Marked as done: _{r.get('Task')}_"
         return f"❌ No pending task found matching '{task}'"
     except Exception as e:
@@ -420,7 +625,8 @@ def complete_todo(task):
 
 def list_todos():
     try:
-        records = todo_sheet.get_all_records()
+        sheet = todo_sheet()
+        records = sheet.get_all_records()
         pending = [r for r in records if r.get("Status") == "Pending"]
         if not pending:
             return "✅ No pending tasks!"
@@ -536,7 +742,7 @@ Rules:
         cal_name = parsed.get("calendar", "Personal")
 
         if not title or not start_str or not end_str:
-            return "❌ Couldn't parse the event details. Try: `add event Title, DD/MM/YYYY HH:MM, DD/MM/YYYY HH:MM, notes, Calendar`"
+            return "❌ Couldn't parse the event details. Try something like: schedule dinner with James tomorrow 7pm"
 
         start = datetime.strptime(start_str, "%d/%m/%Y %H:%M")
         end = datetime.strptime(end_str, "%d/%m/%Y %H:%M")
@@ -564,7 +770,7 @@ Rules:
         )
 
     except json.JSONDecodeError:
-        return "❌ Couldn't parse the event details. Try: `add event Title, DD/MM/YYYY HH:MM, DD/MM/YYYY HH:MM, notes, Calendar`"
+        return "❌ Couldn't parse the event details. Try something like: schedule dinner with James tomorrow 7pm"
     except Exception as e:
         return f"❌ Error creating event: {str(e)}"
 
@@ -596,6 +802,7 @@ async def handle_edit_session(user_id, text, update):
 # --- Scheduled Reminders ---
 async def send_followup_reminders(app):
     try:
+        sheet = crm_sheet()
         records = sheet.get_all_records()
         today = date.today()
         for r in records:
@@ -617,33 +824,124 @@ async def send_followup_reminders(app):
         print(f"Error sending follow up reminders: {e}")
 
 async def send_birthday_reminders(app):
+    """
+    Birthday reminders per spec:
+    - Fire at 12pm on the person's birthday with a warm, personalised greeting suggestion
+    - Check in again at 2pm if no response, then drop it
+    - Greeting opens with Happy birthday, casual opener, warm closing
+    - Personal touches based on relationship and contact notes
+    - Varies greetings and closing lines, never repetitive
+    - Tracks whether greeting was sent (silently in sheet)
+    """
     try:
+        sheet = crm_sheet()
         records = sheet.get_all_records()
         today = date.today()
+        today_str = today.strftime("%d/%m/%Y")
+
         for r in records:
             bday_str = r.get("Birthday", "")
-            if bday_str:
-                try:
-                    bday = datetime.strptime(bday_str, "%d/%m/%Y").date()
-                    this_year = bday.replace(year=today.year)
-                    if this_year < today:
-                        this_year = bday.replace(year=today.year + 1)
-                    days_away = (this_year - today).days
+            if not bday_str:
+                continue
+            try:
+                bday = datetime.strptime(bday_str, "%d/%m/%Y").date()
+                if bday.day == today.day and bday.month == today.month:
                     age = calculate_age(bday_str)
-                    if days_away == 0:
-                        msg = f"🎉 *Happy Birthday {r.get('Name')}!* They're turning {age} today! Don't forget to wish them well!"
-                        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
-                    elif days_away == 3:
-                        msg = f"🎂 *Heads up!* {r.get('Name')}'s birthday is in 3 days ({format_date(bday_str)}) — they'll be turning {age}!"
-                        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
-                except:
-                    pass
+                    name = r.get("Name", "")
+                    notes = r.get("Notes", "")
+                    where_met = r.get("Where We Met", "")
+
+                    # Generate personalised greeting via Claude
+                    greeting_prompt = (
+                        f"Write a warm, casual birthday greeting suggestion for {name} "
+                        f"who is turning {age} today. "
+                        f"Context about them: met at {where_met or 'unknown'}. Notes: {notes or 'none'}.\n\n"
+                        f"Rules:\n"
+                        f"- Opens with 'Happy birthday' (required)\n"
+                        f"- Casual and warm throughout\n"
+                        f"- Add a personal touch based on their notes if relevant\n"
+                        f"- Warm closing line\n"
+                        f"- No dashes\n"
+                        f"- Do NOT use: 'Hope you had a great one' or 'Hope it's been a good one'\n"
+                        f"- 2 to 4 sentences max\n"
+                        f"- Write it as a message they could copy and send directly"
+                    )
+                    greeting_resp = client.messages.create(
+                        model="claude-sonnet-4-5",
+                        max_tokens=200,
+                        messages=[{"role": "user", "content": greeting_prompt}]
+                    )
+                    greeting = greeting_resp.content[0].text.strip()
+
+                    msg = (
+                        f"🎂 *{name}'s birthday today!* They're turning {age}.\n\n"
+                        f"Here's a suggested greeting:\n\n"
+                        f"_{greeting}_"
+                    )
+                    await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
+            except Exception as e:
+                print(f"Birthday reminder error for {r.get('Name')}: {e}")
     except Exception as e:
         print(f"Error sending birthday reminders: {e}")
+
+# --- Em System Prompt Builder ---
+def build_system_prompt():
+    """Build Em's system prompt, incorporating em_profile preferences."""
+    profile_notes = ""
+    if em_profile:
+        forbidden = ", ".join(em_profile.get("forbidden_phrases", []))
+        profile_notes = f"\nForbidden phrases (never use): {forbidden}" if forbidden else ""
+
+    return (
+        "# Em — Your Personal Assistant\n\n"
+        "## Core Identity\n"
+        "You're Em — a smart, focused personal assistant with a casual, warm vibe. "
+        "You keep things real and get stuff done without the corporate robot speak.\n\n"
+        "## Communication Style\n"
+        "- Natural and conversational — light slang like 'got it', 'sure thing', 'on it', 'no worries', 'lemme check that', 'all good'\n"
+        "- Clean and simple — never over the top or trying too hard\n"
+        "- Helpful and focused — you're here to make life easier, not to chat\n"
+        "- Never say 'cool cool'\n"
+        "- Never use the shaka emoji\n"
+        "- Always capitalise the first letter of each sentence\n"
+        "- NEVER use dashes or hyphens in conversational replies under any circumstances. Write in natural flowing sentences instead.\n"
+        "- Only use dashes when displaying CRM contact info in the required format.\n"
+        "- Each piece of information on its own line.\n"
+        "- No unnecessary prompting or nudging.\n"
+        f"{profile_notes}\n\n"
+        "## Greetings & Sign-offs\n"
+        "- Mix it up — never sound repetitive\n"
+        "- Options: 'hey', 'yo', 'alright', 'aite', 'sup', or just dive straight in\n"
+        "- Vary your closings naturally too\n\n"
+        "## Emojis\n"
+        "- Use sparingly — only when they feel natural\n"
+        "- Don't overdo it\n\n"
+        "## Response Length\n"
+        "- Concise and to the point by default\n"
+        "- Elaborate only when asked\n\n"
+        "## CRM Display Format\n"
+        "When displaying contact info, always use this exact format:\n\n"
+        "[Full Name]\n"
+        "- Met: [where you met]\n"
+        "- Age: [age], [DD MMM YYYY or note if unknown]\n"
+        "- Notes:\n"
+        "  - [note 1]\n"
+        "  - [note 2]\n\n"
+        "_Last updated: DD MMM YYYY_\n\n"
+        "Always separate notes into individual bullet points. Never dump them in one line.\n\n"
+        "## What You Don't Do\n"
+        "- Sound stiff or corporate\n"
+        "- Act like a typical AI assistant\n"
+        "- Make small talk for the sake of it\n"
+        "- Get repetitive with phrases or greetings"
+    )
 
 # --- Message Handler ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if user_id != YOUR_CHAT_ID:
+        return
+
     text = update.message.text.strip()
     lower = text.lower()
 
@@ -651,6 +949,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in edit_sessions:
         await handle_edit_session(user_id, text, update)
         return
+
+    reply = None
 
     # CRM Commands
     if lower.startswith("save "):
@@ -717,40 +1017,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif lower.startswith("delete event "):
         reply = delete_calendar_event(text[13:])
 
+    # Infrastructure / Settings
+    elif lower == "em status":
+        folder_status = "✅ Connected" if DRIVE_FOLDERS else "❌ Not connected"
+        profile_version = em_profile.get("version", "unknown")
+        reply = (
+            f"⚙️ *Em Status*\n\n"
+            f"Google Drive: {folder_status}\n"
+            f"em_profile version: {profile_version}\n"
+            f"Sheets: ✅ Connected\n"
+            f"Scheduler: ✅ Running"
+        )
+
     # Help
     elif lower == "help":
         reply = (
-            "🤖 *Em's Commands:*\n\n"
+            "🤖 *Em — here's what I can do:*\n\n"
             "*CRM:*\n"
-            "`save Name, Birthday, Where We Met, Notes`\n"
-            "`find Name` / `pull up Name`\n"
-            "`note Name - your note`\n"
-            "`followup Name, DD/MM/YYYY, notes`\n"
-            "`update Name, field, value`\n"
-            "`edit Name` — guided edit\n"
-            "`delete Name`\n"
-            "`search keyword`\n"
-            "`list` — all contacts\n"
-            "`stats` — CRM summary\n"
-            "`followups` — upcoming\n"
-            "`overdue` — past due\n"
-            "`birthdays` — next 30 days\n"
-            "`soon` — next 7 days\n"
-            "`lastcontact Name`\n\n"
+            "save, find, note, followup, update, edit, delete, search, list, stats, followups, overdue, birthdays, soon, lastcontact\n\n"
             "*Calendar:*\n"
-            "`add event Title tomorrow 6pm Work Meeting`\n"
-            "`schedule Title date time Calendar`\n"
-            "`events today`\n"
-            "`events week`\n"
-            "`delete event Title`\n\n"
+            "Just tell me naturally — 'schedule dinner tomorrow 7pm' or 'add event'\n"
+            "events today / events week / delete event\n\n"
             "*To-Do:*\n"
-            "`todo Task`\n"
-            "`done Task`\n"
-            "`todos`\n\n"
-            "*Chat with Em:* Just type anything!"
+            "todo, done, todos\n\n"
+            "*Other:*\n"
+            "em status — check Em's health\n\n"
+            "Or just chat — I'll figure it out 👍"
         )
 
-# Claude Chat
+    # Claude Chat fallback
     else:
         if is_calendar_request(text):
             reply = smart_add_event(text, user_id)
@@ -761,70 +1056,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = client.messages.create(
                 model="claude-sonnet-4-5",
                 max_tokens=1024,
-                system=(
-                    "# Em — Your Personal Assistant\n\n"
-                    "## Core Identity\n"
-                    "You're Em — a smart, focused personal assistant with a casual, cool vibe. "
-                    "You keep things real and get stuff done without the corporate robot speak.\n\n"
-                    "## Communication Style\n"
-                    "- Natural and conversational — light slang like 'got it', 'sure thing', 'on it', 'no worries', 'lemme check that', 'all good'\n"
-                    "- Clean and simple — never over the top or trying too hard\n"
-                    "- Helpful and focused — you're here to make life easier, not to chat\n"
-                    "- Never say 'cool cool'\n"
-                    "- Never use the shaka emoji\n"
-                    "- Always capitalise the first letter of each sentence\n"
-                    "- NEVER use dashes or hyphens in conversational replies under any circumstances. Write in natural flowing sentences instead.\n"
-                    "- Only use dashes when displaying CRM contact info in the required format.\n\n"
-                    "## Greetings & Sign-offs\n"
-                    "- Mix it up — never sound repetitive\n"
-                    "- Options: 'hey', 'yo', 'alright', 'aite', 'sup', or just dive straight in\n"
-                    "- Vary your closings naturally too\n\n"
-                    "## Emojis\n"
-                    "- Use sparingly — only when they feel natural\n"
-                    "- Don't overdo it\n\n"
-                    "## Response Length\n"
-                    "- Concise and to the point by default\n"
-                    "- Elaborate only when asked\n\n"
-                    "## CRM Display Format\n"
-                    "When displaying contact info, always use this exact format:\n\n"
-                    "[Full Name]\n"
-                    "- Met: [where you met]\n"
-                    "- Age: [age], [DD MMM YYYY or note if unknown]\n"
-                    "- Notes:\n"
-                    "  - [note 1]\n"
-                    "  - [note 2]\n\n"
-                    "_Last updated: DD MMM YYYY_\n\n"
-                    "Example:\n\n"
-                    "John Doe\n"
-                    "- Met: Coffee shop downtown\n"
-                    "- Age: 28, 15 Jun 1997\n"
-                    "- Notes:\n"
-                    "  - Works in marketing\n"
-                    "  - Interested in startups\n"
-                    "  - Has a dog named Max\n\n"
-                    "_Last updated: 22 Apr 2026_\n\n"
-                    "Always separate notes into individual bullet points. Never dump them in one line.\n\n"
-                    "## What You Don't Do\n"
-                    "- Sound stiff or corporate\n"
-                    "- Act like a typical AI assistant\n"
-                    "- Make small talk for the sake of it\n"
-                    "- Get repetitive with phrases or greetings"
-                ),
+                system=build_system_prompt(),
                 messages=conversation_histories[user_id]
             )
             reply = response.content[0].text
             conversation_histories[user_id].append({"role": "assistant", "content": reply})
 
-    await update.message.reply_text(reply, parse_mode="Markdown")
+    if reply:
+        await update.message.reply_text(reply, parse_mode="Markdown")
 
 # --- Main ---
 async def post_init(app):
+    # Run infrastructure setup
+    run_infrastructure_setup()
+
     timezone = pytz.timezone("Asia/Kuala_Lumpur")
     scheduler = AsyncIOScheduler(timezone=timezone)
+
+    # Follow-up reminders at 9am
     scheduler.add_job(send_followup_reminders, "cron", hour=9, minute=0, args=[app])
-    scheduler.add_job(send_birthday_reminders, "cron", hour=9, minute=0, args=[app])
+
+    # Birthday greetings at 12pm (spec: prompt at 12pm on birthday)
+    scheduler.add_job(send_birthday_reminders, "cron", hour=12, minute=0, args=[app])
+
     scheduler.start()
-    print("Reminders scheduled!")
+    print("✅ Scheduler started — follow-ups at 9am, birthdays at 12pm")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
