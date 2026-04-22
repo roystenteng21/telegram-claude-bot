@@ -28,6 +28,7 @@ if google_creds_env:
 else:
     creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
+print(f"Attempting to open sheet with ID: '{SHEET_ID}'")
 sheet = gc.open_by_key(SHEET_ID).sheet1
 
 # --- Anthropic Setup ---
