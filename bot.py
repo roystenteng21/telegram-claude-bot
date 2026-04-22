@@ -584,6 +584,86 @@ async def handle_edit_session(user_id, text, update):
         del edit_sessions[user_id]
         await update.message.reply_text(result, parse_mode="Markdown")
 
+def smart_add_event(text, user_id):
+    try:
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+        calendar_names = [
+            "Estate Planning", "Work Meeting", "Personal",
+            "Closing", "Urgent", "MinimaList", "Appointment"
+        ]
+        parse_prompt = f"""Today is {today.strftime('%d %b %Y')} ({today.strftime('%A')}).
+Tomorrow is {tomorrow.strftime('%d %b %Y')}.
+
+Available calendars: {', '.join(calendar_names)}
+
+The user wants to add a calendar event. Extract the details from this message:
+"{text}"
+
+Respond ONLY with a JSON object in this exact format, nothing else:
+{{
+  "title": "event title",
+  "start": "DD/MM/YYYY HH:MM",
+  "end": "DD/MM/YYYY HH:MM",
+  "notes": "any notes or empty string",
+  "calendar": "exact calendar name from the list above or Personal if unclear"
+}}
+
+Rules:
+- If no end time given, assume 1 hour after start
+- If AM/PM not specified, use context to determine (6pm not 6am for dinner etc)
+- Match calendar name exactly from the available list
+- If no calendar specified, use Personal"""
+
+        response = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=300,
+            messages=[{"role": "user", "content": parse_prompt}]
+        )
+
+        raw = response.content[0].text.strip()
+        clean = raw.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(clean)
+
+        title = parsed.get("title", "")
+        start_str = parsed.get("start", "")
+        end_str = parsed.get("end", "")
+        notes = parsed.get("notes", "")
+        cal_name = parsed.get("calendar", "Personal")
+
+        if not title or not start_str or not end_str:
+            return "❌ Couldn't parse the event details. Try: `add event Title, DD/MM/YYYY HH:MM, DD/MM/YYYY HH:MM, notes, Calendar`"
+
+        start = datetime.strptime(start_str, "%d/%m/%Y %H:%M")
+        end = datetime.strptime(end_str, "%d/%m/%Y %H:%M")
+
+        calendar = get_calendar(cal_name)
+        if not calendar:
+            calendar = get_calendar("Personal")
+
+        ics = (
+            "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\n"
+            f"SUMMARY:{title}\n"
+            f"DTSTART:{start.strftime('%Y%m%dT%H%M%S')}\n"
+            f"DTEND:{end.strftime('%Y%m%dT%H%M%S')}\n"
+            f"DESCRIPTION:{notes}\n"
+            "END:VEVENT\nEND:VCALENDAR"
+        )
+        calendar.add_event(ics)
+
+        return (
+            f"✅ Done!\n\n"
+            f"📅 *{title}*\n"
+            f"🕐 {start.strftime('%d %b %Y, %H:%M')} → {end.strftime('%H:%M')}\n"
+            f"📁 {calendar.name}\n"
+            + (f"📝 {notes}" if notes else "")
+        )
+
+    except json.JSONDecodeError:
+        return "❌ Couldn't parse the event details. Try: `add event Title, DD/MM/YYYY HH:MM, DD/MM/YYYY HH:MM, notes, Calendar`"
+    except Exception as e:
+        return f"❌ Error creating event: {str(e)}"
+
 # --- Message Handler ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -651,8 +731,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = list_todos()
 
     # Calendar Commands
-    elif lower.startswith("add event "):
-        reply = add_calendar_event(text[10:])
+elif lower.startswith("add event ") or lower.startswith("schedule ") or lower.startswith("create event "):
+        reply = smart_add_event(text, user_id)
     elif lower == "events today":
         reply = get_events(1)
     elif lower == "events week":
