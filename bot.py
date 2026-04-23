@@ -298,7 +298,6 @@ def todo_sheet():
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 conversation_histories = {}
 edit_sessions = {}
-crm_confirm_sessions = {}  # { user_id: {"name": str, "note": str} }
 
 # --- iCloud Calendar Setup ---
 def get_calendar(name=None):
@@ -1402,9 +1401,7 @@ meeting_sessions = {}
 MEETING_START_PHRASES = [
     "meeting recap", "taking notes", "log this meeting", "meeting notes",
     "recap for", "notes for", "log meeting", "start recap", "new recap",
-    "networking recap", "presentation recap",
-    "i'm at", "im at", "just arrived at", "arrived at", "i am at",
-    "at the ", "heading to ", "just got to "
+    "networking recap", "presentation recap"
 ]
 
 MEETING_DONE_PHRASES = [
@@ -1412,18 +1409,9 @@ MEETING_DONE_PHRASES = [
     "finish", "finished", "end recap", "process this", "that's all", "thats all"
 ]
 
-MEETING_END_PHRASES = [
-    "back in sg", "back home", "reached sg", "home now", "just landed",
-    "event done", "event over", "wrapping up", "that's a wrap", "thats a wrap"
-]
-
 def is_meeting_start(text):
     lower = text.lower()
     return any(p in lower for p in MEETING_START_PHRASES)
-
-def is_meeting_end(text):
-    lower = text.lower().strip()
-    return any(p in lower for p in MEETING_END_PHRASES)
 
 def is_meeting_done(text):
     lower = text.lower().strip()
@@ -1433,13 +1421,11 @@ def extract_event_name(text):
     """Try to pull event name from the start message."""
     lower = text.lower()
     for phrase in ["recap for", "notes for", "meeting notes for", "taking notes for",
-                   "meeting recap for", "log meeting for",
-                   "i'm at", "im at", "just arrived at", "arrived at", "i am at",
-                   "at the", "heading to", "just got to"]:
+                   "meeting recap for", "log meeting for"]:
         if phrase in lower:
             idx = lower.index(phrase) + len(phrase)
             return text[idx:].strip().strip(".,!?")
-    return text.strip().strip(".,!?")
+    return ""
 
 def tag_crm_contacts(text):
     """Find any CRM contacts mentioned in the text."""
@@ -1562,27 +1548,11 @@ async def handle_meeting_session(user_id, text, update):
     session = meeting_sessions[user_id]
     step = session.get("step")
 
-    # End session triggers (back home / event over)
-    if is_meeting_end(text):
-        if session.get("notes"):
-            await update.message.reply_text("On it, give me a sec...")
-            try:
-                recap = process_meeting_notes(session.get("event_name", ""), session["notes"])
-                session["pending_recap"] = recap
-                session["step"] = "confirming"
-                confirmation = format_recap_confirmation(recap)
-                await update.message.reply_text(confirmation)
-            except Exception as e:
-                await update.message.reply_text(f"Couldn't process the notes: {str(e)}. Try again.")
-        else:
-            del meeting_sessions[user_id]
-            await update.message.reply_text("Got it, session ended. No notes to save.")
-        return
-
     # Confirming step — waiting for Y or E
     if step == "confirming":
         if text.strip().upper() == "Y":
             saved = save_meeting_recap(session["pending_recap"])
+            # Tag CRM contacts
             contacts = session["pending_recap"].get("contacts_mentioned", [])
             for name in contacts:
                 row_num, record = find_row(name)
@@ -1610,56 +1580,11 @@ async def handle_meeting_session(user_id, text, update):
         session["event_name"] = text.strip()
         session["step"] = "collecting"
         await update.message.reply_text(
-            f"Got it, logging for *{text.strip()}*. Send me a name to log someone, or just dump your notes and say done when finished."
+            f"Got it. Send your notes for {text.strip()} and say done when you're finished."
         )
         return
 
-    # Awaiting notes for a specific contact
-    if step == "awaiting_contact_note":
-        pending_name = session.get("pending_contact_name", "")
-        note_text = text.strip()
-        if note_text.lower() != "skip":
-            # Save note to CRM
-            row_num, record = find_row(pending_name)
-            if record:
-                add_note(f"{record.get('Name')} - [{session.get('event_name', 'event')}] {note_text}")
-                session["notes"].append(f"{record.get('Name')}: {note_text}")
-                await update.message.reply_text(f"✅ Noted for *{record.get('Name')}*. Anyone else? Send another name or say done.")
-            else:
-                # New contact — ask to confirm
-                session["pending_new_contact"] = {"name": pending_name, "note": note_text}
-                session["step"] = "confirm_new_contact"
-                await update.message.reply_text(
-                    f"*{pending_name}* isn't in your CRM. Add them as a new contact?\n\nReply Y to add or N to skip."
-                )
-        else:
-            await update.message.reply_text("Skipped. Anyone else? Send a name or say done.")
-            session["step"] = "collecting"
-        session.pop("pending_contact_name", None)
-        if step != "confirm_new_contact":
-            session["step"] = "collecting"
-        return
-
-    # Confirm adding new contact from meeting
-    if step == "confirm_new_contact":
-        pending = session.get("pending_new_contact", {})
-        if text.strip().upper() == "Y":
-            name = pending.get("name", "")
-            note = pending.get("note", "")
-            today = date.today().strftime("%d/%m/%Y")
-            crm_sheet().append_row([
-                name, "", "", "", session.get("event_name", ""), note,
-                "", "", today, "", "", "", "", ""
-            ])
-            session["notes"].append(f"{name}: {note}")
-            await update.message.reply_text(f"✅ Added *{name}* to CRM. Anyone else? Send a name or say done.")
-        else:
-            await update.message.reply_text("Skipped. Anyone else? Send a name or say done.")
-        session.pop("pending_new_contact", None)
-        session["step"] = "collecting"
-        return
-
-    # Collecting step — buffering notes or detecting a name
+    # Collecting step — buffering notes
     if is_meeting_done(text):
         if not session.get("notes"):
             await update.message.reply_text("You haven't sent any notes yet. Send your notes then say done.")
@@ -1677,25 +1602,9 @@ async def handle_meeting_session(user_id, text, update):
             await update.message.reply_text(f"Couldn't process the notes: {str(e)}. Try again.")
         return
 
-    # Check if message looks like just a name (1-3 words, exists in CRM or short enough to be a name)
-    words = text.strip().split()
-    if 1 <= len(words) <= 3:
-        row_num, record = find_row(text.strip())
-        if record:
-            session["pending_contact_name"] = record.get("Name")
-            session["step"] = "awaiting_contact_note"
-            await update.message.reply_text(f"What's the update for *{record.get('Name')}*?")
-            return
-        # Looks like a name but not in CRM
-        if len(words) <= 2 and text.strip().replace(" ", "").isalpha():
-            session["pending_contact_name"] = text.strip().title()
-            session["step"] = "awaiting_contact_note"
-            await update.message.reply_text(f"What's the update for *{text.strip().title()}*?")
-            return
-
     # Still collecting — buffer the note
     session["notes"].append(text)
-    # Acknowledge silently to keep flow natural
+    # Acknowledge silently (no reply) to keep flow natural
 
 
 
@@ -2008,8 +1917,15 @@ overseas_state = {
     "active": False,
     "destination": "",
     "currency": "SGD",
-    "return_date": ""
+    "return_date": "",
+    "dep_job_id": None,       # scheduler job ID for departure activation
+    "return_job_id": None,    # scheduler job ID for return deactivation
+    "return_flight": None,    # return flight data dict
 }
+
+# Global scheduler reference (set in post_init)
+_scheduler = None
+_app_ref = None
 
 # Pending new merchant — waiting for user to confirm category + card
 # { user_id: { "merchant": str, "amount": float, "currency": str, "step": "category"|"card" } }
@@ -2255,26 +2171,83 @@ def get_dest_info_from_iata(iata_code, airport_name):
         print(f"get_dest_info_from_iata JSON parse error: {e} | raw: {raw}")
         return {"destination": airport_name or iata_code, "currency": "SGD"}
 
+def deactivate_overseas_mode():
+    """Deactivate overseas mode and clear scheduled jobs."""
+    global overseas_state, _scheduler
+    overseas_state["active"] = False
+    overseas_state["destination"] = ""
+    overseas_state["currency"] = "SGD"
+    overseas_state["return_date"] = ""
+    overseas_state["return_flight"] = None
+    for job_key in ["dep_job_id", "return_job_id"]:
+        job_id = overseas_state.get(job_key)
+        if job_id and _scheduler:
+            try:
+                _scheduler.remove_job(job_id)
+            except Exception:
+                pass
+        overseas_state[job_key] = None
+
+async def activate_overseas_mode_scheduled(dest, curr, return_flight_data=None):
+    """Called by scheduler at departure time to activate overseas mode."""
+    global overseas_state, _app_ref
+    overseas_state["active"] = True
+    overseas_state["destination"] = dest
+    overseas_state["currency"] = curr
+    msg = f"Overseas mode on ✈️\nDestination: {dest}\nCurrency: {curr}\nI'll log expenses in {curr} with SGD equivalent."
+    if return_flight_data:
+        ret_dep = format_flight_time(return_flight_data.get("dep_time", ""))
+        msg += f"\nReturn flight: {return_flight_data.get('flight', '')} departs {ret_dep}"
+        # Schedule return deactivation at return arrival time
+        ret_arr_str = return_flight_data.get("arr_time", "")
+        if ret_arr_str and _scheduler and _app_ref:
+            try:
+                ret_arr_dt = datetime.fromisoformat(ret_arr_str.replace("Z", "+00:00"))
+                ret_arr_local = ret_arr_dt.astimezone(TIMEZONE)
+                job = _scheduler.add_job(
+                    deactivate_and_notify,
+                    "date",
+                    run_date=ret_arr_local,
+                    args=[_app_ref]
+                )
+                overseas_state["return_job_id"] = job.id
+            except Exception as e:
+                print(f"Failed to schedule return deactivation: {e}")
+    if _app_ref:
+        try:
+            await _app_ref.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
+        except Exception as e:
+            print(f"Failed to send overseas mode activation message: {e}")
+
+async def deactivate_and_notify(app):
+    """Called by scheduler at return arrival — deactivate overseas mode and notify."""
+    import random
+    dest = overseas_state.get("destination", "")
+    deactivate_overseas_mode()
+    greeting = random.choice(["Welcome back!", "Good to have you back!", "Hope the trip was great!"])
+    msg = f"{greeting} Back in SG — switching to SGD. 🏠"
+    try:
+        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
+    except Exception as e:
+        print(f"Failed to send return notification: {e}")
+
 def handle_overseas_request(text):
     """Toggle overseas mode on/off, with optional flight lookup."""
-    global overseas_state
+    global overseas_state, _scheduler
     lower = text.lower()
 
-    # Returning home
+    # Returning home manually
     if any(p in lower for p in ["back home", "returned", "i'm back", "landed back", "home now"]):
-        overseas_state["active"] = False
-        overseas_state["destination"] = ""
-        overseas_state["currency"] = "SGD"
-        overseas_state.pop("_pending_flight", None)
         import random
         greeting = random.choice(["Welcome back!", "Good to have you back!", "Hope the trip was great!"])
+        deactivate_overseas_mode()
         return f"{greeting} Switching back to SGD. 🏠"
 
     # Look for flight numbers in message
     all_flights = extract_all_flight_numbers(text)
     if all_flights and AVIATIONSTACK_API_KEY:
         outbound = all_flights[0]
-        return_flight = all_flights[1] if len(all_flights) > 1 else None
+        return_flight_num = all_flights[1] if len(all_flights) > 1 else None
 
         flight_data = lookup_flight(outbound)
         if flight_data:
@@ -2289,63 +2262,35 @@ def handle_overseas_request(text):
                 "arr_airport": flight_data["arr_airport"],
                 "arr_iata": flight_data["arr_iata"],
                 "arr_city": flight_data["arr_city"],
-                "return_date": "",
+                "return_flight_data": None,
             }
 
             reply = f"Found {outbound} ✈️\nDeparts: {dep_fmt}\nArrives: {arr_fmt} → {arr_label}\n"
 
-            if return_flight:
-                ret_data = lookup_flight(return_flight)
+            if return_flight_num:
+                ret_data = lookup_flight(return_flight_num)
                 if ret_data:
                     ret_dep = format_flight_time(ret_data["dep_time"])
                     ret_arr = format_flight_time(ret_data["arr_time"])
-                    pending["return_date"] = ret_data["dep_time"][:10] if ret_data["dep_time"] else ""
-                    reply += f"Return {return_flight}: {ret_dep} → {ret_arr}\n"
+                    ret_data["flight"] = return_flight_num
+                    pending["return_flight_data"] = ret_data
+                    reply += f"Return {return_flight_num}: {ret_dep} → {ret_arr}\n"
                 else:
-                    reply += f"(Couldn't find {return_flight} — I'll skip the return date)\n"
+                    reply += f"(Couldn't find {return_flight_num} — I'll skip the return)\n"
 
             overseas_state["_pending_flight"] = pending
-            reply += "\nReply Y to set overseas mode, or tell me the destination manually."
+            reply += "\nReply Y to confirm — overseas mode will activate at departure time."
             return reply
 
         else:
-            # AviationStack returned nothing — tell user exactly what happened
             return (
                 f"Looked up {outbound} on AviationStack but got no data back — "
                 f"the flight may not be in their system yet (free tier only covers flights within ~24hrs). "
-                f"Where are you headed? Just tell me the destination and I'll set it manually, "
-                f"e.g. 'Tokyo, back Monday'."
+                f"Where are you headed and when are you departing and returning?"
             )
 
-    # No flight number — parse destination from natural language
-    prompt = (
-        f"Extract travel details from: '{text}'\n\n"
-        f"Return ONLY JSON:\n"
-        f"- destination: string (city or country, empty if unknown)\n"
-        f"- currency: string (3-letter ISO code, empty if unknown)\n"
-        f"- return_date: string YYYY-MM-DD if mentioned, else empty\n\n"
-        f"Return ONLY the JSON."
-    )
-    resp = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=150,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    try:
-        parsed = json.loads(raw)
-        dest = parsed.get("destination", "").strip()
-        curr = parsed.get("currency", "").strip()
-        if not dest or not curr:
-            return "Where are you headed? e.g. 'Tokyo, back Monday' or just send me the flight number."
-        overseas_state["active"] = True
-        overseas_state["destination"] = dest
-        overseas_state["currency"] = curr
-        overseas_state["return_date"] = parsed.get("return_date", "")
-        return f"Overseas mode on — {dest} ({curr}). I'll log expenses in {curr} with SGD equivalent. 🌏"
-    except Exception as e:
-        print(f"handle_overseas_request parse error: {e} | raw: {raw}")
-        return "Where are you headed? e.g. 'Tokyo, back Monday' or just send me the flight number."
+    # No flight number — ask for details
+    return "What\'s your departure date/time and destination? And when are you back in SG?"
 
 async def handle_expense_session(user_id, text, update):
     """Handle merchant onboarding — asking for category and card."""
@@ -3485,56 +3430,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_edit_session(user_id, text, update)
         return
 
-    # Handle pending new CRM contact confirmation
-    if user_id in crm_confirm_sessions:
-        pending = crm_confirm_sessions.pop(user_id)
-        if text.strip().upper() == "Y":
-            name = pending["name"]
-            note = pending.get("note", "")
-            today = date.today().strftime("%d/%m/%Y")
-            crm_sheet().append_row([
-                name, "", "", "", "", note, "", "", today, "", "", "", "", ""
-            ])
-            reply = f"✅ Added *{name}* to CRM."
-            if note:
-                reply += f" Note saved: {note}"
-        else:
-            reply = "Skipped."
-        try:
-            await update.message.reply_text(reply, parse_mode="Markdown")
-        except Exception:
-            await update.message.reply_text(reply)
-        return
-
     # Pending flight confirmation — intercept the next message entirely
     if overseas_state.get("_pending_flight"):
         pf = overseas_state["_pending_flight"]
         if text.strip().upper() == "Y":
-            # Confirm: resolve destination and activate overseas mode
             overseas_state.pop("_pending_flight")
             info = get_dest_info_from_iata(pf.get("arr_iata", ""), pf.get("arr_city", pf.get("arr_airport", "")))
             dest = info.get("destination") or pf.get("arr_city") or pf.get("arr_airport", "Unknown")
             curr = info.get("currency", "SGD")
-            overseas_state["active"] = True
-            overseas_state["destination"] = dest
-            overseas_state["currency"] = curr
-            overseas_state["return_date"] = pf.get("return_date", "")
-            dep_fmt = format_flight_time(pf.get("dep_time", ""))
-            ret_date = pf.get("return_date", "")
-            ret_str = f"\nReturn: {format_flight_time(ret_date)}" if ret_date else ""
-            reply = (
-                f"Overseas mode on ✈️\n"
-                f"Destination: {dest}\n"
-                f"Currency: {curr}\n"
-                f"Departing: {dep_fmt}"
-                f"{ret_str}\n\n"
-                f"I'll log expenses in {curr} with SGD equivalent from now."
-            )
+            dep_str = pf.get("dep_time", "")
+            dep_fmt = format_flight_time(dep_str)
+            return_flight_data = pf.get("return_flight_data")
+            # Schedule activation at departure time
+            scheduled = False
+            if dep_str and _scheduler:
+                try:
+                    dep_dt = datetime.fromisoformat(dep_str.replace("Z", "+00:00"))
+                    dep_local = dep_dt.astimezone(TIMEZONE)
+                    now_local = datetime.now(TIMEZONE)
+                    if dep_local > now_local:
+                        job = _scheduler.add_job(
+                            activate_overseas_mode_scheduled,
+                            "date",
+                            run_date=dep_local,
+                            args=[dest, curr, return_flight_data]
+                        )
+                        overseas_state["dep_job_id"] = job.id
+                        overseas_state["destination"] = dest
+                        overseas_state["currency"] = curr
+                        scheduled = True
+                except Exception as e:
+                    print(f"Failed to schedule departure: {e}")
+            if scheduled:
+                ret_str = ""
+                if return_flight_data:
+                    ret_dep = format_flight_time(return_flight_data.get("dep_time", ""))
+                    ret_arr = format_flight_time(return_flight_data.get("arr_time", ""))
+                    ret_str = f"\nReturn: {return_flight_data.get('flight', '')} {ret_dep} → {ret_arr}"
+                reply = (
+                    f"Got it ✈️ Overseas mode will activate at departure: {dep_fmt}\n"
+                    f"Destination: {dest} ({curr}){ret_str}\n"
+                    f"I'll send a confirmation when it kicks in."
+                )
+            else:
+                # Departure already passed or no dep time — activate now
+                overseas_state["active"] = True
+                overseas_state["destination"] = dest
+                overseas_state["currency"] = curr
+                reply = (
+                    f"Overseas mode on ✈️\n"
+                    f"Destination: {dest}\nCurrency: {curr}\n"
+                    f"I'll log expenses in {curr} with SGD equivalent."
+                )
         elif text.strip().upper() == "N":
             overseas_state.pop("_pending_flight", None)
-            reply = "Got it — tell me the destination manually, e.g. 'Tokyo, back Monday'."
+            reply = "Got it — what's your departure date/time, destination, and when are you back in SG?"
         else:
-            # Anything else = manual destination override, clear pending and reprocess
+            # Anything else = manual destination override
             overseas_state.pop("_pending_flight", None)
             reply = handle_overseas_request(text)
         if reply:
@@ -3625,7 +3577,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif is_meeting_start(text):
         event_name = extract_event_name(text)
         meeting_sessions[user_id] = {
-            "step": "collecting" if event_name else "get_name",
+            "step": "collecting",
             "event_name": event_name,
             "notes": []
         }
@@ -3656,7 +3608,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif lower in ["delete last expense", "remove last expense"]:
         reply = delete_last_expense()
     elif is_overseas_mode_request(text):
-        reply = handle_overseas_request(text)
+        # Check if message has no flight number but conversation history does
+        if not extract_flight_number(text) and user_id in conversation_histories:
+            history_text = " ".join(
+                m["content"] for m in conversation_histories[user_id][-10:]
+                if m["role"] == "user"
+            )
+            found_flights = extract_all_flight_numbers(history_text)
+            if found_flights:
+                # Re-run with the flight numbers injected
+                reply = handle_overseas_request(" ".join(found_flights) + " " + text)
+            else:
+                reply = handle_overseas_request(text)
+        else:
+            reply = handle_overseas_request(text)
     elif is_expense_input(text):
         reply, needs_session, session_data = handle_expense_text(text, user_id)
         if needs_session and session_data:
@@ -3776,28 +3741,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_calendar_request(text):
             reply = smart_add_event(text, user_id)
         else:
-            # Freeform CRM: check if message is just a name (lookup or new contact)
-            words = text.strip().split()
-            if 1 <= len(words) <= 3 and text.strip().replace(" ", "").isalpha():
-                row_num, record = find_row(text.strip())
-                if record:
-                    reply = find_contact(text.strip())
-                else:
-                    # Unknown name — ask to confirm adding
-                    crm_confirm_sessions[user_id] = {"name": text.strip().title(), "note": ""}
-                    reply = f"*{text.strip().title()}* isn't in your CRM. Add them as a new contact? (Y/N)"
-            elif not reply:
-                if user_id not in conversation_histories:
-                    conversation_histories[user_id] = []
-                conversation_histories[user_id].append({"role": "user", "content": text})
-                response = client.messages.create(
-                    model="claude-sonnet-4-5",
-                    max_tokens=1024,
-                    system=build_system_prompt(),
-                    messages=conversation_histories[user_id]
-                )
-                reply = response.content[0].text
-                conversation_histories[user_id].append({"role": "assistant", "content": reply})
+            if user_id not in conversation_histories:
+                conversation_histories[user_id] = []
+            conversation_histories[user_id].append({"role": "user", "content": text})
+            response = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=1024,
+                system=build_system_prompt(),
+                messages=conversation_histories[user_id]
+            )
+            reply = response.content[0].text
+            conversation_histories[user_id].append({"role": "assistant", "content": reply})
 
     if reply:
         try:
@@ -3807,11 +3761,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main ---
 async def post_init(app):
+    global _scheduler, _app_ref
     # Run infrastructure setup
     run_infrastructure_setup()
 
     timezone = pytz.timezone("Asia/Kuala_Lumpur")
     scheduler = AsyncIOScheduler(timezone=timezone)
+    _scheduler = scheduler
+    _app_ref = app
 
     # Follow-up reminders at 9am
     scheduler.add_job(send_followup_reminders, "cron", hour=9, minute=0, args=[app])
