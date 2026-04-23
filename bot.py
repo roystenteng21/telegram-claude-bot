@@ -14,6 +14,7 @@ from googleapiclient.discovery import build
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
 import caldav
+import openpyxl
 
 load_dotenv()
 
@@ -845,7 +846,6 @@ def parse_excel_column_order(text):
 async def handle_excel_import(file_bytes, column_order, update):
     """Import contacts from Excel bytes using declared column order."""
     try:
-        import openpyxl
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
         ws_xl = wb.active
         rows = list(ws_xl.iter_rows(values_only=True))
@@ -967,8 +967,6 @@ async def handle_excel_import(file_bytes, column_order, update):
             msg += f", {skipped} skipped (already exist)"
         await update.message.reply_text(msg)
 
-    except ImportError:
-        await update.message.reply_text("openpyxl isn't installed. Run `pip install openpyxl` and redeploy.")
     except Exception as e:
         await update.message.reply_text(f"❌ Import failed: {str(e)}")
 
@@ -3320,7 +3318,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Auto-detect column order from the file's own header row
             try:
-                import openpyxl
                 wb_peek = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
                 ws_peek = wb_peek.active
                 first_row = next(ws_peek.iter_rows(max_row=1, values_only=True), None)
