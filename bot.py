@@ -1386,8 +1386,13 @@ async def check_and_fire_reminders(app):
 def is_reminder_request(text):
     """Detect if a message is asking to set a reminder."""
     lower = text.lower()
-    triggers = ["remind me", "set a reminder", "reminder for", "don't let me forget",
-                "alert me", "notify me", "ping me"]
+    triggers = [
+        "remind me", "remind", "set a reminder", "set me a reminder",
+        "reminder for", "reminder at", "reminder to",
+        "don't let me forget", "dont let me forget",
+        "alert me", "notify me", "ping me",
+        "drop me a reminder", "drop a reminder", "send me a reminder"
+    ]
     return any(t in lower for t in triggers)
 
 def is_reschedule_request(text):
@@ -2789,6 +2794,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = handle_stock_request(text)
             if result:
                 reply = result
+        elif is_reminder_request(text):
+            reply = handle_new_reminder(text)
         elif is_calendar_request(text):
             reply = smart_add_event(text, user_id)
         else:
