@@ -2032,6 +2032,7 @@ def is_overseas_mode_request(text):
 def lookup_flight(flight_number):
     """Look up flight details via AviationStack API. Returns dict or None."""
     if not AVIATIONSTACK_API_KEY:
+        print("Flight lookup: no AVIATIONSTACK_API_KEY set")
         return None
     try:
         url = "http://api.aviationstack.com/v1/flights"
@@ -2041,8 +2042,13 @@ def lookup_flight(flight_number):
         }
         resp = requests.get(url, params=params, timeout=10)
         data = resp.json()
+        print(f"AviationStack {flight_number}: {json.dumps(data)[:400]}")
+        if "error" in data:
+            print(f"AviationStack API error: {data['error']}")
+            return None
         flights = data.get("data", [])
         if not flights:
+            print(f"AviationStack: no data for {flight_number}")
             return None
         f = flights[0]
         dep = f.get("departure", {})
@@ -2050,96 +2056,142 @@ def lookup_flight(flight_number):
         return {
             "flight": flight_number.upper(),
             "dep_airport": dep.get("airport", ""),
+            "dep_iata": dep.get("iata", ""),
             "dep_time": dep.get("scheduled", ""),
             "arr_airport": arr.get("airport", ""),
+            "arr_iata": arr.get("iata", ""),
+            "arr_city": arr.get("city") or arr.get("airport", ""),
             "arr_time": arr.get("scheduled", ""),
-            "destination_city": arr.get("iata", ""),
         }
     except Exception as e:
-        print(f"Flight lookup error: {e}")
+        print(f"Flight lookup error for {flight_number}: {e}")
         return None
 
 def extract_flight_number(text):
-    """Extract a flight number like TR450, SQ321 from text."""
-    match = re.search(r'\b([A-Z]{1,3}\d{1,4}[A-Z]?)\b', text.upper())
-    return match.group(1) if match else None
+    """Extract first valid flight number (e.g. TR450, SQ321) from text."""
+    matches = re.findall(r'\b([A-Z]{1,3}\d{2,4}[A-Z]?)\b', text.upper())
+    return matches[0] if matches else None
+
+def extract_all_flight_numbers(text):
+    """Extract all flight numbers from text."""
+    return re.findall(r'\b([A-Z]{1,3}\d{2,4}[A-Z]?)\b', text.upper())
+
+def format_flight_time(iso_str):
+    """Format ISO datetime string to readable local time."""
+    if not iso_str:
+        return "time unknown"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.strftime("%d %b, %H:%M")
+    except:
+        return iso_str[:16]
+
+def get_dest_info_from_iata(iata_code, airport_name):
+    """Resolve IATA code + airport name to city and currency via Claude."""
+    prompt = (
+        f"Airport IATA code: '{iata_code}', airport name: '{airport_name}'.\n"
+        f"Return ONLY JSON: {{\"destination\": \"city name\", \"currency\": \"3-letter ISO code\"}}"
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=60,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(raw)
+    except:
+        return {"destination": airport_name or iata_code, "currency": "SGD"}
 
 def handle_overseas_request(text):
     """Toggle overseas mode on/off, with optional flight lookup."""
     global overseas_state
     lower = text.lower()
 
-    # Check if returning home
+    # Returning home
     if any(p in lower for p in ["back home", "returned", "i'm back", "landed back", "home now"]):
         overseas_state["active"] = False
         overseas_state["destination"] = ""
         overseas_state["currency"] = "SGD"
-        greetings = ["Welcome back!", "Good to have you back!", "Hope the trip was great!"]
+        overseas_state.pop("_pending_flight", None)
         import random
-        greeting = random.choice(greetings)
+        greeting = random.choice(["Welcome back!", "Good to have you back!", "Hope the trip was great!"])
         return f"{greeting} Switching back to SGD. 🏠"
 
-    # Check for flight number in the message
-    flight_number = extract_flight_number(text)
-    if flight_number and AVIATIONSTACK_API_KEY:
-        flight_data = lookup_flight(flight_number)
-        if flight_data:
-            dep_time = flight_data.get("dep_time", "")
-            arr_time = flight_data.get("arr_time", "")
-            arr_airport = flight_data.get("arr_airport", "")
-            # Store pending flight confirmation in overseas_state for next message
-            overseas_state["_pending_flight"] = {
-                "flight_number": flight_number,
-                "dep_time": dep_time,
-                "arr_time": arr_time,
-                "arr_airport": arr_airport,
-                "raw_text": text,
-            }
-            dep_fmt = dep_time[:16] if dep_time else "unknown"
-            arr_fmt = arr_time[:16] if arr_time else "unknown"
-            return (
-                f"Found flight {flight_number} ✈️\n"
-                f"Departs: {dep_fmt}\n"
-                f"Arrives: {arr_fmt} ({arr_airport})\n\n"
-                f"Confirm? Reply Y to set overseas mode, or send the destination manually."
-            )
-        else:
-            # Flight not found — fall through to manual parse
-            pass
-
-    # If confirming a pending flight
+    # Confirming a pending flight lookup
     if text.strip().upper() == "Y" and overseas_state.get("_pending_flight"):
         pf = overseas_state.pop("_pending_flight")
-        # Extract destination from arr_airport name via Claude
-        prompt = (
-            f"What is the local currency for the airport '{pf['arr_airport']}'? "
-            f"Return ONLY a JSON: {{\"destination\": \"city name\", \"currency\": \"3-letter code\"}}"
-        )
-        resp = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=50,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        try:
-            parsed = json.loads(resp.content[0].text.strip().replace("```json","").replace("```","").strip())
-            dest = parsed.get("destination", pf["arr_airport"])
-            curr = parsed.get("currency", "USD")
-        except:
-            dest = pf["arr_airport"]
-            curr = "USD"
+        info = get_dest_info_from_iata(pf.get("arr_iata", ""), pf.get("arr_city", pf.get("arr_airport", "")))
+        dest = info.get("destination") or pf.get("arr_city") or pf.get("arr_airport", "Unknown")
+        curr = info.get("currency", "SGD")
         overseas_state["active"] = True
         overseas_state["destination"] = dest
         overseas_state["currency"] = curr
-        overseas_state["return_date"] = ""
-        return f"Overseas mode on — {dest} ({curr}). I'll log expenses in {curr} with SGD equivalent. ✈️"
+        overseas_state["return_date"] = pf.get("return_date", "")
+        dep_fmt = format_flight_time(pf.get("dep_time", ""))
+        ret_date = pf.get("return_date", "")
+        ret_str = f"\nReturn: {format_flight_time(ret_date)}" if ret_date else ""
+        return (
+            f"Overseas mode on ✈️\n"
+            f"Destination: {dest}\n"
+            f"Currency: {curr}\n"
+            f"Departing: {dep_fmt}"
+            f"{ret_str}\n\n"
+            f"I'll log expenses in {curr} with SGD equivalent from now."
+        )
 
-    # Going overseas — extract destination and currency via Claude
+    # Look for flight numbers in message
+    all_flights = extract_all_flight_numbers(text)
+    if all_flights and AVIATIONSTACK_API_KEY:
+        outbound = all_flights[0]
+        return_flight = all_flights[1] if len(all_flights) > 1 else None
+
+        flight_data = lookup_flight(outbound)
+        if flight_data:
+            dep_fmt = format_flight_time(flight_data["dep_time"])
+            arr_fmt = format_flight_time(flight_data["arr_time"])
+            arr_label = flight_data["arr_city"] or flight_data["arr_airport"] or flight_data["arr_iata"]
+
+            pending = {
+                "flight_number": outbound,
+                "dep_time": flight_data["dep_time"],
+                "arr_time": flight_data["arr_time"],
+                "arr_airport": flight_data["arr_airport"],
+                "arr_iata": flight_data["arr_iata"],
+                "arr_city": flight_data["arr_city"],
+                "return_date": "",
+            }
+
+            reply = f"Found {outbound} ✈️\nDeparts: {dep_fmt}\nArrives: {arr_fmt} → {arr_label}\n"
+
+            if return_flight:
+                ret_data = lookup_flight(return_flight)
+                if ret_data:
+                    ret_dep = format_flight_time(ret_data["dep_time"])
+                    ret_arr = format_flight_time(ret_data["arr_time"])
+                    pending["return_date"] = ret_data["dep_time"][:10] if ret_data["dep_time"] else ""
+                    reply += f"Return {return_flight}: {ret_dep} → {ret_arr}\n"
+                else:
+                    reply += f"(Couldn't find {return_flight} — I'll skip the return date)\n"
+
+            overseas_state["_pending_flight"] = pending
+            reply += "\nReply Y to set overseas mode, or tell me the destination manually."
+            return reply
+
+        else:
+            # AviationStack returned nothing — ask directly
+            return (
+                f"Couldn't find {outbound} on AviationStack. "
+                f"Where are you headed? e.g. 'Tokyo, back Monday'"
+            )
+
+    # No flight number — parse destination from natural language
     prompt = (
         f"Extract travel details from: '{text}'\n\n"
-        f"Return ONLY JSON with:\n"
-        f"- destination: string (city or country name)\n"
-        f"- currency: string (3-letter currency code for that destination, e.g. JPY, USD, GBP)\n"
-        f"- return_date: string in YYYY-MM-DD format if mentioned, else empty string\n\n"
+        f"Return ONLY JSON:\n"
+        f"- destination: string (city or country, empty if unknown)\n"
+        f"- currency: string (3-letter ISO code, empty if unknown)\n"
+        f"- return_date: string YYYY-MM-DD if mentioned, else empty\n\n"
         f"Return ONLY the JSON."
     )
     resp = client.messages.create(
@@ -2147,18 +2199,20 @@ def handle_overseas_request(text):
         max_tokens=150,
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
     try:
         parsed = json.loads(raw)
+        dest = parsed.get("destination", "").strip()
+        curr = parsed.get("currency", "").strip()
+        if not dest or not curr:
+            return "Where are you headed? e.g. 'Tokyo, back Monday' or just send me the flight number."
         overseas_state["active"] = True
-        overseas_state["destination"] = parsed.get("destination", "")
-        overseas_state["currency"] = parsed.get("currency", "USD")
+        overseas_state["destination"] = dest
+        overseas_state["currency"] = curr
         overseas_state["return_date"] = parsed.get("return_date", "")
-        dest = overseas_state["destination"]
-        curr = overseas_state["currency"]
         return f"Overseas mode on — {dest} ({curr}). I'll log expenses in {curr} with SGD equivalent. 🌏"
     except:
-        return "Couldn't parse the travel details. Try: 'I'm in Tokyo, returning 25 Apr'."
+        return "Where are you headed? e.g. 'Tokyo, back Monday' or just send me the flight number."
 
 async def handle_expense_session(user_id, text, update):
     """Handle merchant onboarding — asking for category and card."""
