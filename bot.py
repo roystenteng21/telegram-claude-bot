@@ -597,10 +597,10 @@ def search_contacts(keyword):
         records = sheet.get_all_records()
         results = []
         for r in records:
-            if any(keyword.lower() in str(v).lower() for v in r.values()):  # Fixed bug: was keyword.modify()
+            if any(keyword.lower() in str(v).lower() for v in r.values()):
                 results.append(r)
         if not results:
-            return f"❌ No results for '{keyword}'"
+            return f"No contacts found matching '{keyword}' in the CRM."
         return f"🔍 *{len(results)} result(s) for '{keyword}':*\n\n" + "\n\n".join(format_contact(r) for r in results)
     except Exception as e:
         return f"❌ Error searching: {str(e)}"
@@ -634,8 +634,8 @@ def get_stats():
                     fu_date = datetime.strptime(fu, "%d/%m/%Y").date()
                     if fu_date >= today:
                         followups_due += 1
-                except:
-                    pass
+                except Exception as e:
+                    print(f"get_stats: bad follow up date in row: {e}")
             bday = r.get("Birthday", "")
             if bday:
                 try:
@@ -645,8 +645,8 @@ def get_stats():
                         this_year = b.replace(year=today.year + 1)
                     if (this_year - today).days <= 30:
                         birthdays_month += 1
-                except:
-                    pass
+                except Exception as e:
+                    print(f"get_stats: bad birthday in row: {e}")
         return (
             f"📊 *CRM Stats*\n\n"
             f"👥 Total contacts: {total}\n"
@@ -669,8 +669,8 @@ def upcoming_followups():
                     fu = datetime.strptime(fu_date, "%d/%m/%Y").date()
                     if fu >= today:
                         upcoming.append((fu, r))
-                except:
-                    pass
+                except Exception as e:
+                    print(f"upcoming_followups: bad date in row: {e}")
         if not upcoming:
             return "✅ No upcoming follow ups!"
         upcoming.sort(key=lambda x: x[0])
@@ -697,8 +697,8 @@ def overdue_followups():
                     fu = datetime.strptime(fu_date, "%d/%m/%Y").date()
                     if fu < today:
                         overdue.append((fu, r))
-                except:
-                    pass
+                except Exception as e:
+                    print(f"overdue_followups: bad date in row: {e}")
         if not overdue:
             return "✅ No overdue follow ups!"
         overdue.sort(key=lambda x: x[0])
@@ -730,8 +730,8 @@ def upcoming_birthdays(days=30):
                     days_away = (this_year - today).days
                     if days_away <= days:
                         upcoming.append((days_away, r))
-                except:
-                    pass
+                except Exception as e:
+                    print(f"upcoming_birthdays: bad date in row: {e}")
         if not upcoming:
             return f"🎂 No birthdays in the next {days} days!"
         upcoming.sort(key=lambda x: x[0])
@@ -1012,7 +1012,7 @@ def get_events(days=1):
     try:
         calendar = get_calendar("Personal")
         if not calendar:
-            return "❌ Could not connect to iCloud Calendar"
+            return "⚠️ Couldn't connect to iCloud Calendar — check that ICLOUD_USERNAME and ICLOUD_PASSWORD are set correctly in Railway."
         start = datetime.now()
         end = start + timedelta(days=days)
         events = calendar.date_search(start=start, end=end)
@@ -1031,7 +1031,7 @@ def get_events(days=1):
                 response += f"• *{summary}* — {dtstart}\n"
         return response
     except Exception as e:
-        return f"❌ Error fetching events: {str(e)}"
+        return f"⚠️ Calendar error: {str(e)} — if this keeps happening, check your iCloud credentials in Railway."
 
 def delete_calendar_event(title):
     try:
@@ -1051,17 +1051,70 @@ def delete_calendar_event(title):
         return f"❌ Error deleting event: {str(e)}"
 
 def is_calendar_request(text):
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=10,
-            messages=[{"role": "user", "content": f"""Is this message asking to add, schedule, create, book, set up, pencil in, or block out a calendar event? Reply with only YES or NO.
+    lower = text.lower().strip()
 
-Message: "{text}" """}]
-        )
-        return response.content[0].text.strip().upper() == "YES"
-    except:
+    # Tier 1: Hard keyword triggers — zero-cost instant match
+    CALENDAR_TRIGGERS = [
+        "schedule ", "add event", "create event", "new event",
+        "book ", "set up a meeting", "set up meeting",
+        "pencil in", "block out", "block off",
+        "put in my calendar", "add to calendar", "add to my calendar",
+        "add a meeting", "add meeting", "meeting at ", "meeting on ",
+        "dinner at ", "dinner on ", "lunch at ", "lunch on ",
+        "drinks at ", "drinks on ", "breakfast at ",
+        "call at ", "call on ", "appointment at ", "appointment on ",
+        "catch up at ", "catch up on ", "event at ", "event on ",
+        "remind me on calendar", "add reminder to calendar",
+    ]
+    if any(t in lower for t in CALENDAR_TRIGGERS):
+        return True
+
+    # Tier 2: Hard exclusions — zero-cost instant reject
+    EXCLUSIONS = [
+        "remind me", "reminder", "spent", "paid", "bought", "cost",
+        "expense", "bill", "price", "how much", "what time", "what's the time",
+        "stock", "portfolio", "restaurant", "save ", "note ", "find ",
+        "search ", "todo", "weather",
+    ]
+    if any(e in lower for e in EXCLUSIONS):
         return False
+
+    # Tier 3: Require a time anchor — calendar events always have one.
+    # Without a time anchor there is nothing to schedule, so skip the API call entirely.
+    TIME_WORDS = [
+        "tomorrow", "tonight", "monday", "tuesday", "wednesday",
+        "thursday", "friday", "saturday", "sunday", "next week",
+        "this evening", "this afternoon", "this morning", "next month",
+        "on the ", "this friday", "this saturday", "this sunday",
+    ]
+    AT_PATTERN = bool(re.search(r'\b(at|@)\s*\d{1,2}(:\d{2})?\s*(am|pm)?\b', lower))
+    DATE_PATTERN = bool(re.search(r'\b\d{1,2}[\/\-]\d{1,2}\b', lower))
+    has_time_anchor = AT_PATTERN or DATE_PATTERN or any(w in lower for w in TIME_WORDS)
+
+    if not has_time_anchor:
+        return False  # No time anchor → not a calendar request, no API call
+
+    # Tier 4: Has time anchor + event word → call Claude to confirm
+    # This is the only path that hits the API, and only when genuinely ambiguous
+    AMBIGUOUS_SIGNALS = [
+        "meet", "meeting", "catch up", "dinner", "lunch", "drinks",
+        "coffee", "call", "appointment", "event", "session",
+        "interview", "presentation", "visit",
+    ]
+    if any(s in lower for s in AMBIGUOUS_SIGNALS) or AT_PATTERN:
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=10,
+                messages=[{"role": "user", "content":
+                    f'Is this asking to add a calendar event? Reply YES or NO only.\n\n"{text}"'}]
+            )
+            return response.content[0].text.strip().upper() == "YES"
+        except Exception as e:
+            print(f"is_calendar_request API fallback error: {e}")
+            return False
+
+    return False
 
 # --- Smart Calendar ---
 def smart_add_event(text, user_id):
@@ -1195,8 +1248,8 @@ async def send_followup_reminders(app):
                             f"Don't forget to reach out today!"
                         )
                         await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=message, parse_mode="Markdown")
-                except:
-                    pass
+                except Exception as e:
+                    print(f"send_followup_reminders error for {r.get('Name','?')}: {e}")
     except Exception as e:
         print(f"Error sending follow up reminders: {e}")
 
@@ -1385,7 +1438,8 @@ def tag_crm_contacts(text):
             if name and name.lower() in text.lower():
                 tagged.append(name)
         return tagged
-    except:
+    except Exception as e:
+        print(f"tag_crm_contacts error: {e}")
         return []
 
 def process_meeting_notes(event_name, notes_list):
@@ -1567,7 +1621,8 @@ last_fired_reminder = {}
 def reminders_sheet():
     try:
         return spreadsheet.worksheet("Reminders")
-    except:
+    except Exception:
+        print("Reminders sheet not found — creating it")
         ws = spreadsheet.add_worksheet(title="Reminders", rows=500, cols=8)
         ws.append_row(["ID", "Message", "Scheduled Time", "Recurrence", "Status", "Attempts", "Contact"])
         return ws
@@ -1681,7 +1736,8 @@ def get_next_recurrence(scheduled_time_str, recurrence):
                 next_dt = dt.replace(month=dt.month + 1)
             return next_dt.strftime("%Y-%m-%d %H:%M")
         return None
-    except:
+    except Exception as e:
+        print(f"get_next_recurrence error: {e}")
         return None
 
 async def check_and_fire_reminders(app):
@@ -1702,7 +1758,8 @@ async def check_and_fire_reminders(app):
             try:
                 scheduled = datetime.strptime(scheduled_str, "%Y-%m-%d %H:%M")
                 scheduled = TIMEZONE.localize(scheduled)
-            except:
+            except Exception as e:
+                print(f"check_and_fire_reminders: bad scheduled time '{scheduled_str}': {e}")
                 continue
 
             # Fire if within the current minute
@@ -1800,7 +1857,8 @@ def handle_new_reminder(text):
         try:
             dt = datetime.strptime(scheduled_time, "%Y-%m-%d %H:%M")
             time_str = dt.strftime("%d %b %Y at %I:%M %p")
-        except:
+        except Exception as e:
+            print(f"handle_new_reminder: time format error: {e}")
             time_str = scheduled_time
 
         rec_str = f" ({recurrence})" if recurrence != "once" else ""
@@ -1833,7 +1891,8 @@ def handle_reschedule(text, user_id):
         try:
             dt = datetime.strptime(new_time, "%Y-%m-%d %H:%M")
             time_str = dt.strftime("%d %b at %I:%M %p")
-        except:
+        except Exception as e:
+            print(f"handle_reschedule: time format error: {e}")
             time_str = new_time
 
         return f"Got it, I'll remind you about {last['message']} again on {time_str}."
@@ -1894,8 +1953,8 @@ def get_merchant_memory(merchant):
         for r in records:
             if r.get("Merchant", "").lower() == merchant.lower():
                 return r.get("Category", ""), r.get("Card", "")
-    except:
-        pass
+    except Exception as e:
+        print(f"get_merchant_memory error for '{merchant}': {e}")
     return None, None
 
 def save_merchant_memory(merchant, category, card):
@@ -1940,12 +1999,12 @@ def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_
         category, card, receipt_link, reconciled, notes
     ])
 
-def format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount=None, fx_fee=None):
+def format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount=None, fx_fee=None, fx_source=""):
     """Format the expense confirmation message."""
     amount_str = f"{currency} {amount:.2f}" if currency != "SGD" else f"${amount:.2f}"
     lines = [f"🏪 {merchant}, {amount_str}"]
     if sgd_amount and currency != "SGD":
-        lines.append(f"SGD equivalent: ${sgd_amount:.2f}")
+        lines.append(f"SGD equivalent: ${sgd_amount:.2f}" + (f" ({fx_source})" if fx_source else ""))
         if fx_fee:
             lines.append(f"Est. FX fee: ${fx_fee:.2f}")
     lines.append(f"🗂 {category} | 💳 {card}")
@@ -1973,8 +2032,8 @@ def get_monthly_summary(month=None, year=None):
                 dt = datetime.strptime(d, "%d/%m/%Y")
                 if dt.month == target_month and dt.year == target_year:
                     month_records.append(r)
-            except:
-                pass
+            except Exception as e:
+                print(f"get_monthly_summary: bad date in row: {e}")
 
         if not month_records:
             return f"No expenses for {datetime(target_year, target_month, 1).strftime('%B %Y')}."
@@ -2083,7 +2142,8 @@ def format_flight_time(iso_str):
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
         return dt.strftime("%d %b, %H:%M")
-    except:
+    except Exception as e:
+        print(f"format_flight_time: bad ISO string '{iso_str}': {e}")
         return iso_str[:16]
 
 def get_dest_info_from_iata(iata_code, airport_name):
@@ -2100,7 +2160,8 @@ def get_dest_info_from_iata(iata_code, airport_name):
     raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
     try:
         return json.loads(raw)
-    except:
+    except Exception as e:
+        print(f"get_dest_info_from_iata JSON parse error: {e} | raw: {raw}")
         return {"destination": airport_name or iata_code, "currency": "SGD"}
 
 def handle_overseas_request(text):
@@ -2117,28 +2178,6 @@ def handle_overseas_request(text):
         import random
         greeting = random.choice(["Welcome back!", "Good to have you back!", "Hope the trip was great!"])
         return f"{greeting} Switching back to SGD. 🏠"
-
-    # Confirming a pending flight lookup
-    if text.strip().upper() == "Y" and overseas_state.get("_pending_flight"):
-        pf = overseas_state.pop("_pending_flight")
-        info = get_dest_info_from_iata(pf.get("arr_iata", ""), pf.get("arr_city", pf.get("arr_airport", "")))
-        dest = info.get("destination") or pf.get("arr_city") or pf.get("arr_airport", "Unknown")
-        curr = info.get("currency", "SGD")
-        overseas_state["active"] = True
-        overseas_state["destination"] = dest
-        overseas_state["currency"] = curr
-        overseas_state["return_date"] = pf.get("return_date", "")
-        dep_fmt = format_flight_time(pf.get("dep_time", ""))
-        ret_date = pf.get("return_date", "")
-        ret_str = f"\nReturn: {format_flight_time(ret_date)}" if ret_date else ""
-        return (
-            f"Overseas mode on ✈️\n"
-            f"Destination: {dest}\n"
-            f"Currency: {curr}\n"
-            f"Departing: {dep_fmt}"
-            f"{ret_str}\n\n"
-            f"I'll log expenses in {curr} with SGD equivalent from now."
-        )
 
     # Look for flight numbers in message
     all_flights = extract_all_flight_numbers(text)
@@ -2179,10 +2218,12 @@ def handle_overseas_request(text):
             return reply
 
         else:
-            # AviationStack returned nothing — ask directly
+            # AviationStack returned nothing — tell user exactly what happened
             return (
-                f"Couldn't find {outbound} on AviationStack. "
-                f"Where are you headed? e.g. 'Tokyo, back Monday'"
+                f"Looked up {outbound} on AviationStack but got no data back — "
+                f"the flight may not be in their system yet (free tier only covers flights within ~24hrs). "
+                f"Where are you headed? Just tell me the destination and I'll set it manually, "
+                f"e.g. 'Tokyo, back Monday'."
             )
 
     # No flight number — parse destination from natural language
@@ -2211,13 +2252,58 @@ def handle_overseas_request(text):
         overseas_state["currency"] = curr
         overseas_state["return_date"] = parsed.get("return_date", "")
         return f"Overseas mode on — {dest} ({curr}). I'll log expenses in {curr} with SGD equivalent. 🌏"
-    except:
+    except Exception as e:
+        print(f"handle_overseas_request parse error: {e} | raw: {raw}")
         return "Where are you headed? e.g. 'Tokyo, back Monday' or just send me the flight number."
 
 async def handle_expense_session(user_id, text, update):
     """Handle merchant onboarding — asking for category and card."""
     session = expense_sessions[user_id]
     step = session.get("step")
+
+    if step == "fx_rate":
+        try:
+            rate = float(text.strip().replace(",", "."))
+            if rate <= 0:
+                raise ValueError("Rate must be positive")
+        except ValueError:
+            currency = session.get("currency", "")
+            await update.message.reply_text(
+                f"That doesn't look right. Enter a positive number — e.g. '0.0093' means 1 {currency} = 0.0093 SGD."
+            )
+            return
+        merchant = session["merchant"]
+        amount = session["amount"]
+        currency = session["currency"]
+        category = session.get("category", "")
+        card = session.get("card", "")
+        sgd_amount = round(amount * rate, 2)
+        fx_fee = round(sgd_amount * CARD_FX_FEES[card] / 100, 2) if card in CARD_FX_FEES else None
+        fx_source = "manual rate"
+        session["sgd_amount"] = sgd_amount
+        session["fx_fee"] = fx_fee
+        session["fx_source"] = fx_source
+        # If category or card still needed, move to next step
+        if not category:
+            session["step"] = "category"
+            cats = ", ".join(EXPENSE_CATEGORIES)
+            await update.message.reply_text(f"Got it — SGD {sgd_amount:.2f}. What category? {cats}")
+            return
+        if not card:
+            session["step"] = "card"
+            cards = ", ".join(EXPENSE_CARDS)
+            await update.message.reply_text(f"Got it — SGD {sgd_amount:.2f}. Which card? {cards}")
+            return
+        # All info available — log directly
+        log_expense(merchant, amount, currency, sgd_amount, category, card)
+        del expense_sessions[user_id]
+        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, fx_fee, fx_source)
+        try:
+            await update.message.reply_text(confirmation, parse_mode="Markdown")
+        except Exception as e:
+            print(f"fx_rate confirmation send failed: {e}")
+            await update.message.reply_text(confirmation)
+        return
 
     if step == "category":
         # Validate category
@@ -2249,16 +2335,16 @@ async def handle_expense_session(user_id, text, update):
         card = session["card"]
         sgd_amount = session.get("sgd_amount", amount)
         fx_fee = session.get("fx_fee", None)
+        fx_source = session.get("fx_source", "")
         log_expense(merchant, amount, currency, sgd_amount, category, card)
         del expense_sessions[user_id]
-        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, fx_fee)
+        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, fx_fee, fx_source)
         try:
             await update.message.reply_text(confirmation, parse_mode="Markdown")
-        except:
+        except Exception as e:
+            print(f"Expense confirmation Markdown send failed, retrying plain: {e}")
             await update.message.reply_text(confirmation)
         return
-
-def handle_expense_text(text, user_id):
     """
     Process a text expense entry.
     Returns (reply_str, needs_session, session_data) 
@@ -2279,8 +2365,9 @@ def handle_expense_text(text, user_id):
         # Calculate SGD equivalent if foreign currency
         sgd_amount = amount
         fx_fee = None
+        fx_source = ""
+        rate = None
         if currency != "SGD":
-            rate = None
             # Try live exchange rate first
             if EXCHANGE_RATE_API_KEY:
                 try:
@@ -2289,9 +2376,12 @@ def handle_expense_text(text, user_id):
                     fx_data = fx_resp.json()
                     if fx_data.get("result") == "success":
                         rate = float(fx_data["conversion_rate"])
+                        fx_source = "live rate"
+                    else:
+                        print(f"ExchangeRate-API error: {fx_data}")
                 except Exception as e:
-                    print(f"ExchangeRate-API error: {e}")
-            # Fallback to Claude estimate if no key or request failed
+                    print(f"ExchangeRate-API exception: {e}")
+            # Fallback to Claude estimate
             if rate is None:
                 try:
                     fx_prompt = (
@@ -2304,8 +2394,26 @@ def handle_expense_text(text, user_id):
                         messages=[{"role": "user", "content": fx_prompt}]
                     )
                     rate = float(fx_resp_cl.content[0].text.strip())
-                except:
-                    rate = 1.0
+                    fx_source = "estimated rate (live FX unavailable)"
+                except Exception as e:
+                    print(f"Claude FX estimate failed: {e}")
+                    rate = None  # Will ask user below
+
+            # If rate still unknown — ask user, do not guess
+            if rate is None:
+                session = {
+                    "merchant": merchant,
+                    "amount": amount,
+                    "currency": currency,
+                    "category": category,
+                    "card": card,
+                    "step": "fx_rate"
+                }
+                return (
+                    f"Couldn't get the {currency}/SGD rate automatically. "
+                    f"What's the exchange rate? (e.g. '0.0093' means 1 {currency} = 0.0093 SGD)"
+                ), True, session
+
             sgd_amount = round(amount * rate, 2)
             if card in CARD_FX_FEES:
                 fx_fee = round(sgd_amount * CARD_FX_FEES[card] / 100, 2)
@@ -2325,6 +2433,7 @@ def handle_expense_text(text, user_id):
                 "currency": currency,
                 "sgd_amount": sgd_amount,
                 "fx_fee": fx_fee,
+                "fx_source": fx_source if currency != "SGD" else "",
                 "category": category,
                 "card": card,
                 "step": "category" if not category else "card"
@@ -2338,7 +2447,7 @@ def handle_expense_text(text, user_id):
 
         # All info available — log directly
         log_expense(merchant, amount, currency, sgd_amount, category, card)
-        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, fx_fee)
+        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, fx_fee, fx_source if currency != "SGD" else "")
         return confirmation, False, None
 
     except Exception as e:
@@ -2451,10 +2560,11 @@ def get_cycle_expenses(card_name, due_day):
                 card = r.get("Card", "")
                 if dt >= cycle_start and card_name.lower() in card.lower():
                     total += float(r.get("SGD Amount", 0) or r.get("Amount", 0))
-            except:
-                pass
+            except Exception as e:
+                print(f"get_cycle_expenses: bad row: {e}")
         return total
-    except:
+    except Exception as e:
+        print(f"get_cycle_expenses error: {e}")
         return 0
 
 async def send_bill_reminders(app):
@@ -2576,7 +2686,8 @@ def lookup_restaurant_from_maps(url):
     raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
     try:
         return json.loads(raw)
-    except:
+    except Exception as e:
+        print(f"lookup_restaurant_from_maps JSON parse error: {e} | raw: {raw}")
         return {"name": "", "location": "", "country": "Singapore"}
 
 def save_restaurant(name, location, country="Singapore", tags="", notes=""):
@@ -3033,7 +3144,9 @@ def handle_stock_request(text):
             data = fetch_price(ticker)
             if data:
                 return format_price(data)
-            return f"Couldn't fetch price for {ticker}. Check the ticker and try again."
+            if ALPHA_VANTAGE_API_KEY:
+                return f"Couldn't fetch {ticker} — Alpha Vantage and Yahoo Finance both failed. The ticker may be wrong, or try again in a moment."
+            return f"Couldn't fetch {ticker}. Check the ticker and try again."
 
         elif intent == "set_alert" and ticker:
             condition = parsed.get("alert_condition", "below")
@@ -3179,7 +3292,12 @@ def build_system_prompt():
         "Email and Address are private fields — never show them unless the user specifically asks.\n"
         "Age is calculated on the fly from Birthday — never store or display a static age.\n"
         "Always separate notes into individual bullet points. Never dump them in one line.\n\n"
-        "## What You Don't Do\n"
+        "## ABSOLUTE RULE — CRM Data\n"
+        "You NEVER invent, fabricate, guess, or generate contact information. "
+        "If asked about a person and no real data was retrieved from the sheet, "
+        "say you don't have them in the CRM. Never produce a formatted contact card "
+        "unless the data came directly from a sheet lookup in this same message. "
+        "This rule overrides everything else — no exceptions.\n\n"
         "- Sound stiff or corporate\n"
         "- Act like a typical AI assistant\n"
         "- Make small talk for the sake of it\n"
@@ -3207,7 +3325,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ws_peek = wb_peek.active
                 first_row = next(ws_peek.iter_rows(max_row=1, values_only=True), None)
                 auto_cols = [str(c).strip().replace('\xa0','') for c in first_row if c] if first_row else []
-            except:
+            except Exception as e:
+                print(f"Excel header auto-detect error: {e}")
                 auto_cols = []
 
             if auto_cols:
@@ -3275,9 +3394,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_edit_session(user_id, text, update)
         return
 
-    # Confirm pending flight for overseas mode
-    if text.strip().upper() == "Y" and overseas_state.get("_pending_flight"):
-        reply = handle_overseas_request(text)
+    # Pending flight confirmation — intercept the next message entirely
+    if overseas_state.get("_pending_flight"):
+        pf = overseas_state["_pending_flight"]
+        if text.strip().upper() == "Y":
+            # Confirm: resolve destination and activate overseas mode
+            overseas_state.pop("_pending_flight")
+            info = get_dest_info_from_iata(pf.get("arr_iata", ""), pf.get("arr_city", pf.get("arr_airport", "")))
+            dest = info.get("destination") or pf.get("arr_city") or pf.get("arr_airport", "Unknown")
+            curr = info.get("currency", "SGD")
+            overseas_state["active"] = True
+            overseas_state["destination"] = dest
+            overseas_state["currency"] = curr
+            overseas_state["return_date"] = pf.get("return_date", "")
+            dep_fmt = format_flight_time(pf.get("dep_time", ""))
+            ret_date = pf.get("return_date", "")
+            ret_str = f"\nReturn: {format_flight_time(ret_date)}" if ret_date else ""
+            reply = (
+                f"Overseas mode on ✈️\n"
+                f"Destination: {dest}\n"
+                f"Currency: {curr}\n"
+                f"Departing: {dep_fmt}"
+                f"{ret_str}\n\n"
+                f"I'll log expenses in {curr} with SGD equivalent from now."
+            )
+        elif text.strip().upper() == "N":
+            overseas_state.pop("_pending_flight", None)
+            reply = "Got it — tell me the destination manually, e.g. 'Tokyo, back Monday'."
+        else:
+            # Anything else = manual destination override, clear pending and reprocess
+            overseas_state.pop("_pending_flight", None)
+            reply = handle_overseas_request(text)
         if reply:
             try:
                 await update.message.reply_text(reply, parse_mode="Markdown")
