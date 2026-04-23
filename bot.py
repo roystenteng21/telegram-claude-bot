@@ -2204,6 +2204,317 @@ def handle_search_restaurants(text):
         return f"Error: {str(e)}"
 
 
+
+# =============================================================================
+# STOCK MARKET ACCESS (Step 8)
+# =============================================================================
+# Uses Yahoo Finance via yfinance (free, 15min delay for US, near-realtime for others)
+# Portfolio stored in Portfolio sheet
+# Price alerts stored in memory + checked every 15 minutes
+
+import urllib.request
+
+# Price alerts: { "AAPL": { "condition": "below", "price": 180.0, "active": True } }
+price_alerts = {}
+
+# Indices to track for weekly summary
+MARKET_INDICES = {
+    "US": {"^GSPC": "S&P 500", "^DJI": "Dow Jones", "^IXIC": "Nasdaq"},
+    "China": {"000001.SS": "Shanghai", "^HSI": "Hang Seng"},
+    "India": {"^BSESN": "Sensex", "^NSEI": "Nifty 50"},
+}
+
+def fetch_price(ticker):
+    """Fetch current price for a ticker using Yahoo Finance API."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2d"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        result = data["chart"]["result"][0]
+        meta = result["meta"]
+        price = meta.get("regularMarketPrice", 0)
+        prev_close = meta.get("chartPreviousClose", 0)
+        currency = meta.get("currency", "USD")
+        name = meta.get("longName") or meta.get("shortName") or ticker
+        change = price - prev_close
+        change_pct = (change / prev_close * 100) if prev_close else 0
+        return {
+            "ticker": ticker,
+            "name": name,
+            "price": price,
+            "prev_close": prev_close,
+            "change": change,
+            "change_pct": change_pct,
+            "currency": currency
+        }
+    except Exception as e:
+        return None
+
+def format_price(data):
+    """Format a price response naturally."""
+    if not data:
+        return None
+    arrow = "▲" if data["change"] >= 0 else "▼"
+    sign = "+" if data["change"] >= 0 else ""
+    return (
+        f"{data['name']} ({data['ticker']}): {data['currency']} {data['price']:.2f} "
+        f"{arrow} {sign}{data['change_pct']:.2f}%"
+    )
+
+def portfolio_sheet():
+    return spreadsheet.worksheet("Portfolio")
+
+def log_portfolio_buy(ticker, quantity, price, buy_date=None):
+    """Log a stock purchase to Portfolio sheet."""
+    sheet = portfolio_sheet()
+    today = buy_date or date.today().strftime("%d/%m/%Y")
+    sheet.append_row([ticker.upper(), str(quantity), str(price), today, ""])
+
+def get_portfolio_holdings():
+    """Get current holdings with average cost."""
+    try:
+        sheet = portfolio_sheet()
+        records = sheet.get_all_records()
+        holdings = {}
+        for r in records:
+            ticker = r.get("Stock", "").upper()
+            qty = float(r.get("Quantity", 0))
+            price = float(r.get("Buy Price", 0))
+            if ticker not in holdings:
+                holdings[ticker] = {"total_qty": 0, "total_cost": 0}
+            holdings[ticker]["total_qty"] += qty
+            holdings[ticker]["total_cost"] += qty * price
+        # Calculate averages
+        result = {}
+        for ticker, h in holdings.items():
+            if h["total_qty"] > 0:
+                result[ticker] = {
+                    "qty": h["total_qty"],
+                    "avg_cost": h["total_cost"] / h["total_qty"]
+                }
+        return result
+    except Exception as e:
+        print(f"Error getting portfolio: {e}")
+        return {}
+
+def get_portfolio_performance():
+    """Get portfolio performance — current vs average cost."""
+    holdings = get_portfolio_holdings()
+    if not holdings:
+        return "No holdings logged yet."
+
+    lines = ["Portfolio:\n"]
+    total_cost = 0
+    total_value = 0
+
+    for ticker, h in holdings.items():
+        data = fetch_price(ticker)
+        avg = h["avg_cost"]
+        qty = h["qty"]
+        cost = avg * qty
+
+        if data:
+            current = data["price"]
+            value = current * qty
+            pnl = value - cost
+            pnl_pct = (pnl / cost * 100) if cost else 0
+            sign = "+" if pnl >= 0 else ""
+            flag = "✅" if pnl >= 0 else "⚠️"
+            lines.append(
+                f"{flag} {ticker}: {qty:.0f} shares @ avg {data['currency']} {avg:.2f} "
+                f"| now {data['currency']} {current:.2f} | {sign}{pnl_pct:.1f}% ({sign}{data['currency']} {pnl:.2f})"
+            )
+            total_cost += cost
+            total_value += value
+        else:
+            lines.append(f"• {ticker}: {qty:.0f} shares @ avg {avg:.2f} (price unavailable)")
+            total_cost += cost
+
+    if total_cost > 0:
+        total_pnl = total_value - total_cost
+        total_pct = (total_pnl / total_cost * 100)
+        sign = "+" if total_pnl >= 0 else ""
+        lines.append(f"\nTotal P&L: {sign}{total_pct:.1f}% ({sign}${total_pnl:.2f})")
+
+    return "\n".join(lines)
+
+def set_price_alert(ticker, condition, price):
+    """Set a price alert for a ticker."""
+    ticker = ticker.upper()
+    price_alerts[ticker] = {"condition": condition, "price": price, "active": True}
+
+def parse_stock_request(text):
+    """Use Claude to parse a stock-related request."""
+    prompt = (
+        f"Parse this stock market request: '{text}'\n\n"
+        f"Return ONLY a JSON object with:\n"
+        f"- intent: string (one of: price_check, set_alert, portfolio_add, portfolio_view, "
+        f"stock_suggest, market_summary, price_alert_check)\n"
+        f"- ticker: string (stock ticker symbol, uppercase, or empty)\n"
+        f"- quantity: number (shares, or 0)\n"
+        f"- price: number (price per share, or 0)\n"
+        f"- alert_condition: string (above or below, or empty)\n"
+        f"- alert_price: number (alert trigger price, or 0)\n"
+        f"- criteria: string (for stock suggestions — describe what user wants)\n\n"
+        f"Return ONLY the JSON."
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+    return json.loads(raw)
+
+def suggest_stocks(criteria):
+    """Suggest 3 stocks based on described criteria."""
+    prompt = (
+        f"Suggest 3 stocks based on this criteria: '{criteria}'\n\n"
+        f"For each stock provide a qualitative summary. Flag concerns with a warning, all clear with a checkmark.\n\n"
+        f"Format your response exactly like this for each stock (with a divider line between each):\n\n"
+        f"TICKER — Company Name\n"
+        f"[checkmark or warning] [2-3 sentence qualitative summary. No numbers unless asked.]\n\n"
+        f"---\n\n"
+        f"Keep it concise and honest. Flag anything concerning."
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=600,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return resp.content[0].text.strip()
+
+async def check_price_alerts(app):
+    """Check price alerts every 15 minutes."""
+    try:
+        for ticker, alert in list(price_alerts.items()):
+            if not alert.get("active"):
+                continue
+            data = fetch_price(ticker)
+            if not data:
+                continue
+            current = data["price"]
+            condition = alert["condition"]
+            trigger = alert["price"]
+
+            triggered = (condition == "below" and current <= trigger) or                        (condition == "above" and current >= trigger)
+
+            if triggered:
+                msg = (
+                    f"🔔 Price alert: {ticker} is now {data['currency']} {current:.2f} "
+                    f"({condition} your target of {data['currency']} {trigger:.2f})"
+                )
+                await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
+                price_alerts[ticker]["active"] = False  # deactivate after firing
+
+    except Exception as e:
+        print(f"Error checking price alerts: {e}")
+
+async def send_weekly_market_summary(app):
+    """Monday 8am — send US, China, India market summary."""
+    try:
+        lines = []
+        sentiments = []
+
+        for market, indices in MARKET_INDICES.items():
+            market_lines = [f"{market}"]
+            market_changes = []
+
+            for ticker, name in indices.items():
+                data = fetch_price(ticker)
+                if data:
+                    arrow = "▲" if data["change_pct"] >= 0 else "▼"
+                    market_lines.append(f"• {name}: {arrow} {abs(data['change_pct']):.1f}%")
+                    market_changes.append(data["change_pct"])
+
+            if market_changes:
+                avg = sum(market_changes) / len(market_changes)
+                sentiment = "positive" if avg > 0.3 else "negative" if avg < -0.3 else "mixed"
+                sentiments.append(sentiment)
+                market_lines.append(f"Sentiment: {sentiment.title()}")
+
+            lines.append("\n".join(market_lines))
+
+        # Overall flag
+        if sentiments:
+            overall = "broadly positive" if sentiments.count("positive") >= 2 else                       "broadly negative" if sentiments.count("negative") >= 2 else "mixed"
+            lines.append(f"Overall: {overall}")
+
+        msg = "Weekly Market Summary\n\n" + "\n\n---\n\n".join(lines)
+        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
+
+    except Exception as e:
+        print(f"Error sending weekly market summary: {e}")
+
+def is_stock_request(text):
+    """Detect stock market related requests."""
+    lower = text.lower()
+    triggers = [
+        "stock", "share", "ticker", "portfolio", "holdings", "p&l",
+        "aapl", "tsla", "nvda", "price of", "what's ", "alert me if",
+        "alert if", "bought ", "sold ", "suggest stocks", "stock ideas",
+        "market summary", "how is the market", "market today"
+    ]
+    # Also catch common patterns
+    import re
+    ticker_pattern = re.search(r'\b[A-Z]{1,5}\b', text)
+    return any(t in lower for t in triggers) or bool(ticker_pattern and any(
+        t in lower for t in ["price", "at", "worth", "doing", "performing"]
+    ))
+
+def handle_stock_request(text):
+    """Route a stock request to the right handler."""
+    try:
+        parsed = parse_stock_request(text)
+        intent = parsed.get("intent", "")
+        ticker = parsed.get("ticker", "").upper()
+
+        if intent == "price_check" and ticker:
+            data = fetch_price(ticker)
+            if data:
+                return format_price(data)
+            return f"Couldn't fetch price for {ticker}. Check the ticker and try again."
+
+        elif intent == "set_alert" and ticker:
+            condition = parsed.get("alert_condition", "below")
+            alert_price = parsed.get("alert_price", 0)
+            if not alert_price:
+                return "What price should I alert you at? Try: 'alert me if AAPL drops below $180'"
+            set_price_alert(ticker, condition, alert_price)
+            return f"Alert set — I'll let you know when {ticker} goes {condition} ${alert_price:.2f}."
+
+        elif intent == "portfolio_add" and ticker:
+            qty = parsed.get("quantity", 0)
+            price = parsed.get("price", 0)
+            if not qty or not price:
+                return "I need the quantity and price. Try: 'bought 100 AAPL at $180'"
+            log_portfolio_buy(ticker, qty, price)
+            return f"Logged — {qty:.0f} {ticker} @ ${price:.2f}."
+
+        elif intent == "portfolio_view":
+            return get_portfolio_performance()
+
+        elif intent == "stock_suggest":
+            criteria = parsed.get("criteria", text)
+            return suggest_stocks(criteria)
+
+        elif intent == "market_summary":
+            # Trigger on-demand summary
+            return "Pulling the latest market data, give me a sec..."
+
+        else:
+            # Fallback — try price check if ticker found
+            if ticker:
+                data = fetch_price(ticker)
+                if data:
+                    return format_price(data)
+            return None  # Fall through to Claude chat
+
+    except Exception as e:
+        return f"Something went wrong: {str(e)}"
+
+
 # --- Em System Prompt Builder ---
 def build_system_prompt():
     """Build Em's system prompt, incorporating em_profile preferences."""
@@ -2398,6 +2709,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif lower.startswith("search restaurants "):
         reply = search_restaurants(text[19:].strip())
 
+    # Stock Commands
+    elif lower in ["portfolio", "my portfolio", "holdings", "portfolio performance"]:
+        reply = get_portfolio_performance()
+    elif lower in ["market summary", "market today", "how is the market"]:
+        reply = "Pulling latest market data..."
+        # Will be handled async — for now route to handle_stock_request
+        reply = handle_stock_request(text) or "Use 'weekly market summary' to get a full breakdown."
+    elif is_stock_request(text):
+        result = handle_stock_request(text)
+        if result:
+            reply = result
+
     # Todo Commands
     elif lower.startswith("todo "):
         reply = add_todo(text[5:])
@@ -2462,6 +2785,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply = handle_search_restaurants(text)
         elif is_bill_request(text):
             reply = handle_new_bill(text)
+        elif is_stock_request(text):
+            result = handle_stock_request(text)
+            if result:
+                reply = result
         elif is_calendar_request(text):
             reply = smart_add_event(text, user_id)
         else:
@@ -2506,8 +2833,14 @@ async def post_init(app):
     # Bill reminders — daily at 9am
     scheduler.add_job(send_bill_reminders, "cron", hour=9, minute=0, args=[app])
 
+    # Price alerts — check every 15 minutes
+    scheduler.add_job(check_price_alerts, "interval", minutes=15, args=[app])
+
+    # Weekly market summary — Monday 8am
+    scheduler.add_job(send_weekly_market_summary, "cron", day_of_week="mon", hour=8, minute=0, args=[app])
+
     scheduler.start()
-    print("✅ Scheduler started — follow-ups + bills at 9am, birthdays at 12pm + 2pm, reminders every minute")
+    print("✅ Scheduler started — follow-ups + bills at 9am, birthdays at 12pm + 2pm, reminders every minute, market Monday 8am")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
