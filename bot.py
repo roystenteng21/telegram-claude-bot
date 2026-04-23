@@ -2124,10 +2124,14 @@ def lookup_flight(flight_number):
             "dep_airport": dep.get("airport", ""),
             "dep_iata": dep.get("iata", ""),
             "dep_time": dep.get("scheduled", ""),
+            "dep_terminal": dep.get("terminal", ""),
+            "dep_gate": dep.get("gate", ""),
             "arr_airport": arr.get("airport", ""),
             "arr_iata": arr.get("iata", ""),
             "arr_city": arr.get("city") or arr.get("airport", ""),
             "arr_time": arr.get("scheduled", ""),
+            "arr_terminal": arr.get("terminal", ""),
+            "arr_gate": arr.get("gate", ""),
         }
     except Exception as e:
         print(f"Flight lookup error for {flight_number}: {e}")
@@ -2258,10 +2262,14 @@ def handle_overseas_request(text):
             pending = {
                 "flight_number": outbound,
                 "dep_time": flight_data["dep_time"],
+                "dep_terminal": flight_data.get("dep_terminal", ""),
+                "dep_gate": flight_data.get("dep_gate", ""),
                 "arr_time": flight_data["arr_time"],
                 "arr_airport": flight_data["arr_airport"],
                 "arr_iata": flight_data["arr_iata"],
                 "arr_city": flight_data["arr_city"],
+                "arr_terminal": flight_data.get("arr_terminal", ""),
+                "arr_gate": flight_data.get("arr_gate", ""),
                 "return_flight_data": None,
             }
 
@@ -3280,6 +3288,35 @@ def detect_crm_natural_update(text):
     return None
 
 
+def _build_overseas_flight_context():
+    """Return a flight context block for the system prompt if terminal/gate info is available."""
+    dep_terminal = overseas_state.get("dep_terminal", "")
+    dep_gate = overseas_state.get("dep_gate", "")
+    arr_terminal = overseas_state.get("arr_terminal", "")
+    arr_gate = overseas_state.get("arr_gate", "")
+    dep_flight = overseas_state.get("dep_flight", "")
+    dep_time = overseas_state.get("dep_time", "")
+
+    if not any([dep_terminal, dep_gate, arr_terminal, arr_gate]):
+        return ""
+
+    lines = ["\n\n## Upcoming Flight Info"]
+    if dep_flight:
+        lines.append(f"Flight: {dep_flight}")
+    if dep_time:
+        lines.append(f"Departure: {format_flight_time(dep_time)}")
+    if dep_terminal:
+        lines.append(f"Departure terminal: {dep_terminal}")
+    if dep_gate:
+        lines.append(f"Departure gate: {dep_gate}")
+    if arr_terminal:
+        lines.append(f"Arrival terminal: {arr_terminal}")
+    if arr_gate:
+        lines.append(f"Arrival gate: {arr_gate}")
+    lines.append("Use this info to answer questions about terminals and gates directly.")
+    return "\n".join(lines)
+
+
 # --- Em System Prompt Builder ---
 def build_system_prompt():
     """Build Em's system prompt, incorporating em_profile preferences."""
@@ -3338,7 +3375,7 @@ def build_system_prompt():
         "- Act like a typical AI assistant\n"
         "- Make small talk for the sake of it\n"
         "- Get repetitive with phrases or greetings"
-    )
+    ) + _build_overseas_flight_context()
 
 # --- Message Handler ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3458,6 +3495,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         overseas_state["dep_job_id"] = job.id
                         overseas_state["destination"] = dest
                         overseas_state["currency"] = curr
+                        overseas_state["dep_flight"] = pf.get("flight_number", "")
+                        overseas_state["dep_time"] = pf.get("dep_time", "")
+                        overseas_state["dep_terminal"] = pf.get("dep_terminal", "")
+                        overseas_state["dep_gate"] = pf.get("dep_gate", "")
+                        overseas_state["arr_terminal"] = pf.get("arr_terminal", "")
+                        overseas_state["arr_gate"] = pf.get("arr_gate", "")
                         scheduled = True
                 except Exception as e:
                     print(f"Failed to schedule departure: {e}")
@@ -3477,6 +3520,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 overseas_state["active"] = True
                 overseas_state["destination"] = dest
                 overseas_state["currency"] = curr
+                overseas_state["dep_flight"] = pf.get("flight_number", "")
+                overseas_state["dep_time"] = pf.get("dep_time", "")
+                overseas_state["dep_terminal"] = pf.get("dep_terminal", "")
+                overseas_state["dep_gate"] = pf.get("dep_gate", "")
+                overseas_state["arr_terminal"] = pf.get("arr_terminal", "")
+                overseas_state["arr_gate"] = pf.get("arr_gate", "")
                 reply = (
                     f"Overseas mode on ✈️\n"
                     f"Destination: {dest}\nCurrency: {curr}\n"
@@ -3733,9 +3782,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_bill_request(text):
             reply = handle_new_bill(text)
         elif is_stock_request(text):
-            result = handle_stock_request(text)
-            if result:
-                reply = result
+            reply = handle_stock_request(text)
         elif is_reminder_request(text):
             reply = handle_new_reminder(text)
         elif is_calendar_request(text):
@@ -3752,6 +3799,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             reply = response.content[0].text
             conversation_histories[user_id].append({"role": "assistant", "content": reply})
+
+    if not reply:
+        try:
+            fallback_response = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=300,
+                system=(
+                    "You are Em, a personal assistant bot built in Python using python-telegram-bot and the Anthropic API. "
+                    "The user just sent a message that no handler in the bot code recognised — it fell through everything. "
+                    "Acknowledge you couldn't handle it in one short sentence (casual, no corporate speak). "
+                    "Then suggest one concrete thing the developer could add to the bot to support this — "
+                    "be specific about what kind of handler, function, or API would help. "
+                    "Keep it to 2-3 sentences total. No bullet points."
+                ),
+                messages=[{"role": "user", "content": text}]
+            )
+            reply = fallback_response.content[0].text
+        except Exception as e:
+            print(f"Fallback Claude call failed: {e}")
+            reply = "Not sure how to handle that one — might be worth adding a handler for it in the bot code."
 
     if reply:
         try:
