@@ -1833,6 +1833,377 @@ def get_expense_report(report_type="monthly"):
     return get_monthly_summary()
 
 
+
+# =============================================================================
+# BILL REMINDERS (Step 6)
+# =============================================================================
+
+BILL_REMINDER_GREETINGS = [
+    "Heads up", "Just a nudge", "Quick reminder", "Hey", "FYI"
+]
+
+def bills_sheet():
+    return spreadsheet.worksheet("Bills")
+
+def parse_bill_request(text):
+    """Parse a natural language bill setup request."""
+    prompt = (
+        f"Extract bill details from: '{text}'\n\n"
+        f"Return ONLY a JSON object with:\n"
+        f"- name: string (bill name, e.g. 'Citi Credit Card', 'Netflix', 'Electricity')\n"
+        f"- bank: string (bank or provider name, or empty)\n"
+        f"- due_day: number (day of month the bill is due, e.g. 15)\n"
+        f"- estimated_amount: number (estimated amount in SGD, or 0 if not mentioned)\n"
+        f"- notes: string (any extra notes, or empty)\n\n"
+        f"Return ONLY the JSON."
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+    return json.loads(raw)
+
+def add_bill(name, bank, due_day, estimated_amount, notes=""):
+    """Add a bill to the Bills sheet."""
+    sheet = bills_sheet()
+    sheet.append_row([name, bank, str(due_day), str(estimated_amount), notes])
+
+def list_bills():
+    """List all bills."""
+    try:
+        sheet = bills_sheet()
+        records = sheet.get_all_records()
+        if not records:
+            return "No bills set up yet."
+        lines = ["Your bills:\n"]
+        for r in records:
+            amt = r.get("Estimated Amount", "")
+            amt_str = f" — ~${amt}" if amt and str(amt) != "0" else ""
+            lines.append(f"• {r.get('Name', '')} (due day {r.get('Due Date', '')}){amt_str}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing bills: {str(e)}"
+
+def delete_bill(name):
+    """Delete a bill by name."""
+    try:
+        sheet = bills_sheet()
+        records = sheet.get_all_records()
+        for i, r in enumerate(records):
+            if name.lower() in r.get("Name", "").lower():
+                sheet.delete_rows(i + 2)
+                return f"Deleted bill: {r.get('Name')}"
+        return f"No bill found matching '{name}'."
+    except Exception as e:
+        return f"Error deleting bill: {str(e)}"
+
+def get_cycle_expenses(card_name, due_day):
+    """Sum expenses for a card in the current billing cycle."""
+    try:
+        sheet = expenses_sheet()
+        records = sheet.get_all_records()
+        today = date.today()
+        # Billing cycle: from last due date to today
+        if today.day >= due_day:
+            cycle_start = today.replace(day=due_day)
+        else:
+            if today.month == 1:
+                cycle_start = today.replace(year=today.year - 1, month=12, day=due_day)
+            else:
+                cycle_start = today.replace(month=today.month - 1, day=due_day)
+
+        total = 0
+        for r in records:
+            try:
+                dt = datetime.strptime(r.get("Date", ""), "%d/%m/%Y").date()
+                card = r.get("Card", "")
+                if dt >= cycle_start and card_name.lower() in card.lower():
+                    total += float(r.get("SGD Amount", 0) or r.get("Amount", 0))
+            except:
+                pass
+        return total
+    except:
+        return 0
+
+async def send_bill_reminders(app):
+    """Daily 9am job — check for bills due in 7 days."""
+    import random
+    try:
+        sheet = bills_sheet()
+        records = sheet.get_all_records()
+        today = date.today()
+
+        for r in records:
+            try:
+                due_day = int(r.get("Due Date", 0))
+                if not due_day:
+                    continue
+
+                # Calculate next due date
+                if today.day <= due_day:
+                    next_due = today.replace(day=due_day)
+                else:
+                    if today.month == 12:
+                        next_due = today.replace(year=today.year + 1, month=1, day=due_day)
+                    else:
+                        next_due = today.replace(month=today.month + 1, day=due_day)
+
+                days_away = (next_due - today).days
+
+                if days_away == 7:
+                    name = r.get("Name", "")
+                    estimated = r.get("Estimated Amount", "")
+
+                    # Try to get actual cycle spend
+                    cycle_total = get_cycle_expenses(name, due_day)
+                    amount_str = f"${cycle_total:.2f} logged this cycle" if cycle_total > 0 else (f"~${estimated}" if estimated and str(estimated) != "0" else "amount unknown")
+
+                    greeting = random.choice(BILL_REMINDER_GREETINGS)
+                    msg = (
+                        f"{greeting} — your {name} bill is due in 7 days ({next_due.strftime('%d %b')}).\n"
+                        f"{amount_str}."
+                    )
+                    await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
+
+            except Exception as e:
+                print(f"Bill reminder error for {r.get('Name', '?')}: {e}")
+
+    except Exception as e:
+        print(f"Error in send_bill_reminders: {e}")
+
+def is_bill_request(text):
+    """Detect bill setup intent."""
+    lower = text.lower()
+    triggers = ["bill is due", "bill due", "set up a bill", "add a bill", "my bill",
+                "credit card bill", "due on the", "due every", "remind me about my"]
+    return any(t in lower for t in triggers)
+
+def handle_new_bill(text):
+    """Parse and save a new bill."""
+    try:
+        parsed = parse_bill_request(text)
+        name = parsed.get("name", "")
+        bank = parsed.get("bank", "")
+        due_day = parsed.get("due_day", 0)
+        estimated_amount = parsed.get("estimated_amount", 0)
+        notes = parsed.get("notes", "")
+
+        if not name or not due_day:
+            return "Couldn't get the bill details. Try: 'my Citi bill is due on the 15th, usually around $800'."
+
+        add_bill(name, bank, due_day, estimated_amount, notes)
+        amt_str = f", estimated ~${estimated_amount}" if estimated_amount else ""
+        return f"Got it, I'll remind you about your {name} bill 7 days before it's due (day {due_day} of each month{amt_str})."
+    except Exception as e:
+        return f"Couldn't save that bill: {str(e)}"
+
+
+# =============================================================================
+# RESTAURANT TRACKER (Step 7)
+# =============================================================================
+
+def restaurants_sheet():
+    return spreadsheet.worksheet("Restaurants")
+
+def parse_restaurant_save(text):
+    """Parse a restaurant save request — name, location, tags, notes."""
+    prompt = (
+        f"Extract restaurant details from: '{text}'\n\n"
+        f"Return ONLY a JSON object with:\n"
+        f"- name: string (restaurant name)\n"
+        f"- location: string (address or area, e.g. 'Teck Lim Road' or 'Shibuya, Tokyo')\n"
+        f"- country: string (country, default 'Singapore' if not mentioned)\n"
+        f"- tags: string (comma-separated tags like 'date night, japanese, omakase' — only if mentioned, else empty)\n"
+        f"- notes: string (any notes like 'need reservation', 'cash only' — only if mentioned, else empty)\n\n"
+        f"Return ONLY the JSON."
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+    return json.loads(raw)
+
+def lookup_restaurant_from_maps(url):
+    """Extract restaurant name and address from a Google Maps URL via Claude."""
+    prompt = (
+        f"Given this Google Maps URL: {url}\n\n"
+        f"Extract the restaurant/place name and address from the URL itself (don't browse it).\n"
+        f"Return ONLY a JSON object with:\n"
+        f"- name: string (place name if visible in URL, else empty)\n"
+        f"- location: string (area or address if visible, else empty)\n"
+        f"- country: string (country if determinable from URL, else 'Singapore')\n\n"
+        f"Return ONLY the JSON."
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=150,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+    try:
+        return json.loads(raw)
+    except:
+        return {"name": "", "location": "", "country": "Singapore"}
+
+def save_restaurant(name, location, country="Singapore", tags="", notes=""):
+    """Save a restaurant to the Restaurants sheet."""
+    sheet = restaurants_sheet()
+    sheet.append_row([name, location, country, tags, notes])
+
+def format_restaurant_saved(name, location, tags="", notes=""):
+    """Format the restaurant saved confirmation."""
+    lines = ["Saved!"]
+    lines.append(f"🏪 {name}")
+    lines.append(f"📍 {location}")
+    if tags:
+        lines.append(f"🏷 {tags}")
+    if notes:
+        lines.append(f"📝 {notes}")
+    return "\n".join(lines)
+
+def search_restaurants(query):
+    """Search restaurants by cuisine, location, or tag."""
+    try:
+        sheet = restaurants_sheet()
+        records = sheet.get_all_records()
+        if not records:
+            return "No restaurants saved yet."
+
+        query_lower = query.lower()
+        results = []
+        for r in records:
+            searchable = " ".join(str(v).lower() for v in r.values())
+            if query_lower in searchable:
+                results.append(r)
+
+        if not results:
+            return f"No restaurants found matching '{query}'."
+
+        lines = [f"{len(results)} restaurant(s) found:\n"]
+        for r in results:
+            line = f"🏪 {r.get('Name', '')} — 📍 {r.get('Location', '')}"
+            if r.get("Tags"):
+                line += f" ({r.get('Tags')})"
+            lines.append(line)
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error searching restaurants: {str(e)}"
+
+def list_restaurants(country_filter=None):
+    """List all saved restaurants, optionally filtered by country."""
+    try:
+        sheet = restaurants_sheet()
+        records = sheet.get_all_records()
+        if not records:
+            return "No restaurants saved yet."
+
+        if country_filter:
+            records = [r for r in records if country_filter.lower() in r.get("Country", "").lower()]
+
+        if not records:
+            return f"No restaurants saved for {country_filter}."
+
+        lines = [f"{len(records)} saved restaurant(s):\n"]
+        for r in records:
+            line = f"🏪 {r.get('Name', '')} — 📍 {r.get('Location', '')}"
+            if r.get("Tags"):
+                line += f" ({r.get('Tags')})"
+            lines.append(line)
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing restaurants: {str(e)}"
+
+def delete_restaurant(name):
+    """Delete a restaurant by name."""
+    try:
+        sheet = restaurants_sheet()
+        records = sheet.get_all_records()
+        for i, r in enumerate(records):
+            if name.lower() in r.get("Name", "").lower():
+                sheet.delete_rows(i + 2)
+                return f"Removed {r.get('Name')} from your list."
+        return f"No restaurant found matching '{name}'."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def is_restaurant_save(text):
+    """Detect restaurant save intent."""
+    lower = text.lower()
+    triggers = ["save restaurant", "add restaurant", "save this place", "add this place",
+                "want to try", "add to my list", "save to my list", "maps.google",
+                "goo.gl/maps", "restaurant to try", "place to try", "log this restaurant"]
+    return any(t in lower for t in triggers)
+
+def is_restaurant_search(text):
+    """Detect restaurant search intent."""
+    lower = text.lower()
+    triggers = ["find a restaurant", "search restaurants", "any restaurants",
+                "restaurant recommendations", "where to eat", "restaurants in",
+                "show my restaurants", "my restaurant list", "saved restaurants"]
+    return any(t in lower for t in triggers)
+
+def handle_save_restaurant(text):
+    """Handle saving a restaurant from text or maps link."""
+    try:
+        # Check if it contains a Maps URL
+        if "maps.google" in text or "goo.gl/maps" in text or "maps.app.goo" in text:
+            # Extract URL
+            words = text.split()
+            url = next((w for w in words if "map" in w.lower() or "goo.gl" in w.lower()), "")
+            parsed = lookup_restaurant_from_maps(url)
+            name = parsed.get("name", "")
+            location = parsed.get("location", "")
+            country = parsed.get("country", "Singapore")
+            tags = ""
+            notes = ""
+
+            if not name:
+                return "I got the link but couldn't extract the name. Try: 'save Burnt Ends, Teck Lim Road, tag: date night'"
+        else:
+            parsed = parse_restaurant_save(text)
+            name = parsed.get("name", "")
+            location = parsed.get("location", "")
+            country = parsed.get("country", "Singapore")
+            tags = parsed.get("tags", "")
+            notes = parsed.get("notes", "")
+
+        if not name:
+            return "What's the restaurant name? Try: 'save Burnt Ends, Teck Lim Road'"
+
+        save_restaurant(name, location, country, tags, notes)
+        return format_restaurant_saved(name, location, tags, notes)
+
+    except Exception as e:
+        return f"Couldn't save that restaurant: {str(e)}"
+
+def handle_search_restaurants(text):
+    """Handle a restaurant search request."""
+    try:
+        lower = text.lower()
+        # Check if listing all
+        if "my restaurant list" in lower or "show my restaurants" in lower or "saved restaurants" in lower:
+            return list_restaurants()
+
+        # Extract search term
+        for trigger in ["restaurants in", "find a restaurant", "any restaurants",
+                        "where to eat", "restaurant recommendations", "search restaurants"]:
+            if trigger in lower:
+                query = lower.replace(trigger, "").strip()
+                if query:
+                    return search_restaurants(query)
+                else:
+                    return list_restaurants()
+
+        # Fallback — search by full text
+        return search_restaurants(text)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
 # --- Em System Prompt Builder ---
 def build_system_prompt():
     """Build Em's system prompt, incorporating em_profile preferences."""
@@ -2008,6 +2379,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if needs_session and session_data:
             expense_sessions[user_id] = session_data
 
+    # Bill Commands
+    elif lower in ["bills", "my bills", "list bills"]:
+        reply = list_bills()
+    elif lower.startswith("delete bill "):
+        reply = delete_bill(text[12:].strip())
+    elif is_bill_request(text):
+        reply = handle_new_bill(text)
+
+    # Restaurant Commands
+    elif lower.startswith("delete restaurant ") or lower.startswith("remove restaurant "):
+        name = text.split(" ", 2)[2].strip()
+        reply = delete_restaurant(name)
+    elif is_restaurant_search(text):
+        reply = handle_search_restaurants(text)
+    elif is_restaurant_save(text):
+        reply = handle_save_restaurant(text)
+    elif lower.startswith("search restaurants "):
+        reply = search_restaurants(text[19:].strip())
+
     # Todo Commands
     elif lower.startswith("todo "):
         reply = add_todo(text[5:])
@@ -2066,6 +2456,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 expense_sessions[user_id] = session_data
         elif is_overseas_mode_request(text):
             reply = handle_overseas_request(text)
+        elif is_restaurant_save(text):
+            reply = handle_save_restaurant(text)
+        elif is_restaurant_search(text):
+            reply = handle_search_restaurants(text)
+        elif is_bill_request(text):
+            reply = handle_new_bill(text)
         elif is_calendar_request(text):
             reply = smart_add_event(text, user_id)
         else:
@@ -2107,8 +2503,11 @@ async def post_init(app):
     # Custom reminders — check every minute
     scheduler.add_job(check_and_fire_reminders, "interval", minutes=1, args=[app])
 
+    # Bill reminders — daily at 9am
+    scheduler.add_job(send_bill_reminders, "cron", hour=9, minute=0, args=[app])
+
     scheduler.start()
-    print("✅ Scheduler started — follow-ups at 9am, birthdays at 12pm + 2pm, reminders every minute")
+    print("✅ Scheduler started — follow-ups + bills at 9am, birthdays at 12pm + 2pm, reminders every minute")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
