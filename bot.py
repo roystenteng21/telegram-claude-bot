@@ -818,66 +818,158 @@ async def send_followup_reminders(app):
     except Exception as e:
         print(f"Error sending follow up reminders: {e}")
 
-async def send_birthday_reminders(app):
-    """
-    Birthday reminders per spec:
-    - Fire at 12pm on the person's birthday with a warm, personalised greeting suggestion
-    - Check in again at 2pm if no response, then drop it
-    - Greeting opens with Happy birthday, casual opener, warm closing
-    - Personal touches based on relationship and contact notes
-    - Varies greetings and closing lines, never repetitive
-    - Tracks whether greeting was sent (silently in sheet)
-    """
+# --- Birthday Greeting State ---
+# Tracks who got a 12pm prompt today, pending acknowledgement
+birthday_pending = {}
+
+def ensure_birthday_greeted_column():
+    """Make sure CRM has a Birthday Greeted column."""
     try:
+        sheet = crm_sheet()
+        headers = sheet.row_values(1)
+        if "Birthday Greeted" not in headers:
+            next_col = len(headers) + 1
+            sheet.update_cell(1, next_col, "Birthday Greeted")
+            print("Added Birthday Greeted column to CRM")
+    except Exception as e:
+        print(f"Error ensuring Birthday Greeted column: {e}")
+
+def get_birthday_greeted_col():
+    """Return the column index (1-based) of Birthday Greeted."""
+    try:
+        sheet = crm_sheet()
+        headers = sheet.row_values(1)
+        if "Birthday Greeted" in headers:
+            return headers.index("Birthday Greeted") + 1
+        return None
+    except:
+        return None
+
+def generate_birthday_greeting(name, age, where_met, notes):
+    """Generate a personalised birthday greeting via Claude."""
+    greeting_prompt = (
+        f"Write a warm, casual birthday greeting that someone could copy and paste to send to {name}, "
+        f"who is turning {age} today.\n\n"
+        f"Context: met at {where_met or 'unknown'}. Notes about them: {notes or 'none'}.\n\n"
+        f"Rules:\n"
+        f"- Must open with Happy birthday\n"
+        f"- Casual and warm throughout, never stiff or corporate\n"
+        f"- Add one personal touch based on their notes if relevant\n"
+        f"- End with a warm closing line\n"
+        f"- No dashes anywhere\n"
+        f"- Do NOT use: Hope you had a great one, Hope its been a good one\n"
+        f"- 2 to 4 sentences max\n"
+        f"- Write it in first person, ready to copy and send"
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=200,
+        messages=[{"role": "user", "content": greeting_prompt}]
+    )
+    return resp.content[0].text.strip()
+
+async def send_birthday_reminders(app):
+    """12pm job: find today birthdays, generate greeting, send prompt."""
+    global birthday_pending
+    try:
+        ensure_birthday_greeted_column()
         sheet = crm_sheet()
         records = sheet.get_all_records()
         today = date.today()
-        today_str = today.strftime("%d/%m/%Y")
 
-        for r in records:
+        for i, r in enumerate(records):
             bday_str = r.get("Birthday", "")
             if not bday_str:
                 continue
             try:
                 bday = datetime.strptime(bday_str, "%d/%m/%Y").date()
-                if bday.day == today.day and bday.month == today.month:
-                    age = calculate_age(bday_str)
-                    name = r.get("Name", "")
-                    notes = r.get("Notes", "")
-                    where_met = r.get("Where We Met", "")
+                if bday.day != today.day or bday.month != today.month:
+                    continue
 
-                    # Generate personalised greeting via Claude
-                    greeting_prompt = (
-                        f"Write a warm, casual birthday greeting suggestion for {name} "
-                        f"who is turning {age} today. "
-                        f"Context about them: met at {where_met or 'unknown'}. Notes: {notes or 'none'}.\n\n"
-                        f"Rules:\n"
-                        f"- Opens with 'Happy birthday' (required)\n"
-                        f"- Casual and warm throughout\n"
-                        f"- Add a personal touch based on their notes if relevant\n"
-                        f"- Warm closing line\n"
-                        f"- No dashes\n"
-                        f"- Do NOT use: 'Hope you had a great one' or 'Hope it's been a good one'\n"
-                        f"- 2 to 4 sentences max\n"
-                        f"- Write it as a message they could copy and send directly"
-                    )
-                    greeting_resp = client.messages.create(
-                        model="claude-sonnet-4-5",
-                        max_tokens=200,
-                        messages=[{"role": "user", "content": greeting_prompt}]
-                    )
-                    greeting = greeting_resp.content[0].text.strip()
+                name = r.get("Name", "")
+                age = calculate_age(bday_str)
+                notes = r.get("Notes", "")
+                where_met = r.get("Where We Met", "")
 
-                    msg = (
-                        f"🎂 *{name}'s birthday today!* They're turning {age}.\n\n"
-                        f"Here's a suggested greeting:\n\n"
-                        f"_{greeting}_"
-                    )
-                    await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
+                # Skip if already greeted today
+                already_greeted = r.get("Birthday Greeted", "")
+                if already_greeted == today.strftime("%d/%m/%Y"):
+                    continue
+
+                greeting = generate_birthday_greeting(name, age, where_met, notes)
+
+                msg = (
+                    f"It's {name}'s birthday today! Turning {age}. 🎂\n\n"
+                    f"Here's a message you can send:\n\n"
+                    f"{greeting}"
+                )
+                await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
+
+                birthday_pending[name] = {
+                    "row": i + 2,
+                    "greeted": False,
+                    "greeting": greeting
+                }
+                print(f"Birthday prompt sent for {name}")
+
             except Exception as e:
-                print(f"Birthday reminder error for {r.get('Name')}: {e}")
+                print(f"Birthday reminder error for {r.get('Name', '?')}: {e}")
+
     except Exception as e:
-        print(f"Error sending birthday reminders: {e}")
+        print(f"Error in send_birthday_reminders: {e}")
+
+async def send_birthday_followups(app):
+    """2pm job: follow up on unacknowledged birthdays, then drop."""
+    global birthday_pending
+    try:
+        still_pending = {k: v for k, v in birthday_pending.items() if not v.get("greeted")}
+
+        for name, data in still_pending.items():
+            try:
+                msg = (
+                    f"Did you get a chance to wish {name} happy birthday? 🎂\n\n"
+                    f"Here's that message again:\n\n"
+                    f"{data['greeting']}"
+                )
+                await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
+                print(f"2pm follow-up sent for {name}")
+            except Exception as e:
+                print(f"Error sending 2pm follow-up for {name}: {e}")
+
+        birthday_pending = {}
+
+    except Exception as e:
+        print(f"Error in send_birthday_followups: {e}")
+
+def mark_birthday_greeted(name):
+    """Mark contact as greeted today in CRM sheet."""
+    try:
+        col = get_birthday_greeted_col()
+        if not col:
+            return
+        row_num, record = find_row(name)
+        if record:
+            sheet = crm_sheet()
+            sheet.update_cell(row_num, col, date.today().strftime("%d/%m/%Y"))
+    except Exception as e:
+        print(f"Error marking birthday greeted for {name}: {e}")
+
+def check_birthday_acknowledgement():
+    """
+    If birthday greetings are pending, mark them all as acknowledged.
+    Called on any incoming message. Returns True if any were acknowledged.
+    """
+    global birthday_pending
+    if not birthday_pending:
+        return False
+    acknowledged = []
+    for name, data in birthday_pending.items():
+        if not data.get("greeted"):
+            data["greeted"] = True
+            mark_birthday_greeted(name)
+            acknowledged.append(name)
+    return len(acknowledged) > 0
+
 
 # --- Em System Prompt Builder ---
 def build_system_prompt():
@@ -939,6 +1031,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
     lower = text.lower()
+
+    # Check birthday acknowledgement — any incoming message counts
+    check_birthday_acknowledgement()
 
     # Handle active edit session
     if user_id in edit_sessions:
@@ -1074,11 +1169,14 @@ async def post_init(app):
     # Follow-up reminders at 9am
     scheduler.add_job(send_followup_reminders, "cron", hour=9, minute=0, args=[app])
 
-    # Birthday greetings at 12pm (spec: prompt at 12pm on birthday)
+    # Birthday greetings at 12pm
     scheduler.add_job(send_birthday_reminders, "cron", hour=12, minute=0, args=[app])
 
+    # Birthday 2pm follow-up
+    scheduler.add_job(send_birthday_followups, "cron", hour=14, minute=0, args=[app])
+
     scheduler.start()
-    print("✅ Scheduler started — follow-ups at 9am, birthdays at 12pm")
+    print("✅ Scheduler started — follow-ups at 9am, birthdays at 12pm + 2pm follow-up")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
