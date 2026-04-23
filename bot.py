@@ -1468,6 +1468,371 @@ def handle_reschedule(text, user_id):
         return f"Couldn't reschedule: {str(e)}"
 
 
+
+# =============================================================================
+# EXPENSE TRACKER
+# =============================================================================
+
+EXPENSE_CATEGORIES = ["FnB", "Entertainment", "Personal", "Family", "Work", "Transport", "Shopping", "Travel"]
+EXPENSE_CARDS = ["Citi", "Maybank", "Amex", "UOB"]
+
+# Foreign transaction fee estimates per card (%)
+CARD_FX_FEES = {"Citi": 3.25, "Maybank": 3.0, "Amex": 3.0, "UOB": 3.25}
+
+# Overseas mode state
+overseas_state = {
+    "active": False,
+    "destination": "",
+    "currency": "SGD",
+    "return_date": ""
+}
+
+# Pending new merchant — waiting for user to confirm category + card
+# { user_id: { "merchant": str, "amount": float, "currency": str, "step": "category"|"card" } }
+expense_sessions = {}
+
+# Pending reconciliation session
+# { user_id: { "items": [...], "current_index": int } }
+recon_sessions = {}
+
+EXPENSE_CONTEXT_EMOJIS = {
+    "FnB": ["☕", "🍜", "🍣", "🥗", "🍕", "🍔", "🧋"],
+    "Entertainment": ["🎬", "🎮", "🎵", "🎭"],
+    "Personal": ["💈", "🛍️", "💊"],
+    "Family": ["👨‍👩‍👧", "🏠", "🎁"],
+    "Work": ["💼", "📊", "🖥️"],
+    "Transport": ["🚗", "🚕", "✈️", "🚌"],
+    "Shopping": ["🛒", "👟", "👗"],
+    "Travel": ["🌏", "🏨", "🗺️"]
+}
+
+def expenses_sheet():
+    return spreadsheet.worksheet("Expenses")
+
+def merchant_map_sheet():
+    return spreadsheet.worksheet("Merchant Map")
+
+def get_merchant_memory(merchant):
+    """Look up known merchant in Merchant Map. Returns (category, card) or (None, None)."""
+    try:
+        sheet = merchant_map_sheet()
+        records = sheet.get_all_records()
+        for r in records:
+            if r.get("Merchant", "").lower() == merchant.lower():
+                return r.get("Category", ""), r.get("Card", "")
+    except:
+        pass
+    return None, None
+
+def save_merchant_memory(merchant, category, card):
+    """Save new merchant to Merchant Map."""
+    try:
+        sheet = merchant_map_sheet()
+        sheet.append_row([merchant, category, card])
+    except Exception as e:
+        print(f"Error saving merchant: {e}")
+
+def get_expense_emoji(category):
+    import random
+    emojis = EXPENSE_CONTEXT_EMOJIS.get(category, ["💳"])
+    return random.choice(emojis)
+
+def parse_expense_text(text):
+    """Use Claude to extract expense details from natural language."""
+    prompt = (
+        f"Extract expense details from this message: '{text}'\n\n"
+        f"Return ONLY a JSON object with:\n"
+        f"- merchant: string (store/restaurant name, title case)\n"
+        f"- amount: number (just the number, no currency symbol)\n"
+        f"- currency: string (3-letter code, default SGD)\n"
+        f"- category: string (one of: FnB, Entertainment, Personal, Family, Work, Transport, Shopping, Travel) or empty if unclear\n"
+        f"- card: string (one of: Citi, Maybank, Amex, UOB) or empty if not mentioned\n\n"
+        f"Return ONLY the JSON."
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+    return json.loads(raw)
+
+def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link="", reconciled="No", notes=""):
+    """Append expense row to Expenses sheet."""
+    today = date.today().strftime("%d/%m/%Y")
+    sheet = expenses_sheet()
+    sheet.append_row([
+        today, merchant, amount, currency, sgd_amount,
+        category, card, receipt_link, reconciled, notes
+    ])
+
+def format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount=None, fx_fee=None):
+    """Format the expense confirmation message."""
+    amount_str = f"{currency} {amount:.2f}" if currency != "SGD" else f"${amount:.2f}"
+    lines = [f"🏪 {merchant}, {amount_str}"]
+    if sgd_amount and currency != "SGD":
+        lines.append(f"SGD equivalent: ${sgd_amount:.2f}")
+        if fx_fee:
+            lines.append(f"Est. FX fee: ${fx_fee:.2f}")
+    lines.append(f"🗂 {category} | 💳 {card}")
+    lines.append(f"Receipt has been uploaded {get_expense_emoji(category)}")
+    return "\n".join(lines)
+
+def get_monthly_summary(month=None, year=None):
+    """Generate monthly expense summary."""
+    try:
+        sheet = expenses_sheet()
+        records = sheet.get_all_records()
+        if not records:
+            return "No expenses logged yet."
+
+        today = date.today()
+        target_month = month or today.month
+        target_year = year or today.year
+
+        month_records = []
+        for r in records:
+            d = r.get("Date", "")
+            if not d:
+                continue
+            try:
+                dt = datetime.strptime(d, "%d/%m/%Y")
+                if dt.month == target_month and dt.year == target_year:
+                    month_records.append(r)
+            except:
+                pass
+
+        if not month_records:
+            return f"No expenses for {datetime(target_year, target_month, 1).strftime('%B %Y')}."
+
+        total = sum(float(r.get("SGD Amount", 0) or r.get("Amount", 0)) for r in month_records)
+
+        # Category breakdown
+        cat_totals = {c: 0 for c in EXPENSE_CATEGORIES}
+        for r in month_records:
+            cat = r.get("Category", "")
+            if cat in cat_totals:
+                amt = float(r.get("SGD Amount", 0) or r.get("Amount", 0))
+                cat_totals[cat] += amt
+
+        # Card breakdown
+        card_totals = {c: 0 for c in EXPENSE_CARDS}
+        for r in month_records:
+            card = r.get("Card", "")
+            if card in card_totals:
+                amt = float(r.get("SGD Amount", 0) or r.get("Amount", 0))
+                card_totals[card] += amt
+
+        month_label = datetime(target_year, target_month, 1).strftime("%B %Y")
+        lines = [f"Monthly Summary — {month_label}\n"]
+
+        for cat, amt in cat_totals.items():
+            lines.append(f"{cat}: ${amt:.2f}")
+
+        lines.append(f"\nTotal: ${total:.2f}")
+        lines.append("\nBy card:")
+        for card, amt in card_totals.items():
+            if amt > 0:
+                lines.append(f"{card}: ${amt:.2f}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error generating summary: {str(e)}"
+
+def is_expense_input(text):
+    """Detect if message looks like an expense entry."""
+    lower = text.lower()
+    triggers = ["spent", "paid", "$", "sgd", "charged", "bought", "grabbed",
+                "receipt", "bill was", "cost me", "picked up"]
+    return any(t in lower for t in triggers)
+
+def is_overseas_mode_request(text):
+    """Detect overseas mode toggle."""
+    lower = text.lower()
+    return ("overseas" in lower or "travelling" in lower or "traveling" in lower or
+            "i'm in" in lower or "flying to" in lower or "arrived in" in lower or
+            "back home" in lower or "returned" in lower or "i'm back" in lower)
+
+def handle_overseas_request(text):
+    """Toggle overseas mode on/off."""
+    global overseas_state
+    lower = text.lower()
+
+    # Check if returning home
+    if any(p in lower for p in ["back home", "returned", "i'm back", "landed back", "home now"]):
+        overseas_state["active"] = False
+        dest = overseas_state.get("destination", "")
+        overseas_state["destination"] = ""
+        overseas_state["currency"] = "SGD"
+        greetings = ["Welcome back!", "Good to have you back!", "Hope the trip was great!"]
+        import random
+        greeting = random.choice(greetings)
+        return f"{greeting} Switching back to SGD. 🏠"
+
+    # Going overseas — extract destination and currency
+    prompt = (
+        f"Extract travel details from: '{text}'\n\n"
+        f"Return ONLY JSON with:\n"
+        f"- destination: string (city or country name)\n"
+        f"- currency: string (3-letter currency code for that destination, e.g. JPY, USD, GBP)\n"
+        f"- return_date: string in YYYY-MM-DD format if mentioned, else empty string\n\n"
+        f"Return ONLY the JSON."
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=150,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+    try:
+        parsed = json.loads(raw)
+        overseas_state["active"] = True
+        overseas_state["destination"] = parsed.get("destination", "")
+        overseas_state["currency"] = parsed.get("currency", "USD")
+        overseas_state["return_date"] = parsed.get("return_date", "")
+        dest = overseas_state["destination"]
+        curr = overseas_state["currency"]
+        return f"Overseas mode on — {dest} ({curr}). I'll log expenses in {curr} with SGD equivalent. 🌏"
+    except:
+        return "Couldn't parse the travel details. Try: 'I'm in Tokyo, returning 25 Apr'."
+
+async def handle_expense_session(user_id, text, update):
+    """Handle merchant onboarding — asking for category and card."""
+    session = expense_sessions[user_id]
+    step = session.get("step")
+
+    if step == "category":
+        # Validate category
+        matched = next((c for c in EXPENSE_CATEGORIES if c.lower() == text.strip().lower()), None)
+        if not matched:
+            cats = ", ".join(EXPENSE_CATEGORIES)
+            await update.message.reply_text(f"Pick a category: {cats}")
+            return
+        session["category"] = matched
+        session["step"] = "card"
+        cards = ", ".join(EXPENSE_CARDS)
+        await update.message.reply_text(f"Which card? {cards}")
+        return
+
+    if step == "card":
+        matched = next((c for c in EXPENSE_CARDS if c.lower() == text.strip().lower()), None)
+        if not matched:
+            cards = ", ".join(EXPENSE_CARDS)
+            await update.message.reply_text(f"Pick a card: {cards}")
+            return
+        session["card"] = matched
+        # Save merchant memory
+        save_merchant_memory(session["merchant"], session["category"], session["card"])
+        # Now log the expense
+        merchant = session["merchant"]
+        amount = session["amount"]
+        currency = session["currency"]
+        category = session["category"]
+        card = session["card"]
+        sgd_amount = session.get("sgd_amount", amount)
+        fx_fee = session.get("fx_fee", None)
+        log_expense(merchant, amount, currency, sgd_amount, category, card)
+        del expense_sessions[user_id]
+        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, fx_fee)
+        try:
+            await update.message.reply_text(confirmation, parse_mode="Markdown")
+        except:
+            await update.message.reply_text(confirmation)
+        return
+
+def handle_expense_text(text, user_id):
+    """
+    Process a text expense entry.
+    Returns (reply_str, needs_session, session_data) 
+    needs_session=True means we need to ask category/card
+    """
+    try:
+        parsed = parse_expense_text(text)
+        merchant = parsed.get("merchant", "Unknown")
+        amount = float(parsed.get("amount", 0))
+        currency = parsed.get("currency", "SGD")
+        category = parsed.get("category", "")
+        card = parsed.get("card", "")
+
+        # If overseas mode active and no currency in message, use overseas currency
+        if overseas_state["active"] and currency == "SGD":
+            currency = overseas_state["currency"]
+
+        # Calculate SGD equivalent if foreign currency
+        sgd_amount = amount
+        fx_fee = None
+        if currency != "SGD":
+            # We don't have live FX — ask Claude for approximate rate
+            fx_prompt = (
+                f"What is the approximate exchange rate from {currency} to SGD today? "
+                f"Return ONLY a single number (the SGD value of 1 {currency}). No text."
+            )
+            fx_resp = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=20,
+                messages=[{"role": "user", "content": fx_prompt}]
+            )
+            try:
+                rate = float(fx_resp.content[0].text.strip())
+                sgd_amount = round(amount * rate, 2)
+                if card in CARD_FX_FEES:
+                    fx_fee = round(sgd_amount * CARD_FX_FEES[card] / 100, 2)
+            except:
+                sgd_amount = amount
+
+        # Check merchant memory
+        known_cat, known_card = get_merchant_memory(merchant)
+        if known_cat:
+            category = known_cat
+        if known_card:
+            card = known_card
+
+        # If still missing category or card — start onboarding session
+        if not category or not card:
+            session = {
+                "merchant": merchant,
+                "amount": amount,
+                "currency": currency,
+                "sgd_amount": sgd_amount,
+                "fx_fee": fx_fee,
+                "category": category,
+                "card": card,
+                "step": "category" if not category else "card"
+            }
+            if not category:
+                cats = ", ".join(EXPENSE_CATEGORIES)
+                return f"New merchant — {merchant}. What category? {cats}", True, session
+            else:
+                cards = ", ".join(EXPENSE_CARDS)
+                return f"Which card for {merchant}? {cards}", True, session
+
+        # All info available — log directly
+        log_expense(merchant, amount, currency, sgd_amount, category, card)
+        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, fx_fee)
+        return confirmation, False, None
+
+    except Exception as e:
+        return f"Couldn't parse that expense: {str(e)}", False, None
+
+def delete_last_expense():
+    """Delete the most recently added expense row."""
+    try:
+        sheet = expenses_sheet()
+        all_values = sheet.get_all_values()
+        if len(all_values) <= 1:
+            return "No expenses to delete."
+        last_row = len(all_values)
+        last = all_values[last_row - 1]
+        sheet.delete_rows(last_row)
+        return f"Deleted last expense: {last[1]} ${last[2]}"
+    except Exception as e:
+        return f"Error deleting expense: {str(e)}"
+
+def get_expense_report(report_type="monthly"):
+    """Generate expense report."""
+    return get_monthly_summary()
+
+
 # --- Em System Prompt Builder ---
 def build_system_prompt():
     """Build Em's system prompt, incorporating em_profile preferences."""
@@ -1535,6 +1900,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle active meeting recap session
     if user_id in meeting_sessions:
         await handle_meeting_session(user_id, text, update)
+        return
+
+    # Handle active expense onboarding session
+    if user_id in expense_sessions:
+        await handle_expense_session(user_id, text, update)
         return
 
     # Handle active CRM edit session
@@ -1626,6 +1996,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif is_reminder_request(text):
         reply = handle_new_reminder(text)
 
+    # Expense Commands
+    elif lower in ["expense report", "monthly report", "spending report", "expenses"]:
+        reply = get_expense_report()
+    elif lower in ["delete last expense", "remove last expense"]:
+        reply = delete_last_expense()
+    elif is_overseas_mode_request(text):
+        reply = handle_overseas_request(text)
+    elif is_expense_input(text):
+        reply, needs_session, session_data = handle_expense_text(text, user_id)
+        if needs_session and session_data:
+            expense_sessions[user_id] = session_data
+
     # Todo Commands
     elif lower.startswith("todo "):
         reply = add_todo(text[5:])
@@ -1678,6 +2060,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply = handle_reschedule(text, user_id)
         elif is_reminder_request(text):
             reply = handle_new_reminder(text)
+        elif is_expense_input(text):
+            reply, needs_session, session_data = handle_expense_text(text, user_id)
+            if needs_session and session_data:
+                expense_sessions[user_id] = session_data
+        elif is_overseas_mode_request(text):
+            reply = handle_overseas_request(text)
         elif is_calendar_request(text):
             reply = smart_add_event(text, user_id)
         else:
