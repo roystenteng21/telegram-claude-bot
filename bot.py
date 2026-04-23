@@ -3701,6 +3701,35 @@ async def handle_statement_upload(file_bytes, fname, user_id, update):
 
 
 # --- Em System Prompt Builder ---
+def _build_overseas_flight_context():
+    """Return a flight context block for the system prompt if terminal/gate info is available."""
+    dep_terminal = overseas_state.get("dep_terminal", "")
+    dep_gate = overseas_state.get("dep_gate", "")
+    arr_terminal = overseas_state.get("arr_terminal", "")
+    arr_gate = overseas_state.get("arr_gate", "")
+    dep_flight = overseas_state.get("dep_flight", "")
+    dep_time = overseas_state.get("dep_time", "")
+
+    if not any([dep_terminal, dep_gate, arr_terminal, arr_gate]):
+        return ""
+
+    lines = ["\n\n## Upcoming Flight Info"]
+    if dep_flight:
+        lines.append(f"Flight: {dep_flight}")
+    if dep_time:
+        lines.append(f"Departure: {format_flight_time(dep_time)}")
+    if dep_terminal:
+        lines.append(f"Departure terminal: {dep_terminal}")
+    if dep_gate:
+        lines.append(f"Departure gate: {dep_gate}")
+    if arr_terminal:
+        lines.append(f"Arrival terminal: {arr_terminal}")
+    if arr_gate:
+        lines.append(f"Arrival gate: {arr_gate}")
+    lines.append("Use this info to answer questions about terminals and gates directly.")
+    return "\n".join(lines)
+
+
 def build_system_prompt():
     """Build Em's system prompt, incorporating em_profile preferences."""
     profile_notes = ""
