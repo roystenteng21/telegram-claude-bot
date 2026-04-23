@@ -1917,10 +1917,13 @@ overseas_state = {
     "active": False,
     "destination": "",
     "currency": "SGD",
+    "currencies": [],          # all currencies used this trip (multi-currency support)
     "return_date": "",
-    "dep_job_id": None,       # scheduler job ID for departure activation
-    "return_job_id": None,    # scheduler job ID for return deactivation
-    "return_flight": None,    # return flight data dict
+    "dep_job_id": None,        # scheduler job ID for departure activation
+    "return_job_id": None,     # scheduler job ID for return deactivation
+    "return_flight": None,     # return flight data dict
+    "trip_start": None,        # date string DD/MM/YYYY when overseas mode activated
+    "trip_destinations": [],   # list of destinations visited this trip
 }
 
 # Global scheduler reference (set in post_init)
@@ -1931,9 +1934,68 @@ _app_ref = None
 # { user_id: { "merchant": str, "amount": float, "currency": str, "step": "category"|"card" } }
 expense_sessions = {}
 
-# Pending reconciliation session
-# { user_id: { "items": [...], "current_index": int } }
+# Reconciliation sessions — { user_id: { "step": str, "unmatched": [...], "index": int } }
 recon_sessions = {}
+
+# Cached FX rates — { "JPY_SGD": { "rate": 0.0093, "fetched_at": datetime } }
+cached_fx_rates = {}
+
+def get_fx_rate(currency):
+    """Return SGD rate for given currency. Uses cache if under 12hrs, else fetches fresh."""
+    if currency == "SGD":
+        return 1.0
+    cache_key = f"{currency}_SGD"
+    cached = cached_fx_rates.get(cache_key)
+    if cached:
+        age = datetime.now(pytz.utc) - cached["fetched_at"]
+        if age.total_seconds() < 43200:  # 12 hours
+            return cached["rate"]
+    # Fetch fresh
+    if EXCHANGE_RATE_API_KEY:
+        try:
+            url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_RATE_API_KEY}/pair/{currency}/SGD"
+            resp = requests.get(url, timeout=8)
+            data = resp.json()
+            if data.get("result") == "success":
+                rate = float(data["conversion_rate"])
+                cached_fx_rates[cache_key] = {"rate": rate, "fetched_at": datetime.now(pytz.utc)}
+                print(f"FX cache updated: 1 {currency} = {rate} SGD")
+                return rate
+        except Exception as e:
+            print(f"FX fetch error for {currency}: {e}")
+    # Fallback to Claude estimate
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=20,
+            messages=[{"role": "user", "content": f"What is the approximate exchange rate from {currency} to SGD today? Return ONLY a single number. No text."}]
+        )
+        rate = float(resp.content[0].text.strip())
+        cached_fx_rates[cache_key] = {"rate": rate, "fetched_at": datetime.now(pytz.utc)}
+        print(f"FX cache (Claude estimate): 1 {currency} = {rate} SGD")
+        return rate
+    except Exception as e:
+        print(f"Claude FX estimate failed for {currency}: {e}")
+        return None
+
+async def refresh_fx_rates(app=None):
+    """Refresh cached FX rates for all active overseas currencies. Called twice daily."""
+    currencies = [c for c in overseas_state.get("currencies", []) if c != "SGD"]
+    if not currencies:
+        return
+    for currency in currencies:
+        cache_key = f"{currency}_SGD"
+        if EXCHANGE_RATE_API_KEY:
+            try:
+                url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_RATE_API_KEY}/pair/{currency}/SGD"
+                resp = requests.get(url, timeout=8)
+                data = resp.json()
+                if data.get("result") == "success":
+                    rate = float(data["conversion_rate"])
+                    cached_fx_rates[cache_key] = {"rate": rate, "fetched_at": datetime.now(pytz.utc)}
+                    print(f"FX refresh: 1 {currency} = {rate} SGD")
+            except Exception as e:
+                print(f"FX refresh error for {currency}: {e}")
 
 EXPENSE_CONTEXT_EMOJIS = {
     "FnB": ["☕", "🍜", "🍣", "🥗", "🍕", "🍔", "🧋"],
@@ -1953,16 +2015,30 @@ def merchant_map_sheet():
     return spreadsheet.worksheet("Merchant Map")
 
 def get_merchant_memory(merchant):
-    """Look up known merchant in Merchant Map. Returns (category, card) or (None, None)."""
+    """Look up known merchant in Merchant Map. Returns (category, card, canonical_name) or (None, None, None)."""
     try:
         sheet = merchant_map_sheet()
         records = sheet.get_all_records()
+        merchant_lower = merchant.lower().strip()
+        # Exact match first
         for r in records:
-            if r.get("Merchant", "").lower() == merchant.lower():
-                return r.get("Category", ""), r.get("Card", "")
+            if r.get("Merchant", "").lower() == merchant_lower:
+                return r.get("Category", ""), r.get("Card", ""), r.get("Merchant", "")
+        # Fuzzy match — check if either is a substring of the other
+        for r in records:
+            known = r.get("Merchant", "").lower().strip()
+            if known and (known in merchant_lower or merchant_lower in known):
+                return r.get("Category", ""), r.get("Card", ""), r.get("Merchant", "")
+        # Word-level match — first significant word (brand name)
+        merchant_words = [w for w in merchant_lower.split() if len(w) > 2]
+        for r in records:
+            known = r.get("Merchant", "").lower().strip()
+            known_words = [w for w in known.split() if len(w) > 2]
+            if merchant_words and known_words and merchant_words[0] == known_words[0]:
+                return r.get("Category", ""), r.get("Card", ""), r.get("Merchant", "")
     except Exception as e:
         print(f"get_merchant_memory error for '{merchant}': {e}")
-    return None, None
+    return None, None, None
 
 def save_merchant_memory(merchant, category, card):
     """Save new merchant to Merchant Map."""
@@ -1979,12 +2055,14 @@ def get_expense_emoji(category):
 
 def parse_expense_text(text):
     """Use Claude to extract expense details from natural language."""
+    overseas_currency = overseas_state["currency"] if overseas_state["active"] else "SGD"
     prompt = (
         f"Extract expense details from this message: '{text}'\n\n"
         f"Return ONLY a JSON object with:\n"
-        f"- merchant: string (store/restaurant name, title case)\n"
+        f"- merchant: string (brand name only — strip legal suffixes like Pte Ltd, Ltd, Inc, Sdn Bhd, Co., Corp, Restaurant, Cafe. "
+        f"  E.g. 'Starbucks Coffee Singapore Pte Ltd' -> 'Starbucks', 'McDonald's Restaurant' -> 'McDonald's')\n"
         f"- amount: number (just the number, no currency symbol)\n"
-        f"- currency: string (3-letter code, default SGD)\n"
+        f"- currency: string (3-letter ISO code. If not mentioned, default to '{overseas_currency}')\n"
         f"- category: string (one of: FnB, Entertainment, Personal, Family, Work, Transport, Shopping, Travel) or empty if unclear\n"
         f"- card: string (one of: Citi, Maybank, Amex, UOB) or empty if not mentioned\n\n"
         f"Return ONLY the JSON."
@@ -1994,7 +2072,7 @@ def parse_expense_text(text):
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link="", reconciled="No", notes=""):
@@ -2006,16 +2084,17 @@ def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_
         category, card, receipt_link, reconciled, notes
     ])
 
-def format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount=None, fx_fee=None, fx_source=""):
+def format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount=None, receipt_saved=False):
     """Format the expense confirmation message."""
-    amount_str = f"{currency} {amount:.2f}" if currency != "SGD" else f"${amount:.2f}"
-    lines = [f"🏪 {merchant}, {amount_str}"]
-    if sgd_amount and currency != "SGD":
-        lines.append(f"SGD equivalent: ${sgd_amount:.2f}" + (f" ({fx_source})" if fx_source else ""))
-        if fx_fee:
-            lines.append(f"Est. FX fee: ${fx_fee:.2f}")
-    lines.append(f"🗂 {category} | 💳 {card}")
-    lines.append(f"Receipt has been uploaded {get_expense_emoji(category)}")
+    emoji = get_expense_emoji(category)
+    lines = [f"🏪 {merchant}"]
+    if currency != "SGD" and sgd_amount is not None:
+        lines.append(f"SGD ${sgd_amount:.2f} ({currency} {amount:,.0f})")
+    else:
+        lines.append(f"SGD ${amount:.2f}")
+    lines.append(f"🗂 {category} | 💳 {card} {emoji}")
+    if receipt_saved:
+        lines.append("🧾 Receipt saved")
     return "\n".join(lines)
 
 def get_monthly_summary(month=None, year=None):
@@ -2067,7 +2146,8 @@ def get_monthly_summary(month=None, year=None):
         lines = [f"Monthly Summary — {month_label}\n"]
 
         for cat, amt in cat_totals.items():
-            lines.append(f"{cat}: ${amt:.2f}")
+            if amt > 0:
+                lines.append(f"{cat}: ${amt:.2f}")
 
         lines.append(f"\nTotal: ${total:.2f}")
         lines.append("\nBy card:")
@@ -2080,10 +2160,11 @@ def get_monthly_summary(month=None, year=None):
         return f"Error generating summary: {str(e)}"
 
 def is_expense_input(text):
-    """Detect if message looks like an expense entry."""
+    """Detect if message looks like an expense entry or expense question."""
     lower = text.lower()
     triggers = ["spent", "paid", "$", "sgd", "charged", "bought", "grabbed",
-                "receipt", "bill was", "cost me", "picked up"]
+                "receipt", "bill was", "cost me", "picked up", "expense",
+                "recorded in", "will it be", "logged in", "track", "how much have i"]
     return any(t in lower for t in triggers)
 
 def is_overseas_mode_request(text):
@@ -2181,8 +2262,11 @@ def deactivate_overseas_mode():
     overseas_state["active"] = False
     overseas_state["destination"] = ""
     overseas_state["currency"] = "SGD"
+    overseas_state["currencies"] = []
     overseas_state["return_date"] = ""
     overseas_state["return_flight"] = None
+    overseas_state["trip_start"] = None
+    overseas_state["trip_destinations"] = []
     for job_key in ["dep_job_id", "return_job_id"]:
         job_id = overseas_state.get(job_key)
         if job_id and _scheduler:
@@ -2198,6 +2282,9 @@ async def activate_overseas_mode_scheduled(dest, curr, return_flight_data=None):
     overseas_state["active"] = True
     overseas_state["destination"] = dest
     overseas_state["currency"] = curr
+    overseas_state["currencies"] = [curr] if curr != "SGD" else []
+    overseas_state["trip_start"] = date.today().strftime("%d/%m/%Y")
+    overseas_state["trip_destinations"] = [dest]
     msg = f"Overseas mode on ✈️\nDestination: {dest}\nCurrency: {curr}\nI'll log expenses in {curr} with SGD equivalent."
     if return_flight_data:
         ret_dep = format_flight_time(return_flight_data.get("dep_time", ""))
@@ -2301,7 +2388,7 @@ def handle_overseas_request(text):
     return "What\'s your departure date/time and destination? And when are you back in SG?"
 
 async def handle_expense_session(user_id, text, update):
-    """Handle merchant onboarding — asking for category and card."""
+    """Handle multi-step expense onboarding — category, card, fx_rate confirmation."""
     session = expense_sessions[user_id]
     step = session.get("step")
 
@@ -2316,83 +2403,108 @@ async def handle_expense_session(user_id, text, update):
                 f"That doesn't look right. Enter a positive number — e.g. '0.0093' means 1 {currency} = 0.0093 SGD."
             )
             return
-        merchant = session["merchant"]
-        amount = session["amount"]
-        currency = session["currency"]
-        category = session.get("category", "")
-        card = session.get("card", "")
-        sgd_amount = round(amount * rate, 2)
-        fx_fee = round(sgd_amount * CARD_FX_FEES[card] / 100, 2) if card in CARD_FX_FEES else None
-        fx_source = "manual rate"
-        session["sgd_amount"] = sgd_amount
-        session["fx_fee"] = fx_fee
-        session["fx_source"] = fx_source
-        # If category or card still needed, move to next step
-        if not category:
-            session["step"] = "category"
-            cats = ", ".join(EXPENSE_CATEGORIES)
-            await update.message.reply_text(f"Got it — SGD {sgd_amount:.2f}. What category? {cats}")
+        session["sgd_amount"] = round(session["amount"] * rate, 2)
+        session["step"] = "category" if not session.get("category") else "card" if not session.get("card") else "done"
+        if session["step"] == "done":
+            await _finalise_expense_session(user_id, update)
             return
-        if not card:
-            session["step"] = "card"
-            cards = ", ".join(EXPENSE_CARDS)
-            await update.message.reply_text(f"Got it — SGD {sgd_amount:.2f}. Which card? {cards}")
-            return
-        # All info available — log directly
-        log_expense(merchant, amount, currency, sgd_amount, category, card)
-        del expense_sessions[user_id]
-        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, fx_fee, fx_source)
-        try:
-            await update.message.reply_text(confirmation, parse_mode="Markdown")
-        except Exception as e:
-            print(f"fx_rate confirmation send failed: {e}")
-            await update.message.reply_text(confirmation)
+        if session["step"] == "category":
+            await update.message.reply_text(f"Got it — SGD ${session['sgd_amount']:.2f}. What category?\n{', '.join(EXPENSE_CATEGORIES)}")
+        else:
+            await update.message.reply_text(f"Which card?\n{', '.join(EXPENSE_CARDS)}")
+        return
+
+    if step == "confirm":
+        # User confirming uncertain fields
+        lower = text.strip().lower()
+        missing = session.get("missing_fields", [])
+        if missing:
+            field = missing[0]
+            if field == "category":
+                matched = next((c for c in EXPENSE_CATEGORIES if c.lower() == lower), None)
+                if not matched:
+                    await update.message.reply_text(f"Pick a category: {', '.join(EXPENSE_CATEGORIES)}")
+                    return
+                session["category"] = matched
+                missing.pop(0)
+            elif field == "card":
+                matched = next((c for c in EXPENSE_CARDS if c.lower() == lower), None)
+                if not matched:
+                    await update.message.reply_text(f"Pick a card: {', '.join(EXPENSE_CARDS)}")
+                    return
+                session["card"] = matched
+                missing.pop(0)
+            session["missing_fields"] = missing
+            if missing:
+                next_field = missing[0]
+                if next_field == "card":
+                    await update.message.reply_text(f"Which card?\n{', '.join(EXPENSE_CARDS)}")
+                return
+        await _finalise_expense_session(user_id, update)
         return
 
     if step == "category":
-        # Validate category
         matched = next((c for c in EXPENSE_CATEGORIES if c.lower() == text.strip().lower()), None)
         if not matched:
-            cats = ", ".join(EXPENSE_CATEGORIES)
-            await update.message.reply_text(f"Pick a category: {cats}")
+            await update.message.reply_text(f"Pick a category: {', '.join(EXPENSE_CATEGORIES)}")
             return
         session["category"] = matched
-        session["step"] = "card"
-        cards = ", ".join(EXPENSE_CARDS)
-        await update.message.reply_text(f"Which card? {cards}")
+        session["step"] = "card" if not session.get("card") else "done"
+        if session["step"] == "done":
+            await _finalise_expense_session(user_id, update)
+            return
+        await update.message.reply_text(f"Which card?\n{', '.join(EXPENSE_CARDS)}")
         return
 
     if step == "card":
         matched = next((c for c in EXPENSE_CARDS if c.lower() == text.strip().lower()), None)
         if not matched:
-            cards = ", ".join(EXPENSE_CARDS)
-            await update.message.reply_text(f"Pick a card: {cards}")
+            await update.message.reply_text(f"Pick a card: {', '.join(EXPENSE_CARDS)}")
             return
         session["card"] = matched
-        # Save merchant memory
-        save_merchant_memory(session["merchant"], session["category"], session["card"])
-        # Now log the expense
-        merchant = session["merchant"]
-        amount = session["amount"]
-        currency = session["currency"]
-        category = session["category"]
-        card = session["card"]
-        sgd_amount = session.get("sgd_amount", amount)
-        fx_fee = session.get("fx_fee", None)
-        fx_source = session.get("fx_source", "")
-        log_expense(merchant, amount, currency, sgd_amount, category, card)
-        del expense_sessions[user_id]
-        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, fx_fee, fx_source)
-        try:
-            await update.message.reply_text(confirmation, parse_mode="Markdown")
-        except Exception as e:
-            print(f"Expense confirmation Markdown send failed, retrying plain: {e}")
-            await update.message.reply_text(confirmation)
+        await _finalise_expense_session(user_id, update)
         return
+
+async def _finalise_expense_session(user_id, update):
+    """Log the expense and send confirmation once all fields are collected."""
+    session = expense_sessions[user_id]
+    merchant = session["merchant"]
+    amount = session["amount"]
+    currency = session["currency"]
+    category = session["category"]
+    card = session["card"]
+    sgd_amount = session.get("sgd_amount", amount)
+    receipt_link = session.get("receipt_link", "")
+    receipt_saved = bool(receipt_link)
+    save_merchant_memory(merchant, category, card)
+    log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
+    del expense_sessions[user_id]
+    confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, receipt_saved)
+    try:
+        await update.message.reply_text(confirmation, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(confirmation)
+
+def check_same_day_duplicate(merchant, amount, currency):
+    """Return True if same merchant+amount+currency already logged today."""
+    try:
+        sheet = expenses_sheet()
+        records = sheet.get_all_records()
+        today = date.today().strftime("%d/%m/%Y")
+        for r in records:
+            if (r.get("Date") == today and
+                r.get("Merchant", "").lower() == merchant.lower() and
+                str(r.get("Amount", "")) == str(amount) and
+                r.get("Currency", "") == currency):
+                return True
+    except Exception as e:
+        print(f"Duplicate check error: {e}")
+    return False
+
+def handle_expense_text(text, user_id, receipt_link=""):
     """
     Process a text expense entry.
-    Returns (reply_str, needs_session, session_data) 
-    needs_session=True means we need to ask category/card
+    Returns (reply_str, needs_session, session_data)
     """
     try:
         parsed = parse_expense_text(text)
@@ -2402,96 +2514,76 @@ async def handle_expense_session(user_id, text, update):
         category = parsed.get("category", "")
         card = parsed.get("card", "")
 
-        # If overseas mode active and no currency in message, use overseas currency
-        if overseas_state["active"] and currency == "SGD":
-            currency = overseas_state["currency"]
-
-        # Calculate SGD equivalent if foreign currency
+        # Resolve FX rate if needed
         sgd_amount = amount
-        fx_fee = None
-        fx_source = ""
-        rate = None
         if currency != "SGD":
-            # Try live exchange rate first
-            if EXCHANGE_RATE_API_KEY:
-                try:
-                    fx_url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_RATE_API_KEY}/pair/{currency}/SGD"
-                    fx_resp = requests.get(fx_url, timeout=8)
-                    fx_data = fx_resp.json()
-                    if fx_data.get("result") == "success":
-                        rate = float(fx_data["conversion_rate"])
-                        fx_source = "live rate"
-                    else:
-                        print(f"ExchangeRate-API error: {fx_data}")
-                except Exception as e:
-                    print(f"ExchangeRate-API exception: {e}")
-            # Fallback to Claude estimate
-            if rate is None:
-                try:
-                    fx_prompt = (
-                        f"What is the approximate exchange rate from {currency} to SGD today? "
-                        f"Return ONLY a single number (the SGD value of 1 {currency}). No text."
-                    )
-                    fx_resp_cl = client.messages.create(
-                        model="claude-sonnet-4-5",
-                        max_tokens=20,
-                        messages=[{"role": "user", "content": fx_prompt}]
-                    )
-                    rate = float(fx_resp_cl.content[0].text.strip())
-                    fx_source = "estimated rate (live FX unavailable)"
-                except Exception as e:
-                    print(f"Claude FX estimate failed: {e}")
-                    rate = None  # Will ask user below
-
-            # If rate still unknown — ask user, do not guess
+            rate = get_fx_rate(currency)
             if rate is None:
                 session = {
-                    "merchant": merchant,
-                    "amount": amount,
-                    "currency": currency,
-                    "category": category,
-                    "card": card,
-                    "step": "fx_rate"
+                    "merchant": merchant, "amount": amount, "currency": currency,
+                    "category": category, "card": card, "step": "fx_rate",
+                    "receipt_link": receipt_link
                 }
                 return (
-                    f"Couldn't get the {currency}/SGD rate automatically. "
+                    f"Couldn't get the {currency}/SGD rate. "
                     f"What's the exchange rate? (e.g. '0.0093' means 1 {currency} = 0.0093 SGD)"
                 ), True, session
-
             sgd_amount = round(amount * rate, 2)
-            if card in CARD_FX_FEES:
-                fx_fee = round(sgd_amount * CARD_FX_FEES[card] / 100, 2)
+            # Track currency for this trip
+            if overseas_state["active"] and currency not in overseas_state["currencies"]:
+                overseas_state["currencies"].append(currency)
 
-        # Check merchant memory
-        known_cat, known_card = get_merchant_memory(merchant)
+        # Fuzzy merchant lookup — use canonical name if found
+        known_cat, known_card, canonical = get_merchant_memory(merchant)
+        if canonical:
+            merchant = canonical
         if known_cat:
             category = known_cat
         if known_card:
             card = known_card
 
-        # If still missing category or card — start onboarding session
-        if not category or not card:
+        # Same-day duplicate check
+        if check_same_day_duplicate(merchant, amount, currency):
             session = {
-                "merchant": merchant,
-                "amount": amount,
-                "currency": currency,
-                "sgd_amount": sgd_amount,
-                "fx_fee": fx_fee,
-                "fx_source": fx_source if currency != "SGD" else "",
-                "category": category,
-                "card": card,
-                "step": "category" if not category else "card"
+                "merchant": merchant, "amount": amount, "currency": currency,
+                "sgd_amount": sgd_amount, "category": category, "card": card,
+                "step": "confirm", "missing_fields": [],
+                "receipt_link": receipt_link, "duplicate_confirmed": False
             }
-            if not category:
-                cats = ", ".join(EXPENSE_CATEGORIES)
-                return f"New merchant — {merchant}. What category? {cats}", True, session
+            return (
+                f"Heads up — looks like you already logged {merchant} {currency} {amount:,.0f} today. Log it again?"
+            ), True, session
+
+        # Confirm-if-unsure — collect missing fields in one message
+        missing = []
+        if not category:
+            missing.append("category")
+        if not card:
+            missing.append("card")
+
+        if missing:
+            session = {
+                "merchant": merchant, "amount": amount, "currency": currency,
+                "sgd_amount": sgd_amount, "category": category, "card": card,
+                "step": "confirm", "missing_fields": missing,
+                "receipt_link": receipt_link
+            }
+            lines = [f"Got it —"]
+            lines.append(f"🏪 {merchant}")
+            if currency != "SGD":
+                lines.append(f"SGD ${sgd_amount:.2f} ({currency} {amount:,.0f})")
             else:
-                cards = ", ".join(EXPENSE_CARDS)
-                return f"Which card for {merchant}? {cards}", True, session
+                lines.append(f"SGD ${amount:.2f}")
+            if "category" in missing:
+                lines.append(f"\nWhat category?\n{', '.join(EXPENSE_CATEGORIES)}")
+            elif "card" in missing:
+                lines.append(f"\nWhich card?\n{', '.join(EXPENSE_CARDS)}")
+            return "\n".join(lines), True, session
 
         # All info available — log directly
-        log_expense(merchant, amount, currency, sgd_amount, category, card)
-        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, fx_fee, fx_source if currency != "SGD" else "")
+        receipt_saved = bool(receipt_link)
+        log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
+        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, receipt_saved)
         return confirmation, False, None
 
     except Exception as e:
@@ -2510,6 +2602,147 @@ def delete_last_expense():
         return f"Deleted last expense: {last[1]} ${last[2]}"
     except Exception as e:
         return f"Error deleting expense: {str(e)}"
+
+def get_last_expense():
+    """Return the last logged expense row as a dict."""
+    try:
+        sheet = expenses_sheet()
+        records = sheet.get_all_records()
+        if not records:
+            return None
+        return records[-1]
+    except Exception as e:
+        print(f"get_last_expense error: {e}")
+        return None
+
+def edit_last_expense(field, new_value):
+    """Edit a specific field in the last expense row."""
+    try:
+        sheet = expenses_sheet()
+        all_values = sheet.get_all_values()
+        if len(all_values) <= 1:
+            return "No expenses to edit."
+        headers = all_values[0]
+        last_row_idx = len(all_values)
+        field_map = {
+            "merchant": "Merchant", "amount": "Amount", "currency": "Currency",
+            "sgd": "SGD Amount", "category": "Category", "card": "Card", "notes": "Notes"
+        }
+        col_name = field_map.get(field.lower())
+        if not col_name or col_name not in headers:
+            return f"Can't edit field '{field}'. Try: merchant, amount, currency, sgd, category, card, notes."
+        col_idx = headers.index(col_name) + 1
+        sheet.update_cell(last_row_idx, col_idx, new_value)
+        return f"Updated {col_name} to '{new_value}'."
+    except Exception as e:
+        return f"Error editing expense: {str(e)}"
+
+def show_last_expense():
+    """Return a formatted view of the last logged expense."""
+    r = get_last_expense()
+    if not r:
+        return "No expenses logged yet."
+    currency = r.get("Currency", "SGD")
+    amount = r.get("Amount", "")
+    sgd = r.get("SGD Amount", "")
+    lines = [
+        f"Last expense:",
+        f"🏪 {r.get('Merchant', '')}",
+    ]
+    if currency != "SGD" and sgd:
+        lines.append(f"SGD ${float(sgd):.2f} ({currency} {float(amount):,.0f})")
+    else:
+        lines.append(f"SGD ${float(amount):.2f}" if amount else "")
+    lines.append(f"🗂 {r.get('Category', '')} | 💳 {r.get('Card', '')}")
+    lines.append(f"📅 {r.get('Date', '')}")
+    lines.append("\nTo edit: 'edit [field] to [value]' e.g. 'edit category to Transport'")
+    return "\n".join(l for l in lines if l)
+
+def get_trip_summary():
+    """Return expense summary for the current or most recent trip."""
+    trip_start = overseas_state.get("trip_start")
+    destinations = overseas_state.get("trip_destinations", [])
+    if not trip_start:
+        return "No trip data — overseas mode hasn't been activated this session."
+    try:
+        sheet = expenses_sheet()
+        records = sheet.get_all_records()
+        start_dt = datetime.strptime(trip_start, "%d/%m/%Y").date()
+        trip_records = []
+        for r in records:
+            d = r.get("Date", "")
+            if not d:
+                continue
+            try:
+                dt = datetime.strptime(d, "%d/%m/%Y").date()
+                if dt >= start_dt:
+                    trip_records.append(r)
+            except Exception:
+                continue
+        if not trip_records:
+            return "No expenses logged for this trip yet."
+        total_sgd = sum(float(r.get("SGD Amount") or r.get("Amount") or 0) for r in trip_records)
+        cat_totals = {}
+        currency_totals = {}
+        for r in trip_records:
+            cat = r.get("Category", "Other")
+            amt = float(r.get("SGD Amount") or r.get("Amount") or 0)
+            cat_totals[cat] = cat_totals.get(cat, 0) + amt
+            curr = r.get("Currency", "SGD")
+            orig = float(r.get("Amount") or 0)
+            if curr != "SGD":
+                currency_totals[curr] = currency_totals.get(curr, 0) + orig
+        dest_str = " → ".join(destinations) if destinations else "trip"
+        lines = [f"Trip summary — {dest_str}", f"From {trip_start}\n"]
+        for cat, amt in sorted(cat_totals.items(), key=lambda x: -x[1]):
+            lines.append(f"{cat}: SGD ${amt:.2f}")
+        lines.append(f"\nTotal: SGD ${total_sgd:.2f}")
+        if currency_totals:
+            lines.append("\nSpend by currency:")
+            for curr, amt in currency_totals.items():
+                lines.append(f"{curr}: {amt:,.0f}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error generating trip summary: {str(e)}"
+
+def rename_category(old_name, new_name):
+    """Rename a category everywhere — category list, Merchant Map, Expenses sheet."""
+    global EXPENSE_CATEGORIES
+    old_title = old_name.strip().title() if old_name.lower() not in [c.lower() for c in EXPENSE_CATEGORIES] else next(c for c in EXPENSE_CATEGORIES if c.lower() == old_name.lower())
+    matched = next((c for c in EXPENSE_CATEGORIES if c.lower() == old_name.lower()), None)
+    if not matched:
+        return f"Category '{old_name}' not found. Current categories: {', '.join(EXPENSE_CATEGORIES)}"
+    new_clean = new_name.strip()
+    EXPENSE_CATEGORIES = [new_clean if c == matched else c for c in EXPENSE_CATEGORIES]
+    updated = 0
+    # Update Expenses sheet
+    try:
+        sheet = expenses_sheet()
+        all_values = sheet.get_all_values()
+        if all_values:
+            headers = all_values[0]
+            if "Category" in headers:
+                col_idx = headers.index("Category")
+                for i, row in enumerate(all_values[1:], start=2):
+                    if len(row) > col_idx and row[col_idx] == matched:
+                        sheet.update_cell(i, col_idx + 1, new_clean)
+                        updated += 1
+    except Exception as e:
+        print(f"rename_category expenses error: {e}")
+    # Update Merchant Map
+    try:
+        sheet = merchant_map_sheet()
+        all_values = sheet.get_all_values()
+        if all_values:
+            headers = all_values[0]
+            if "Category" in headers:
+                col_idx = headers.index("Category")
+                for i, row in enumerate(all_values[1:], start=2):
+                    if len(row) > col_idx and row[col_idx] == matched:
+                        sheet.update_cell(i, col_idx + 1, new_clean)
+    except Exception as e:
+        print(f"rename_category merchant map error: {e}")
+    return f"Renamed '{matched}' to '{new_clean}'. Updated {updated} expense(s)."
 
 def get_expense_report(report_type="monthly"):
     """Generate expense report."""
@@ -3288,7 +3521,157 @@ def detect_crm_natural_update(text):
     return None
 
 
-def _build_overseas_flight_context():
+def get_market_summary_now():
+    """Generate on-demand market summary — same logic as weekly job but returns string."""
+    try:
+        lines = []
+        sentiments = []
+        for market, indices in MARKET_INDICES.items():
+            market_lines = [f"{market}"]
+            market_changes = []
+            for ticker, name in indices.items():
+                data = fetch_price(ticker)
+                if data:
+                    arrow = "▲" if data["change_pct"] >= 0 else "▼"
+                    market_lines.append(f"{name}: {arrow} {abs(data['change_pct']):.1f}%")
+                    market_changes.append(data["change_pct"])
+            if market_changes:
+                avg = sum(market_changes) / len(market_changes)
+                sentiment = "positive" if avg > 0.3 else "negative" if avg < -0.3 else "mixed"
+                sentiments.append(sentiment)
+                market_lines.append(f"Sentiment: {sentiment.title()}")
+            lines.append("\n".join(market_lines))
+        if sentiments:
+            overall = "broadly positive" if sentiments.count("positive") >= 2 else \
+                      "broadly negative" if sentiments.count("negative") >= 2 else "mixed"
+            lines.append(f"Overall: {overall}")
+        return "Market Summary\n\n" + "\n\n---\n\n".join(lines)
+    except Exception as e:
+        return f"Couldn't pull market data right now: {str(e)}"
+
+async def handle_statement_upload(file_bytes, fname, user_id, update):
+    """Parse a bank statement CSV/XLSX and reconcile against logged expenses."""
+    try:
+        await update.message.reply_text("Got the statement, give me a sec to go through it...")
+        # Parse statement rows
+        statement_rows = []
+        if fname.lower().endswith(".csv"):
+            import csv
+            text_data = file_bytes.decode("utf-8", errors="ignore")
+            reader = csv.DictReader(io.StringIO(text_data))
+            for row in reader:
+                statement_rows.append(dict(row))
+        else:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+            ws = wb.active
+            headers = [str(c.value).strip() if c.value else "" for c in next(ws.iter_rows(max_row=1))]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                statement_rows.append(dict(zip(headers, row)))
+
+        if not statement_rows:
+            await update.message.reply_text("Couldn't read any rows from that file.")
+            return
+
+        # Use Claude to normalise statement columns
+        sample = json.dumps(statement_rows[:3], default=str)
+        norm_prompt = (
+            f"Given these bank statement rows: {sample}\n\n"
+            f"Return ONLY a JSON object mapping these keys to the actual column names in the data:\n"
+            f"{{\"date\": \"col\", \"description\": \"col\", \"amount\": \"col\"}}\n"
+            f"If a column doesn't exist, use null."
+        )
+        norm_resp = client.messages.create(
+            model="claude-sonnet-4-5", max_tokens=100,
+            messages=[{"role": "user", "content": norm_prompt}]
+        )
+        col_map = json.loads(norm_resp.content[0].text.strip().replace("```json","").replace("```","").strip())
+        date_col = col_map.get("date")
+        desc_col = col_map.get("description")
+        amt_col = col_map.get("amount")
+
+        if not all([date_col, desc_col, amt_col]):
+            await update.message.reply_text("Couldn't identify date/description/amount columns. Try a CSV with clear headers.")
+            return
+
+        # Load logged expenses
+        sheet = expenses_sheet()
+        logged = sheet.get_all_records()
+
+        missing = []
+        corrections = []
+
+        for srow in statement_rows:
+            raw_date = str(srow.get(date_col, "")).strip()
+            raw_desc = str(srow.get(desc_col, "")).strip()
+            raw_amt = str(srow.get(amt_col, "")).strip().replace(",", "")
+            if not raw_date or not raw_amt:
+                continue
+            try:
+                stmt_amount = abs(float(raw_amt))
+            except ValueError:
+                continue
+
+            # Normalise date
+            stmt_date = None
+            for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d %b %Y", "%d %b %y"):
+                try:
+                    stmt_date = datetime.strptime(raw_date, fmt).strftime("%d/%m/%Y")
+                    break
+                except Exception:
+                    continue
+            if not stmt_date:
+                continue
+
+            # Match against logged expenses — date + amount
+            matched_row = None
+            matched_idx = None
+            for i, r in enumerate(logged):
+                logged_date = r.get("Date", "")
+                logged_sgd = float(r.get("SGD Amount") or r.get("Amount") or 0)
+                if logged_date == stmt_date and abs(logged_sgd - stmt_amount) < 0.02:
+                    matched_row = r
+                    matched_idx = i
+                    break
+
+            if matched_row is None:
+                # Check if ambiguous gateway — skip if can't resolve
+                missing.append(f"{stmt_date} | {raw_desc[:40]} | SGD ${stmt_amount:.2f}")
+            else:
+                # Check for amount discrepancy
+                logged_sgd = float(matched_row.get("SGD Amount") or matched_row.get("Amount") or 0)
+                if abs(logged_sgd - stmt_amount) > 0.01:
+                    # Correct the SGD amount in sheet — row is matched_idx + 2 (1-indexed + header)
+                    all_values = sheet.get_all_values()
+                    headers_row = all_values[0]
+                    sgd_col_idx = headers_row.index("SGD Amount") + 1 if "SGD Amount" in headers_row else None
+                    if sgd_col_idx:
+                        sheet.update_cell(matched_idx + 2, sgd_col_idx, stmt_amount)
+                    corrections.append(
+                        f"{matched_row.get('Merchant', raw_desc[:20])} {stmt_date}: "
+                        f"${logged_sgd:.2f} → ${stmt_amount:.2f}"
+                    )
+
+        lines = ["Reconciliation done ✅"]
+        if corrections:
+            lines.append(f"\nCorrected {len(corrections)} amount(s):")
+            lines.extend(f"  {c}" for c in corrections)
+        if missing:
+            lines.append(f"\n{len(missing)} unmatched statement item(s) — couldn't find in your logs:")
+            lines.extend(f"  {m}" for m in missing[:10])
+            if len(missing) > 10:
+                lines.append(f"  ...and {len(missing) - 10} more")
+        if not corrections and not missing:
+            lines.append("Everything matches up.")
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        print(f"handle_statement_upload error: {e}")
+        await update.message.reply_text(f"Something went wrong parsing the statement: {str(e)}")
+
+
+
     """Return a flight context block for the system prompt if terminal/gate info is available."""
     dep_terminal = overseas_state.get("dep_terminal", "")
     dep_gate = overseas_state.get("dep_gate", "")
@@ -3324,6 +3707,34 @@ def build_system_prompt():
     if em_profile:
         forbidden = ", ".join(em_profile.get("forbidden_phrases", []))
         profile_notes = f"\nForbidden phrases (never use): {forbidden}" if forbidden else ""
+
+    # Overseas + expense context
+    overseas_context = ""
+    if overseas_state.get("active"):
+        dest = overseas_state.get("destination", "")
+        curr = overseas_state.get("currency", "SGD")
+        trip_start = overseas_state.get("trip_start", "")
+        currencies = overseas_state.get("currencies", [])
+        curr_list = ", ".join(currencies) if currencies else curr
+        overseas_context = (
+            f"\n\n## Overseas Mode\n"
+            f"Currently active. Destination: {dest}. Currency: {curr}.\n"
+            f"Currencies used this trip: {curr_list}.\n"
+            f"Trip started: {trip_start}.\n"
+            f"Expenses entered without a currency are assumed to be in {curr}.\n"
+            f"All expenses are converted to SGD using a cached rate refreshed twice daily (8am and 8pm).\n"
+            f"You can answer questions about trip spend, currency, and expense logging directly."
+        )
+
+    expense_context = (
+        "\n\n## Expense Tracking\n"
+        "Em tracks expenses to Google Sheets. "
+        f"Categories: {', '.join(EXPENSE_CATEGORIES)}. "
+        f"Cards: {', '.join(EXPENSE_CARDS)}. "
+        "Known merchants are remembered — category and card are auto-filled for repeat merchants. "
+        "Foreign currency expenses show SGD amount with original currency in brackets. "
+        "Receipts can be attached as photo with caption."
+    )
 
     return (
         "# Em — Your Personal Assistant\n\n"
@@ -3375,7 +3786,7 @@ def build_system_prompt():
         "- Act like a typical AI assistant\n"
         "- Make small talk for the sake of it\n"
         "- Get repetitive with phrases or greetings"
-    ) + _build_overseas_flight_context()
+    ) + _build_overseas_flight_context() + overseas_context + expense_context
 
 # --- Message Handler ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3383,10 +3794,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != YOUR_CHAT_ID:
         return
 
-    # Handle document/file uploads (Excel import)
+    # Handle document/file uploads (Excel import or bank statement)
     if update.message.document:
         doc = update.message.document
         fname = doc.file_name or ""
+        # Bank statement for reconciliation
+        if fname.lower().endswith(".csv") or (fname.lower().endswith((".xlsx", ".xls")) and "statement" in fname.lower()):
+            tg_file = await doc.get_file()
+            file_bytes = bytes(await tg_file.download_as_bytearray())
+            await handle_statement_upload(file_bytes, fname, user_id, update)
+            return
         if fname.lower().endswith((".xlsx", ".xls")):
             tg_file = await doc.get_file()
             file_bytes = bytes(await tg_file.download_as_bytearray())
@@ -3422,6 +3839,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         else:
             await update.message.reply_text("I can only import .xlsx or .xls files for CRM.")
+        return
+
+    # Handle photo messages — receipt with caption as expense
+    if update.message.photo:
+        caption = (update.message.caption or "").strip()
+        photo = update.message.photo[-1]  # highest resolution
+        tg_file = await photo.get_file()
+        file_bytes = bytes(await tg_file.download_as_bytearray())
+        # Upload to Drive receipts folder
+        receipt_link = ""
+        try:
+            from googleapiclient.http import MediaIoBaseUpload
+            today_str = date.today().strftime("%Y%m%d")
+            file_name = f"receipt_{today_str}_{photo.file_id[:8]}.jpg"
+            folder_id = DRIVE_FOLDERS.get("receipts", "")
+            if folder_id:
+                media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
+                file_meta = {"name": file_name, "parents": [folder_id]}
+                uploaded = drive_service.files().create(body=file_meta, media_body=media, fields="id,webViewLink").execute()
+                receipt_link = uploaded.get("webViewLink", "")
+        except Exception as e:
+            print(f"Receipt upload error: {e}")
+
+        if not caption:
+            await update.message.reply_text("Got the receipt 🧾 Add a caption with the expense details — e.g. '1400 Ichiran' and I'll log it.")
+            return
+
+        if is_expense_input(caption):
+            reply, needs_session, session_data = handle_expense_text(caption, user_id, receipt_link=receipt_link)
+            if needs_session and session_data:
+                expense_sessions[user_id] = session_data
+            if reply:
+                try:
+                    await update.message.reply_text(reply, parse_mode="Markdown")
+                except Exception:
+                    await update.message.reply_text(reply)
+        else:
+            await update.message.reply_text("Got the receipt but couldn't read that as an expense. Try a caption like '1400 Ichiran' or 'spent 45 at Uniqlo'.")
         return
 
     text = update.message.text.strip()
@@ -3656,8 +4111,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = get_expense_report()
     elif lower in ["delete last expense", "remove last expense"]:
         reply = delete_last_expense()
+    elif lower in ["last expense", "show last expense", "what did i log"]:
+        reply = show_last_expense()
+    elif lower in ["trip summary", "trip spend", "how much have i spent", "trip expenses"]:
+        reply = get_trip_summary()
+    elif lower.startswith("edit last expense ") or lower.startswith("edit expense "):
+        # "edit last expense category to FnB" or "edit expense card to Citi"
+        m = re.search(r"edit (?:last )?expense (\w+) to (.+)", lower)
+        if m:
+            reply = edit_last_expense(m.group(1), m.group(2).strip())
+        else:
+            reply = show_last_expense()
+    elif lower.startswith("rename category "):
+        # "rename category FnB to Food"
+        m = re.search(r"rename category (.+?) to (.+)", lower)
+        if m:
+            reply = rename_category(m.group(1).strip(), m.group(2).strip())
+        else:
+            reply = f"Try: 'rename category FnB to Food'"
+    elif lower.startswith("now in ") or lower.startswith("switched to ") or lower.startswith("arrived in "):
+        # Mid-trip currency switch — "now in Korea", "arrived in Seoul"
+        if overseas_state.get("active"):
+            dest_text = re.sub(r"^(now in|switched to|arrived in)\s+", "", lower).strip().title()
+            dest_info = get_dest_info_from_iata("", dest_text)
+            new_curr = dest_info.get("currency", "")
+            new_dest = dest_info.get("destination", dest_text)
+            if new_curr and new_curr != "SGD":
+                overseas_state["currency"] = new_curr
+                overseas_state["destination"] = new_dest
+                if new_curr not in overseas_state["currencies"]:
+                    overseas_state["currencies"].append(new_curr)
+                if new_dest not in overseas_state["trip_destinations"]:
+                    overseas_state["trip_destinations"].append(new_dest)
+                # Pre-cache the new currency rate
+                get_fx_rate(new_curr)
+                reply = f"Switched to {new_dest} — expenses will now be logged in {new_curr}."
+            else:
+                reply = handle_overseas_request(text)
+        else:
+            reply = handle_overseas_request(text)
     elif is_overseas_mode_request(text):
-        # Check if message has no flight number but conversation history does
         if not extract_flight_number(text) and user_id in conversation_histories:
             history_text = " ".join(
                 m["content"] for m in conversation_histories[user_id][-10:]
@@ -3665,7 +4158,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             found_flights = extract_all_flight_numbers(history_text)
             if found_flights:
-                # Re-run with the flight numbers injected
                 reply = handle_overseas_request(" ".join(found_flights) + " " + text)
             else:
                 reply = handle_overseas_request(text)
@@ -3698,8 +4190,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Stock Commands
     elif lower in ["portfolio", "my portfolio", "holdings", "portfolio performance"]:
         reply = get_portfolio_performance()
-    elif lower in ["market summary", "market today", "how is the market"]:
-        reply = handle_stock_request(text) or "Use 'weekly market summary' to get a full breakdown."
+    elif lower in ["market summary", "market today", "how is the market", "market update",
+                   "weekly market summary", "how are markets"]:
+        reply = get_market_summary_now()
     elif is_stock_request(text):
         result = handle_stock_request(text)
         if result:
@@ -3858,6 +4351,10 @@ async def post_init(app):
     # Weekly market summary — Monday 8am
     scheduler.add_job(send_weekly_market_summary, "cron", day_of_week="mon", hour=8, minute=0, args=[app])
 
+    # FX rate refresh — 8am and 8pm daily
+    scheduler.add_job(refresh_fx_rates, "cron", hour=8, minute=0)
+    scheduler.add_job(refresh_fx_rates, "cron", hour=20, minute=0)
+
     scheduler.start()
     print("✅ Scheduler started — follow-ups + bills at 9am, birthdays at 12pm + 2pm, reminders every minute, market Monday 8am")
 
@@ -3865,6 +4362,7 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_message))
     print("Em is running... Press Ctrl+C to stop.")
     app.run_polling()
 
