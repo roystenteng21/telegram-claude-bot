@@ -1184,6 +1184,290 @@ async def handle_meeting_session(user_id, text, update):
     # Acknowledge silently (no reply) to keep flow natural
 
 
+
+# --- Custom Reminders ---
+# Reminders sheet columns: ID, Message, Scheduled Time, Recurrence, Status, Attempts, Contact
+# Status: pending | sent | cancelled
+# Recurrence: once | daily | weekly | monthly | or natural string like "every Monday"
+
+TIMEZONE = pytz.timezone("Asia/Kuala_Lumpur")
+
+# Tracks the last reminder fired per user so they can say "remind me again in 2 hours"
+last_fired_reminder = {}
+
+def reminders_sheet():
+    try:
+        return spreadsheet.worksheet("Reminders")
+    except:
+        ws = spreadsheet.add_worksheet(title="Reminders", rows=500, cols=8)
+        ws.append_row(["ID", "Message", "Scheduled Time", "Recurrence", "Status", "Attempts", "Contact"])
+        return ws
+
+def generate_reminder_id():
+    """Simple unique ID based on timestamp."""
+    return datetime.now().strftime("%Y%m%d%H%M%S")
+
+def parse_reminder_request(text):
+    """Use Claude to parse a natural language reminder request."""
+    now = datetime.now(TIMEZONE)
+    prompt = (
+        f"Today is {now.strftime('%A, %d %b %Y')} and the time is {now.strftime('%H:%M')} (Asia/Kuala_Lumpur).\n\n"
+        f"Parse this reminder request and return a JSON object:\n"
+        f"Request: {text}\n\n"
+        f"Return ONLY a JSON object with these fields:\n"
+        f"- message: string (what to remind about, concise)\n"
+        f"- scheduled_time: string in format YYYY-MM-DD HH:MM (exact datetime to fire)\n"
+        f"- recurrence: string — one of: once, daily, weekly, monthly, or a description like 'every Monday' (use 'once' if not recurring)\n"
+        f"- contact: string (name of person mentioned, or empty string)\n\n"
+        f"Rules:\n"
+        f"- If no time specified, default to 09:00\n"
+        f"- 'tomorrow' means {(now + timedelta(days=1)).strftime('%Y-%m-%d')}\n"
+        f"- 'next week' means {(now + timedelta(days=7)).strftime('%Y-%m-%d')}\n"
+        f"- For recurring reminders, scheduled_time is the FIRST occurrence\n"
+        f"- Return ONLY the JSON, no markdown, no explanation"
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def parse_reschedule_request(text, original_message):
+    """Parse a follow-up reschedule like 'remind me again in 2 hours'."""
+    now = datetime.now(TIMEZONE)
+    prompt = (
+        f"Today is {now.strftime('%A, %d %b %Y')} and the time is {now.strftime('%H:%M')}.\n\n"
+        f"The user wants to reschedule a reminder. Original reminder: '{original_message}'\n"
+        f"Reschedule request: '{text}'\n\n"
+        f"Return ONLY a JSON object:\n"
+        f"- scheduled_time: string in format YYYY-MM-DD HH:MM\n"
+        f"- recurrence: string (once, daily, weekly, monthly — use 'once' if unclear)\n\n"
+        f"Return ONLY the JSON."
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=100,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def add_reminder(message, scheduled_time_str, recurrence="once", contact=""):
+    """Add a reminder to the Reminders sheet."""
+    sheet = reminders_sheet()
+    reminder_id = generate_reminder_id()
+    sheet.append_row([
+        reminder_id,
+        message,
+        scheduled_time_str,
+        recurrence,
+        "pending",
+        "0",
+        contact
+    ])
+    return reminder_id
+
+def cancel_reminder_by_keyword(keyword):
+    """Cancel reminders matching a keyword."""
+    sheet = reminders_sheet()
+    records = sheet.get_all_records()
+    cancelled = []
+    for i, r in enumerate(records):
+        if keyword.lower() in r.get("Message", "").lower() and r.get("Status") == "pending":
+            sheet.update_cell(i + 2, 5, "cancelled")
+            cancelled.append(r.get("Message", ""))
+    return cancelled
+
+def list_reminders():
+    """List all pending reminders."""
+    sheet = reminders_sheet()
+    records = sheet.get_all_records()
+    pending = [r for r in records if r.get("Status") == "pending"]
+    if not pending:
+        return "No upcoming reminders."
+    lines = [f"You have {len(pending)} upcoming reminder(s):\n"]
+    for r in pending:
+        t = r.get("Scheduled Time", "")
+        msg = r.get("Message", "")
+        rec = r.get("Recurrence", "once")
+        rec_str = f" ({rec})" if rec != "once" else ""
+        lines.append(f"• {msg} — {t}{rec_str}")
+    return "\n".join(lines)
+
+def get_next_recurrence(scheduled_time_str, recurrence):
+    """Calculate the next fire time for a recurring reminder."""
+    try:
+        dt = datetime.strptime(scheduled_time_str, "%Y-%m-%d %H:%M")
+        if recurrence == "daily":
+            return (dt + timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
+        elif recurrence == "weekly" or "monday" in recurrence.lower() or "every" in recurrence.lower():
+            return (dt + timedelta(weeks=1)).strftime("%Y-%m-%d %H:%M")
+        elif recurrence == "monthly":
+            # Add roughly a month
+            if dt.month == 12:
+                next_dt = dt.replace(year=dt.year + 1, month=1)
+            else:
+                next_dt = dt.replace(month=dt.month + 1)
+            return next_dt.strftime("%Y-%m-%d %H:%M")
+        return None
+    except:
+        return None
+
+async def check_and_fire_reminders(app):
+    """Check sheet every minute and fire due reminders."""
+    try:
+        sheet = reminders_sheet()
+        records = sheet.get_all_records()
+        now = datetime.now(TIMEZONE).replace(second=0, microsecond=0)
+
+        for i, r in enumerate(records):
+            if r.get("Status") != "pending":
+                continue
+
+            scheduled_str = r.get("Scheduled Time", "")
+            if not scheduled_str:
+                continue
+
+            try:
+                scheduled = datetime.strptime(scheduled_str, "%Y-%m-%d %H:%M")
+                scheduled = TIMEZONE.localize(scheduled)
+            except:
+                continue
+
+            # Fire if within the current minute
+            if scheduled <= now:
+                attempts = int(r.get("Attempts", 0))
+                message = r.get("Message", "")
+                recurrence = r.get("Recurrence", "once")
+                contact = r.get("Contact", "")
+                row = i + 2
+
+                # Build reminder message
+                reminder_msg = f"🔔 Reminder: {message}"
+                if contact:
+                    _, record = find_row(contact)
+                    if record:
+                        notes = record.get("Notes", "")
+                        if notes:
+                            reminder_msg += f"\n\n({contact}: {notes.split(';')[0].strip()})"
+
+                await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=reminder_msg)
+
+                # Store as last fired for potential reschedule
+                last_fired_reminder[YOUR_CHAT_ID] = {
+                    "id": r.get("ID"),
+                    "message": message,
+                    "row": row
+                }
+
+                if recurrence != "once":
+                    # Schedule next occurrence
+                    next_time = get_next_recurrence(scheduled_str, recurrence)
+                    if next_time:
+                        sheet.update_cell(row, 3, next_time)
+                        sheet.update_cell(row, 6, "0")  # reset attempts
+                    else:
+                        sheet.update_cell(row, 5, "sent")
+                else:
+                    # One-off: mark attempts, retry once after 2 hours if first attempt
+                    if attempts == 0:
+                        retry_time = (now + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M")
+                        sheet.update_cell(row, 3, retry_time)
+                        sheet.update_cell(row, 6, "1")
+                    else:
+                        # Second attempt done — mark sent and drop
+                        sheet.update_cell(row, 5, "sent")
+
+    except Exception as e:
+        print(f"Error in check_and_fire_reminders: {e}")
+
+def is_reminder_request(text):
+    """Detect if a message is asking to set a reminder."""
+    lower = text.lower()
+    triggers = ["remind me", "set a reminder", "reminder for", "don't let me forget",
+                "alert me", "notify me", "ping me"]
+    return any(t in lower for t in triggers)
+
+def is_reschedule_request(text):
+    """Detect if message is rescheduling the last reminder."""
+    lower = text.lower()
+    triggers = ["remind me again", "snooze", "again in", "remind again",
+                "push it to", "reschedule"]
+    return any(t in lower for t in triggers)
+
+def is_cancel_reminder_request(text):
+    """Detect cancel reminder intent."""
+    lower = text.lower()
+    return ("cancel" in lower or "delete" in lower or "remove" in lower) and "reminder" in lower
+
+def handle_new_reminder(text):
+    """Parse and save a new reminder. Returns confirmation string."""
+    try:
+        parsed = parse_reminder_request(text)
+        message = parsed.get("message", text)
+        scheduled_time = parsed.get("scheduled_time", "")
+        recurrence = parsed.get("recurrence", "once")
+        contact = parsed.get("contact", "")
+
+        if not scheduled_time:
+            return "Couldn't figure out when to remind you. Try something like 'remind me to call James tomorrow at 3pm'."
+
+        # Validate contact against CRM
+        if contact:
+            _, record = find_row(contact)
+            if not record:
+                contact = ""  # contact not in CRM, ignore
+
+        add_reminder(message, scheduled_time, recurrence, contact)
+
+        # Format confirmation
+        try:
+            dt = datetime.strptime(scheduled_time, "%Y-%m-%d %H:%M")
+            time_str = dt.strftime("%d %b %Y at %I:%M %p")
+        except:
+            time_str = scheduled_time
+
+        rec_str = f" ({recurrence})" if recurrence != "once" else ""
+        return f"Done, I'll remind you to {message} on {time_str}{rec_str}."
+
+    except Exception as e:
+        return f"Couldn't parse that reminder: {str(e)}. Try: 'remind me to call James tomorrow at 3pm'."
+
+def handle_reschedule(text, user_id):
+    """Reschedule the last fired reminder."""
+    try:
+        last = last_fired_reminder.get(user_id)
+        if not last:
+            return "Not sure which reminder you mean. Can you be more specific?"
+
+        parsed = parse_reschedule_request(text, last["message"])
+        new_time = parsed.get("scheduled_time", "")
+        recurrence = parsed.get("recurrence", "once")
+
+        if not new_time:
+            return "Couldn't figure out the new time. Try 'remind me again in 2 hours'."
+
+        sheet = reminders_sheet()
+        row = last.get("row")
+        if row:
+            sheet.update_cell(row, 3, new_time)
+            sheet.update_cell(row, 5, "pending")
+            sheet.update_cell(row, 6, "0")
+
+        try:
+            dt = datetime.strptime(new_time, "%Y-%m-%d %H:%M")
+            time_str = dt.strftime("%d %b at %I:%M %p")
+        except:
+            time_str = new_time
+
+        return f"Got it, I'll remind you about {last['message']} again on {time_str}."
+
+    except Exception as e:
+        return f"Couldn't reschedule: {str(e)}"
+
+
 # --- Em System Prompt Builder ---
 def build_system_prompt():
     """Build Em's system prompt, incorporating em_profile preferences."""
@@ -1327,6 +1611,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply = "Sure, what's the event name?"
             meeting_sessions[user_id]["step"] = "get_name"
 
+    # Reminder Commands
+    elif lower == "reminders" or lower == "my reminders" or lower == "list reminders":
+        reply = list_reminders()
+    elif is_cancel_reminder_request(text):
+        keyword = text.lower().replace("cancel", "").replace("delete", "").replace("remove", "").replace("reminder", "").strip()
+        cancelled = cancel_reminder_by_keyword(keyword) if keyword else []
+        if cancelled:
+            reply = f"Cancelled: {', '.join(cancelled)}"
+        else:
+            reply = "Couldn't find a matching reminder to cancel."
+    elif is_reschedule_request(text):
+        reply = handle_reschedule(text, user_id)
+    elif is_reminder_request(text):
+        reply = handle_new_reminder(text)
+
     # Todo Commands
     elif lower.startswith("todo "):
         reply = add_todo(text[5:])
@@ -1375,7 +1674,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Claude Chat fallback
     else:
-        if is_calendar_request(text):
+        if is_reschedule_request(text) and user_id in last_fired_reminder:
+            reply = handle_reschedule(text, user_id)
+        elif is_reminder_request(text):
+            reply = handle_new_reminder(text)
+        elif is_calendar_request(text):
             reply = smart_add_event(text, user_id)
         else:
             if user_id not in conversation_histories:
@@ -1413,8 +1716,11 @@ async def post_init(app):
     # Birthday 2pm follow-up
     scheduler.add_job(send_birthday_followups, "cron", hour=14, minute=0, args=[app])
 
+    # Custom reminders — check every minute
+    scheduler.add_job(check_and_fire_reminders, "interval", minutes=1, args=[app])
+
     scheduler.start()
-    print("✅ Scheduler started — follow-ups at 9am, birthdays at 12pm + 2pm follow-up")
+    print("✅ Scheduler started — follow-ups at 9am, birthdays at 12pm + 2pm, reminders every minute")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
