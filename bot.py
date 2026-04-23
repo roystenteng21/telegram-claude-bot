@@ -113,7 +113,7 @@ def _migrate_crm_headers(ws, old_headers, new_headers):
     try:
         all_data = ws.get_all_values()
         if not all_data:
-            ws.update('A1', [new_headers])
+            ws.update(range_name='A1', values=[new_headers])
             print("CRM headers initialised (empty sheet)")
             return
 
@@ -152,7 +152,7 @@ def _migrate_crm_headers(ws, old_headers, new_headers):
 
         ws.clear()
         if migrated:
-            ws.update('A1', migrated)
+            ws.update(range_name='A1', values=migrated)
         print(f"✅ CRM migrated to new column layout ({len(migrated)-1} contacts)")
     except Exception as e:
         print(f"Error migrating CRM headers: {e}")
