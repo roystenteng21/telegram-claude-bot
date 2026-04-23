@@ -14,7 +14,6 @@ from googleapiclient.discovery import build
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
 import caldav
-import openpyxl
 
 load_dotenv()
 
@@ -846,6 +845,7 @@ def parse_excel_column_order(text):
 async def handle_excel_import(file_bytes, column_order, update):
     """Import contacts from Excel bytes using declared column order."""
     try:
+        import openpyxl
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
         ws_xl = wb.active
         rows = list(ws_xl.iter_rows(values_only=True))
@@ -967,6 +967,8 @@ async def handle_excel_import(file_bytes, column_order, update):
             msg += f", {skipped} skipped (already exist)"
         await update.message.reply_text(msg)
 
+    except ImportError:
+        await update.message.reply_text("openpyxl isn't installed. Run `pip install openpyxl` and redeploy.")
     except Exception as e:
         await update.message.reply_text(f"❌ Import failed: {str(e)}")
 
@@ -3239,6 +3241,22 @@ def detect_crm_natural_update(text):
         field = ask_private.group(2).strip()
         return ("show_private", name, field, None)
 
+    # Freeform notes update: "Update [Name]\n[notes]" or "Update [Name], [notes]"
+    freeform = re.match(
+        r"update\s+([a-z][a-z\s]+?)[\n,]\s*(.+)",
+        lower,
+        re.DOTALL
+    )
+    if freeform:
+        name = freeform.group(1).strip().title()
+        notes_text = freeform.group(2).strip()
+        field_map = {"alias", "birthday", "relationship", "context", "notes",
+                     "follow up date", "follow up notes", "email", "address",
+                     "referred by", "referral date"}
+        first_part = notes_text.split(",")[0].strip()
+        if first_part not in field_map:
+            return ("notes_append", name, "notes", notes_text)
+
     return None
 
 
@@ -3318,6 +3336,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Auto-detect column order from the file's own header row
             try:
+                import openpyxl
                 wb_peek = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
                 ws_peek = wb_peek.active
                 first_row = next(ws_peek.iter_rows(max_row=1, values_only=True), None)
@@ -3636,6 +3655,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply = update_contact_field_natural(name, field_or_referred, value)
             elif action == "show_private":
                 reply = find_contact(name, show_private=True)
+            elif action == "notes_append":
+                reply = add_note(f"{name} - {value}")
         elif is_reschedule_request(text) and user_id in last_fired_reminder:
             reply = handle_reschedule(text, user_id)
         elif is_reminder_request(text):
