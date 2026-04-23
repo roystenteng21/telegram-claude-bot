@@ -298,6 +298,7 @@ def todo_sheet():
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 conversation_histories = {}
 edit_sessions = {}
+crm_confirm_sessions = {}  # { user_id: {"name": str, "note": str} }
 
 # --- iCloud Calendar Setup ---
 def get_calendar(name=None):
@@ -1401,7 +1402,9 @@ meeting_sessions = {}
 MEETING_START_PHRASES = [
     "meeting recap", "taking notes", "log this meeting", "meeting notes",
     "recap for", "notes for", "log meeting", "start recap", "new recap",
-    "networking recap", "presentation recap"
+    "networking recap", "presentation recap",
+    "i'm at", "im at", "just arrived at", "arrived at", "i am at",
+    "at the ", "heading to ", "just got to "
 ]
 
 MEETING_DONE_PHRASES = [
@@ -1409,9 +1412,18 @@ MEETING_DONE_PHRASES = [
     "finish", "finished", "end recap", "process this", "that's all", "thats all"
 ]
 
+MEETING_END_PHRASES = [
+    "back in sg", "back home", "reached sg", "home now", "just landed",
+    "event done", "event over", "wrapping up", "that's a wrap", "thats a wrap"
+]
+
 def is_meeting_start(text):
     lower = text.lower()
     return any(p in lower for p in MEETING_START_PHRASES)
+
+def is_meeting_end(text):
+    lower = text.lower().strip()
+    return any(p in lower for p in MEETING_END_PHRASES)
 
 def is_meeting_done(text):
     lower = text.lower().strip()
@@ -1421,11 +1433,13 @@ def extract_event_name(text):
     """Try to pull event name from the start message."""
     lower = text.lower()
     for phrase in ["recap for", "notes for", "meeting notes for", "taking notes for",
-                   "meeting recap for", "log meeting for"]:
+                   "meeting recap for", "log meeting for",
+                   "i'm at", "im at", "just arrived at", "arrived at", "i am at",
+                   "at the", "heading to", "just got to"]:
         if phrase in lower:
             idx = lower.index(phrase) + len(phrase)
             return text[idx:].strip().strip(".,!?")
-    return ""
+    return text.strip().strip(".,!?")
 
 def tag_crm_contacts(text):
     """Find any CRM contacts mentioned in the text."""
@@ -1548,11 +1562,27 @@ async def handle_meeting_session(user_id, text, update):
     session = meeting_sessions[user_id]
     step = session.get("step")
 
+    # End session triggers (back home / event over)
+    if is_meeting_end(text):
+        if session.get("notes"):
+            await update.message.reply_text("On it, give me a sec...")
+            try:
+                recap = process_meeting_notes(session.get("event_name", ""), session["notes"])
+                session["pending_recap"] = recap
+                session["step"] = "confirming"
+                confirmation = format_recap_confirmation(recap)
+                await update.message.reply_text(confirmation)
+            except Exception as e:
+                await update.message.reply_text(f"Couldn't process the notes: {str(e)}. Try again.")
+        else:
+            del meeting_sessions[user_id]
+            await update.message.reply_text("Got it, session ended. No notes to save.")
+        return
+
     # Confirming step — waiting for Y or E
     if step == "confirming":
         if text.strip().upper() == "Y":
             saved = save_meeting_recap(session["pending_recap"])
-            # Tag CRM contacts
             contacts = session["pending_recap"].get("contacts_mentioned", [])
             for name in contacts:
                 row_num, record = find_row(name)
@@ -1580,11 +1610,56 @@ async def handle_meeting_session(user_id, text, update):
         session["event_name"] = text.strip()
         session["step"] = "collecting"
         await update.message.reply_text(
-            f"Got it. Send your notes for {text.strip()} and say done when you're finished."
+            f"Got it, logging for *{text.strip()}*. Send me a name to log someone, or just dump your notes and say done when finished."
         )
         return
 
-    # Collecting step — buffering notes
+    # Awaiting notes for a specific contact
+    if step == "awaiting_contact_note":
+        pending_name = session.get("pending_contact_name", "")
+        note_text = text.strip()
+        if note_text.lower() != "skip":
+            # Save note to CRM
+            row_num, record = find_row(pending_name)
+            if record:
+                add_note(f"{record.get('Name')} - [{session.get('event_name', 'event')}] {note_text}")
+                session["notes"].append(f"{record.get('Name')}: {note_text}")
+                await update.message.reply_text(f"✅ Noted for *{record.get('Name')}*. Anyone else? Send another name or say done.")
+            else:
+                # New contact — ask to confirm
+                session["pending_new_contact"] = {"name": pending_name, "note": note_text}
+                session["step"] = "confirm_new_contact"
+                await update.message.reply_text(
+                    f"*{pending_name}* isn't in your CRM. Add them as a new contact?\n\nReply Y to add or N to skip."
+                )
+        else:
+            await update.message.reply_text("Skipped. Anyone else? Send a name or say done.")
+            session["step"] = "collecting"
+        session.pop("pending_contact_name", None)
+        if step != "confirm_new_contact":
+            session["step"] = "collecting"
+        return
+
+    # Confirm adding new contact from meeting
+    if step == "confirm_new_contact":
+        pending = session.get("pending_new_contact", {})
+        if text.strip().upper() == "Y":
+            name = pending.get("name", "")
+            note = pending.get("note", "")
+            today = date.today().strftime("%d/%m/%Y")
+            crm_sheet().append_row([
+                name, "", "", "", session.get("event_name", ""), note,
+                "", "", today, "", "", "", "", ""
+            ])
+            session["notes"].append(f"{name}: {note}")
+            await update.message.reply_text(f"✅ Added *{name}* to CRM. Anyone else? Send a name or say done.")
+        else:
+            await update.message.reply_text("Skipped. Anyone else? Send a name or say done.")
+        session.pop("pending_new_contact", None)
+        session["step"] = "collecting"
+        return
+
+    # Collecting step — buffering notes or detecting a name
     if is_meeting_done(text):
         if not session.get("notes"):
             await update.message.reply_text("You haven't sent any notes yet. Send your notes then say done.")
@@ -1602,9 +1677,25 @@ async def handle_meeting_session(user_id, text, update):
             await update.message.reply_text(f"Couldn't process the notes: {str(e)}. Try again.")
         return
 
+    # Check if message looks like just a name (1-3 words, exists in CRM or short enough to be a name)
+    words = text.strip().split()
+    if 1 <= len(words) <= 3:
+        row_num, record = find_row(text.strip())
+        if record:
+            session["pending_contact_name"] = record.get("Name")
+            session["step"] = "awaiting_contact_note"
+            await update.message.reply_text(f"What's the update for *{record.get('Name')}*?")
+            return
+        # Looks like a name but not in CRM
+        if len(words) <= 2 and text.strip().replace(" ", "").isalpha():
+            session["pending_contact_name"] = text.strip().title()
+            session["step"] = "awaiting_contact_note"
+            await update.message.reply_text(f"What's the update for *{text.strip().title()}*?")
+            return
+
     # Still collecting — buffer the note
     session["notes"].append(text)
-    # Acknowledge silently (no reply) to keep flow natural
+    # Acknowledge silently to keep flow natural
 
 
 
@@ -3241,22 +3332,6 @@ def detect_crm_natural_update(text):
         field = ask_private.group(2).strip()
         return ("show_private", name, field, None)
 
-    # Freeform notes update: "Update [Name]\n[notes]" or "Update [Name], [notes]"
-    freeform = re.match(
-        r"update\s+([a-z][a-z\s]+?)[\n,]\s*(.+)",
-        lower,
-        re.DOTALL
-    )
-    if freeform:
-        name = freeform.group(1).strip().title()
-        notes_text = freeform.group(2).strip()
-        field_map = {"alias", "birthday", "relationship", "context", "notes",
-                     "follow up date", "follow up notes", "email", "address",
-                     "referred by", "referral date"}
-        first_part = notes_text.split(",")[0].strip()
-        if first_part not in field_map:
-            return ("notes_append", name, "notes", notes_text)
-
     return None
 
 
@@ -3410,6 +3485,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_edit_session(user_id, text, update)
         return
 
+    # Handle pending new CRM contact confirmation
+    if user_id in crm_confirm_sessions:
+        pending = crm_confirm_sessions.pop(user_id)
+        if text.strip().upper() == "Y":
+            name = pending["name"]
+            note = pending.get("note", "")
+            today = date.today().strftime("%d/%m/%Y")
+            crm_sheet().append_row([
+                name, "", "", "", "", note, "", "", today, "", "", "", "", ""
+            ])
+            reply = f"✅ Added *{name}* to CRM."
+            if note:
+                reply += f" Note saved: {note}"
+        else:
+            reply = "Skipped."
+        try:
+            await update.message.reply_text(reply, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(reply)
+        return
+
     # Pending flight confirmation — intercept the next message entirely
     if overseas_state.get("_pending_flight"):
         pf = overseas_state["_pending_flight"]
@@ -3529,7 +3625,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif is_meeting_start(text):
         event_name = extract_event_name(text)
         meeting_sessions[user_id] = {
-            "step": "collecting",
+            "step": "collecting" if event_name else "get_name",
             "event_name": event_name,
             "notes": []
         }
@@ -3655,8 +3751,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply = update_contact_field_natural(name, field_or_referred, value)
             elif action == "show_private":
                 reply = find_contact(name, show_private=True)
-            elif action == "notes_append":
-                reply = add_note(f"{name} - {value}")
         elif is_reschedule_request(text) and user_id in last_fired_reminder:
             reply = handle_reschedule(text, user_id)
         elif is_reminder_request(text):
@@ -3682,17 +3776,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_calendar_request(text):
             reply = smart_add_event(text, user_id)
         else:
-            if user_id not in conversation_histories:
-                conversation_histories[user_id] = []
-            conversation_histories[user_id].append({"role": "user", "content": text})
-            response = client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=1024,
-                system=build_system_prompt(),
-                messages=conversation_histories[user_id]
-            )
-            reply = response.content[0].text
-            conversation_histories[user_id].append({"role": "assistant", "content": reply})
+            # Freeform CRM: check if message is just a name (lookup or new contact)
+            words = text.strip().split()
+            if 1 <= len(words) <= 3 and text.strip().replace(" ", "").isalpha():
+                row_num, record = find_row(text.strip())
+                if record:
+                    reply = find_contact(text.strip())
+                else:
+                    # Unknown name — ask to confirm adding
+                    crm_confirm_sessions[user_id] = {"name": text.strip().title(), "note": ""}
+                    reply = f"*{text.strip().title()}* isn't in your CRM. Add them as a new contact? (Y/N)"
+            elif not reply:
+                if user_id not in conversation_histories:
+                    conversation_histories[user_id] = []
+                conversation_histories[user_id].append({"role": "user", "content": text})
+                response = client.messages.create(
+                    model="claude-sonnet-4-5",
+                    max_tokens=1024,
+                    system=build_system_prompt(),
+                    messages=conversation_histories[user_id]
+                )
+                reply = response.content[0].text
+                conversation_histories[user_id].append({"role": "assistant", "content": reply})
 
     if reply:
         try:
