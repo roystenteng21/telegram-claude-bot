@@ -1,5 +1,8 @@
 import os
 import json
+import re
+import io
+import requests
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from telegram import Update
@@ -20,6 +23,9 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 SHEET_ID = os.getenv("SHEET_ID")
 ICLOUD_USERNAME = os.getenv("ICLOUD_USERNAME")
 ICLOUD_PASSWORD = os.getenv("ICLOUD_PASSWORD")
+AVIATIONSTACK_API_KEY = os.getenv("AVIATIONSTACK_API_KEY", "")
+EXCHANGE_RATE_API_KEY = os.getenv("EXCHANGE_RATE_API_KEY", "")
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 YOUR_CHAT_ID = 281095850
 
 # --- Google Sheets + Drive Setup ---
@@ -46,6 +52,13 @@ def setup_sheets():
     """Rename Sheet1 to CRM if needed, create all required tabs."""
     existing = [ws.title for ws in spreadsheet.worksheets()]
 
+    # New CRM column headers
+    CRM_HEADERS = [
+        "Name", "Alias", "Birthday", "Relationship", "Context", "Notes",
+        "Follow Up Date", "Follow Up Notes", "Last Updated", "Birthday Greeted",
+        "Referred By", "Referral Date", "Email", "Address"
+    ]
+
     # Rename sheet1 -> CRM if CRM doesn't exist yet
     if "CRM" not in existing:
         try:
@@ -53,12 +66,19 @@ def setup_sheets():
             sheet1.update_title("CRM")
             print("Renamed Sheet1 -> CRM")
         except Exception:
-            # Sheet1 already renamed or doesn't exist, create CRM fresh
             if "CRM" not in [ws.title for ws in spreadsheet.worksheets()]:
-                ws = spreadsheet.add_worksheet(title="CRM", rows=1000, cols=10)
-                ws.append_row(["Name", "Birthday", "Age", "Where We Met", "Notes",
-                               "Follow Up Date", "Follow Up Notes", "Last Updated"])
+                ws = spreadsheet.add_worksheet(title="CRM", rows=1000, cols=20)
+                ws.append_row(CRM_HEADERS)
                 print("Created CRM tab")
+
+    # Migrate existing CRM headers if needed
+    try:
+        crm_ws = spreadsheet.worksheet("CRM")
+        current_headers = crm_ws.row_values(1)
+        if current_headers != CRM_HEADERS:
+            _migrate_crm_headers(crm_ws, current_headers, CRM_HEADERS)
+    except Exception as e:
+        print(f"CRM header check error: {e}")
 
     # Todos tab
     if "Todos" not in existing:
@@ -87,6 +107,55 @@ def setup_sheets():
             print(f"Created tab: {tab_name}")
 
     print("✅ Sheets setup complete")
+
+def _migrate_crm_headers(ws, old_headers, new_headers):
+    """Migrate CRM sheet from old column layout to new layout."""
+    try:
+        all_data = ws.get_all_values()
+        if not all_data:
+            ws.update('A1', [new_headers])
+            print("CRM headers initialised (empty sheet)")
+            return
+
+        old_h = all_data[0]
+        rows = all_data[1:]
+
+        # Build mapping from old col name -> index
+        old_idx = {h: i for i, h in enumerate(old_h)}
+
+        def get_old(row, col_name):
+            i = old_idx.get(col_name)
+            return row[i] if i is not None and i < len(row) else ""
+
+        migrated = [new_headers]
+        for row in rows:
+            name = get_old(row, "Name")
+            if not name:
+                continue
+            # Map old fields to new; old "Where We Met" -> Relationship
+            migrated.append([
+                name,
+                get_old(row, "Alias"),
+                get_old(row, "Birthday"),
+                get_old(row, "Where We Met"),   # becomes Relationship
+                get_old(row, "Context"),
+                get_old(row, "Notes"),
+                get_old(row, "Follow Up Date"),
+                get_old(row, "Follow Up Notes"),
+                get_old(row, "Last Updated"),
+                get_old(row, "Birthday Greeted"),
+                get_old(row, "Referred By"),
+                get_old(row, "Referral Date"),
+                get_old(row, "Email"),
+                get_old(row, "Address"),
+            ])
+
+        ws.clear()
+        if migrated:
+            ws.update('A1', migrated)
+        print(f"✅ CRM migrated to new column layout ({len(migrated)-1} contacts)")
+    except Exception as e:
+        print(f"Error migrating CRM headers: {e}")
 
 def get_or_create_drive_folder(name, parent_id=None):
     """Get a Drive folder by name (under parent), or create it."""
@@ -266,96 +335,177 @@ def calculate_age(birthday_str):
     except:
         return ""
 
-def format_contact(r):
+def format_contact(r, show_private=False):
     name = r.get("Name", "")
+    alias = r.get("Alias", "")
     birthday = r.get("Birthday", "")
     age = calculate_age(birthday) if birthday else ""
-    where_met = r.get("Where We Met", "")
+    relationship = r.get("Relationship", "")
+    context = r.get("Context", "")
     notes_raw = r.get("Notes", "")
     followup_date = r.get("Follow Up Date", "")
     followup_notes = r.get("Follow Up Notes", "")
     last_updated = r.get("Last Updated", "")
+    referred_by = r.get("Referred By", "")
+    referral_date = r.get("Referral Date", "")
+    email = r.get("Email", "")
+    address = r.get("Address", "")
 
+    lines = [f"*{name}*"]
+    if alias:
+        lines.append(f"- Also known as: {alias}")
+    if relationship:
+        lines.append(f"- Relationship: {relationship}")
+    if context:
+        lines.append(f"- Context: {context}")
     if birthday and age:
-        age_line = f"- Age: {age}, {format_date(birthday)}"
-    elif age:
-        age_line = f"- Age: {age}, (unknown birthday)"
-    else:
-        age_line = "- Age: Unknown"
+        lines.append(f"- Birthday: {format_date(birthday)} (age {age})")
+    elif birthday:
+        lines.append(f"- Birthday: {format_date(birthday)}")
 
     if notes_raw:
         note_items = [n.strip() for n in notes_raw.split(";") if n.strip()]
-        notes_formatted = "- Notes:\n" + "\n".join(f"  - {n}" for n in note_items)
+        lines.append("- Notes:")
+        for n in note_items:
+            lines.append(f"  - {n}")
     else:
-        notes_formatted = "- Notes:\n  - None"
+        lines.append("- Notes:\n  - None")
 
-    followup_line = ""
     if followup_date:
-        followup_line = f"\n- Follow Up: {format_date(followup_date)}"
+        lines.append(f"- Follow Up: {format_date(followup_date)}")
         if followup_notes:
-            followup_line += f"\n  - {followup_notes}"
+            lines.append(f"  - {followup_notes}")
 
-    last_updated_line = f"\n_Last updated: {format_date(last_updated)}_" if last_updated else ""
+    if referred_by:
+        ref_line = f"- Referred by: {referred_by}"
+        if referral_date:
+            ref_line += f" on {format_date(referral_date)}"
+        lines.append(ref_line)
 
-    return (
-        f"*{name}*\n"
-        f"- Met: {where_met or 'Unknown'}\n"
-        f"{age_line}\n"
-        f"{notes_formatted}"
-        f"{followup_line}"
-        f"{last_updated_line}"
-    )
+    # Private fields — only shown when explicitly asked
+    if show_private:
+        if email:
+            lines.append(f"- Email: {email}")
+        if address:
+            lines.append(f"- Address: {address}")
+
+    if last_updated:
+        lines.append(f"\n_Last updated: {format_date(last_updated)}_")
+
+    return "\n".join(lines)
 
 def find_row(name):
+    """Search Name first, then Alias, then first-name match. Returns (row_num, record) for best single match."""
     sheet = crm_sheet()
     records = sheet.get_all_records()
+    name_lower = name.strip().lower()
+
+    # 1. Exact full name match
     for i, r in enumerate(records):
-        if name.lower() in r.get("Name", "").lower():
+        if r.get("Name", "").lower() == name_lower:
             return i + 2, r
+
+    # 2. Full alias match
+    for i, r in enumerate(records):
+        if r.get("Alias", "").lower() == name_lower:
+            return i + 2, r
+
+    # 3. Substring match on Name
+    matches = []
+    for i, r in enumerate(records):
+        if name_lower in r.get("Name", "").lower():
+            matches.append((i + 2, r))
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        return matches[0]  # Caller should use find_all_rows for disambiguation
+
+    # 4. Substring match on Alias
+    alias_matches = []
+    for i, r in enumerate(records):
+        if name_lower in r.get("Alias", "").lower():
+            alias_matches.append((i + 2, r))
+    if len(alias_matches) == 1:
+        return alias_matches[0]
+    if len(alias_matches) > 1:
+        return alias_matches[0]
+
+    # 5. First-name match across Name and Alias
+    first_matches = []
+    for i, r in enumerate(records):
+        full_name = r.get("Name", "")
+        alias = r.get("Alias", "")
+        first_name = full_name.split()[0].lower() if full_name else ""
+        alias_first = alias.split()[0].lower() if alias else ""
+        if name_lower == first_name or name_lower == alias_first:
+            first_matches.append((i + 2, r))
+    if first_matches:
+        return first_matches[0]
+
     return None, None
 
 def find_all_rows(name):
+    """Like find_row but returns all matches for disambiguation."""
     sheet = crm_sheet()
     records = sheet.get_all_records()
+    name_lower = name.strip().lower()
     results = []
+
     for i, r in enumerate(records):
-        if name.lower() in r.get("Name", "").lower():
+        full_name = r.get("Name", "").lower()
+        alias = r.get("Alias", "").lower()
+        first_name = full_name.split()[0] if full_name else ""
+        alias_first = alias.split()[0] if alias else ""
+        if (name_lower in full_name or name_lower in alias or
+                name_lower == first_name or name_lower == alias_first):
             results.append((i + 2, r))
     return results
+
+def disambiguate_contacts(matches):
+    """Return a disambiguation prompt if multiple contacts match."""
+    names = [r.get("Name", "?") for _, r in matches]
+    options = " or ".join(f"*{n}*" for n in names)
+    return f"Did you mean {options}?"
 
 # --- CRM Functions ---
 def save_contact(data):
     try:
         sheet = crm_sheet()
         parts = [p.strip() for p in data.split(",")]
-        while len(parts) < 7:
+        while len(parts) < 13:
             parts.append("")
         name = parts[0]
-        birthday = parts[1]
-        age = calculate_age(birthday) if birthday else ""
-        where_met = parts[2]
-        notes = parts[3]
-        followup_date = parts[4]
-        followup_notes = parts[5]
+        alias = parts[1] if len(parts) > 1 else ""
+        birthday = parts[2] if len(parts) > 2 else ""
+        relationship = parts[3] if len(parts) > 3 else ""
+        context = parts[4] if len(parts) > 4 else ""
+        notes = parts[5] if len(parts) > 5 else ""
+        followup_date = parts[6] if len(parts) > 6 else ""
+        followup_notes = parts[7] if len(parts) > 7 else ""
         last_updated = date.today().strftime("%d/%m/%Y")
         if not name:
             return "❌ Name is required"
-        sheet.append_row([name, birthday, age, where_met, notes, followup_date, followup_notes, last_updated])
+        sheet.append_row([
+            name, alias, birthday, relationship, context, notes,
+            followup_date, followup_notes, last_updated, "", "", "", "", ""
+        ])
         return f"✅ Contact saved!\n\n" + format_contact({
-            "Name": name, "Birthday": birthday, "Age": age,
-            "Where We Met": where_met, "Notes": notes,
-            "Follow Up Date": followup_date, "Follow Up Notes": followup_notes,
-            "Last Updated": last_updated
+            "Name": name, "Alias": alias, "Birthday": birthday,
+            "Relationship": relationship, "Context": context,
+            "Notes": notes, "Follow Up Date": followup_date,
+            "Follow Up Notes": followup_notes, "Last Updated": last_updated
         })
     except Exception as e:
         return f"❌ Error saving contact: {str(e)}"
 
-def find_contact(name):
+def find_contact(name, show_private=False):
     try:
         results = find_all_rows(name)
         if not results:
             return f"❌ No contact found for '{name}'"
-        return "\n\n".join(format_contact(r) for _, r in results)
+        if len(results) > 1:
+            return disambiguate_contacts(results)
+        return format_contact(results[0][1], show_private=show_private)
     except Exception as e:
         return f"❌ Error finding contact: {str(e)}"
 
@@ -372,8 +522,9 @@ def add_note(data):
             return f"❌ No contact found for '{name}'"
         existing = record.get("Notes", "")
         new_note = f"{existing}; {note}" if existing else note
-        sheet.update_cell(row_num, 5, new_note)
-        sheet.update_cell(row_num, 8, date.today().strftime("%d/%m/%Y"))
+        # Col 6 = Notes in new schema
+        sheet.update_cell(row_num, 6, new_note)
+        sheet.update_cell(row_num, 9, date.today().strftime("%d/%m/%Y"))  # Last Updated
         return f"✅ Note added to *{record.get('Name')}*"
     except Exception as e:
         return f"❌ Error adding note: {str(e)}"
@@ -390,9 +541,9 @@ def set_followup(data):
         row_num, record = find_row(name)
         if not record:
             return f"❌ No contact found for '{name}'"
-        sheet.update_cell(row_num, 6, followup_date)
-        sheet.update_cell(row_num, 7, followup_notes)
-        sheet.update_cell(row_num, 8, date.today().strftime("%d/%m/%Y"))
+        sheet.update_cell(row_num, 7, followup_date)   # Follow Up Date
+        sheet.update_cell(row_num, 8, followup_notes)   # Follow Up Notes
+        sheet.update_cell(row_num, 9, date.today().strftime("%d/%m/%Y"))  # Last Updated
         return f"✅ Follow up set for *{record.get('Name')}* on {format_date(followup_date)}"
     except Exception as e:
         return f"❌ Error setting follow up: {str(e)}"
@@ -404,24 +555,30 @@ def update_field(data):
         if len(parts) < 3:
             return "❌ Format: update Name, field, new value"
         name, field, value = parts
+        # Col indices: Name=1, Alias=2, Birthday=3, Relationship=4, Context=5,
+        # Notes=6, Follow Up Date=7, Follow Up Notes=8, Last Updated=9,
+        # Birthday Greeted=10, Referred By=11, Referral Date=12, Email=13, Address=14
         field_map = {
-            "birthday": 2, "where we met": 4,
-            "notes": 5, "follow up date": 6, "follow up notes": 7
+            "alias": 2, "birthday": 3, "relationship": 4, "context": 5,
+            "notes": 6, "follow up date": 7, "follow up notes": 8,
+            "referred by": 11, "referral date": 12, "email": 13, "address": 14
         }
         col = field_map.get(field.lower())
         if not col:
-            return f"❌ Unknown field '{field}'. Options: birthday, where we met, notes, follow up date, follow up notes"
+            valid = ", ".join(field_map.keys())
+            return f"❌ Unknown field '{field}'. Options: {valid}"
         row_num, record = find_row(name)
         if not record:
             return f"❌ No contact found for '{name}'"
         sheet.update_cell(row_num, col, value)
-        if field.lower() == "birthday":
-            age = calculate_age(value)
-            sheet.update_cell(row_num, 3, age)
-        sheet.update_cell(row_num, 8, date.today().strftime("%d/%m/%Y"))
+        sheet.update_cell(row_num, 9, date.today().strftime("%d/%m/%Y"))  # Last Updated
         return f"✅ {field.title()} updated for *{record.get('Name')}*"
     except Exception as e:
         return f"❌ Error updating contact: {str(e)}"
+
+def update_contact_field_natural(name, field, value):
+    """Update a single field by natural language field name. Returns reply string."""
+    return update_field(f"{name}, {field}, {value}")
 
 def delete_contact(name):
     try:
@@ -456,7 +613,8 @@ def list_contacts():
             return "❌ No contacts found"
         response = f"📋 *{len(records)} contact(s):*\n\n"
         for r in records:
-            response += f"👤 {r.get('Name', '')} — 📍 {r.get('Where We Met', '') or 'Unknown'}\n"
+            rel = r.get("Relationship", "") or r.get("Context", "") or "Unknown"
+            response += f"👤 {r.get('Name', '')} — {rel}\n"
         return response
     except Exception as e:
         return f"❌ Error listing contacts: {str(e)}"
@@ -596,6 +754,223 @@ def last_contact(name):
         return f"👤 *{record.get('Name')}*\n📅 No updates recorded yet"
     except Exception as e:
         return f"❌ Error: {str(e)}"
+
+# --- Referral Tracking ---
+def set_referral(referrer_name, referred_name):
+    """Record that referrer_name referred referred_name."""
+    try:
+        sheet = crm_sheet()
+        row_num, record = find_row(referred_name)
+        if not record:
+            return f"❌ No contact found for '{referred_name}'. Add them first."
+        today = date.today().strftime("%d/%m/%Y")
+        sheet.update_cell(row_num, 11, referrer_name)   # Referred By
+        sheet.update_cell(row_num, 12, today)            # Referral Date
+        sheet.update_cell(row_num, 9, today)             # Last Updated
+        # Set relationship to Prospect if blank
+        if not record.get("Relationship", ""):
+            sheet.update_cell(row_num, 4, "Prospect")
+        return f"✅ Got it — {referred_name} was referred by {referrer_name} (Referral Date: {format_date(today)})"
+    except Exception as e:
+        return f"❌ Error recording referral: {str(e)}"
+
+def get_referrals_by(referrer_name):
+    """List all contacts referred by a given person."""
+    try:
+        sheet = crm_sheet()
+        records = sheet.get_all_records()
+        results = [r for r in records if r.get("Referred By", "").lower() == referrer_name.lower()]
+        if not results:
+            return f"No referrals found from {referrer_name}."
+        lines = [f"*Referrals from {referrer_name}:*\n"]
+        for r in results:
+            ref_date = format_date(r.get("Referral Date", "")) if r.get("Referral Date") else "unknown date"
+            lines.append(f"👤 {r.get('Name')} — {r.get('Relationship', 'Prospect')} (referred {ref_date})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
+
+def get_all_referrals():
+    """List all contacts with a referral, grouped by referrer."""
+    try:
+        sheet = crm_sheet()
+        records = sheet.get_all_records()
+        referrals = [r for r in records if r.get("Referred By", "")]
+        if not referrals:
+            return "No referrals recorded yet."
+        grouped = {}
+        for r in referrals:
+            ref_by = r.get("Referred By", "Unknown")
+            grouped.setdefault(ref_by, []).append(r)
+        lines = ["*All Referrals:*\n"]
+        for referrer, contacts in sorted(grouped.items(), key=lambda x: -len(x[1])):
+            lines.append(f"*{referrer}* ({len(contacts)} referral{'s' if len(contacts) != 1 else ''})")
+            for c in contacts:
+                lines.append(f"  → {c.get('Name')} ({c.get('Relationship', 'Prospect')})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
+
+def get_top_referrers():
+    """Rank contacts by number of referrals made."""
+    try:
+        sheet = crm_sheet()
+        records = sheet.get_all_records()
+        counts = {}
+        for r in records:
+            ref_by = r.get("Referred By", "")
+            if ref_by:
+                counts[ref_by] = counts.get(ref_by, 0) + 1
+        if not counts:
+            return "No referrals recorded yet."
+        ranked = sorted(counts.items(), key=lambda x: -x[1])
+        lines = ["*Top Referrers:*\n"]
+        for i, (name, count) in enumerate(ranked, 1):
+            lines.append(f"{i}. {name} — {count} referral{'s' if count != 1 else ''}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
+
+# --- Excel Import ---
+# excel_import_sessions tracks state: { user_id: { "step": "awaiting_columns"|"awaiting_file", "column_order": [...] } }
+excel_import_sessions = {}
+
+def parse_excel_column_order(text):
+    """Parse user's declared column order from a message like 'Name, Email, Date of Birth, Alias'."""
+    # Strip numbering like "1. Name 2. Email" or "Name, Email, DOB"
+    text = re.sub(r'\d+[\.\)]\s*', '', text)
+    parts = [p.strip() for p in re.split(r'[,\n]', text) if p.strip()]
+    return parts
+
+async def handle_excel_import(file_bytes, column_order, update):
+    """Import contacts from Excel bytes using declared column order."""
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+        ws_xl = wb.active
+        rows = list(ws_xl.iter_rows(values_only=True))
+
+        # Skip header row if first row looks like headers
+        data_rows = rows
+        if rows:
+            first = [str(c).strip() if c else "" for c in rows[0]]
+            if any(h.lower() in ["name", "email", "alias", "date of birth", "dob", "birthday",
+                                  "relationship", "address", "context", "referred by"] for h in first):
+                data_rows = rows[1:]
+
+        sheet = crm_sheet()
+        existing_records = sheet.get_all_records()
+        existing_names_set = set()
+        for r in existing_records:
+            n = r.get("Name", "").strip().lower()
+            if n:
+                existing_names_set.add(n)
+
+        # Build column index map from declared order
+        col_map = {}
+        for i, col_name in enumerate(column_order):
+            col_map[col_name.strip().lower()] = i
+
+        def get_col(row, *keys):
+            for k in keys:
+                idx = col_map.get(k.lower())
+                if idx is not None and idx < len(row):
+                    val = row[idx]
+                    if val is not None:
+                        return str(val).strip().replace('\xa0', '').strip()
+            return ""
+
+        def normalise_birthday(val):
+            """Convert various birthday formats to DD/MM/YYYY."""
+            if val is None:
+                return ""
+            # Already a datetime object (openpyxl reads Excel dates natively)
+            if isinstance(val, (datetime,)):
+                return val.strftime("%d/%m/%Y")
+            s = str(val).strip()
+            if not s or s.lower() == "none":
+                return ""
+            for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%m/%d/%Y", "%d-%m-%Y",
+                        "%d %b %Y", "%d %B %Y", "%Y-%m-%d %H:%M:%S"]:
+                try:
+                    return datetime.strptime(s, fmt).strftime("%d/%m/%Y")
+                except:
+                    pass
+            # Try Excel serial
+            try:
+                serial = int(float(s))
+                epoch = datetime(1899, 12, 30)
+                return (epoch + timedelta(days=serial)).strftime("%d/%m/%Y")
+            except:
+                pass
+            return s  # return raw if nothing parsed
+
+        def normalise_name(raw):
+            """Strip whitespace/NBSP, Title Case if ALL CAPS."""
+            if not raw:
+                return ""
+            cleaned = str(raw).replace('\xa0', '').strip()
+            if cleaned.isupper():
+                cleaned = cleaned.title()
+            return cleaned
+
+        def normalise_email(raw):
+            return str(raw).strip().lower() if raw else ""
+
+        imported = 0
+        skipped = 0
+        today = date.today().strftime("%d/%m/%Y")
+
+        rows_to_append = []
+        for row in data_rows:
+            if not any(c for c in row if c is not None):
+                continue
+
+            # Get birthday raw value directly from index (handles datetime objects)
+            bday_idx = col_map.get("birthday")
+            bday_raw = row[bday_idx] if bday_idx is not None and bday_idx < len(row) else None
+            birthday = normalise_birthday(bday_raw)
+
+            name = normalise_name(get_col(row, "Name", "name"))
+            if not name:
+                continue
+
+            if name.lower() in existing_names_set:
+                skipped += 1
+                continue
+
+            alias = get_col(row, "Alias", "alias")
+            relationship = get_col(row, "Relationship", "relationship")
+            context = get_col(row, "Context", "context")
+            notes = get_col(row, "Notes", "notes")
+            followup_date = get_col(row, "Follow Up Date", "follow up date")
+            followup_notes = get_col(row, "Follow Up Notes", "follow up notes")
+            referred_by = get_col(row, "Referred By", "referred by")
+            referral_date = get_col(row, "Referral Date", "referral date")
+            email_raw = get_col(row, "Email", "email")
+            email = normalise_email(email_raw)
+            address = get_col(row, "Address", "address")
+
+            rows_to_append.append([
+                name, alias, birthday, relationship, context, notes,
+                followup_date, followup_notes, today, "", referred_by, referral_date, email, address
+            ])
+            existing_names_set.add(name.lower())
+            imported += 1
+
+        # Batch append for speed
+        if rows_to_append:
+            sheet.append_rows(rows_to_append)
+
+        msg = f"✅ Import done — {imported} contact(s) added"
+        if skipped:
+            msg += f", {skipped} skipped (already exist)"
+        await update.message.reply_text(msg)
+
+    except ImportError:
+        await update.message.reply_text("openpyxl isn't installed. Run `pip install openpyxl` and redeploy.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Import failed: {str(e)}")
 
 # --- Todo Functions ---
 def add_todo(task):
@@ -773,13 +1148,20 @@ Rules:
 async def handle_edit_session(user_id, text, update):
     session = edit_sessions[user_id]
     step = session["step"]
-    fields = ["birthday", "where we met", "notes", "follow up date", "follow up notes"]
+    fields = ["alias", "birthday", "relationship", "context", "notes",
+              "follow up date", "follow up notes", "email", "address"]
 
     if step == "choose_field":
         field = text.lower().strip()
+        if field == "cancel":
+            del edit_sessions[user_id]
+            await update.message.reply_text("Cancelled.")
+            return
         if field not in fields:
             await update.message.reply_text(
-                f"Pick a field to edit:\n1. Birthday\n2. Where we met\n3. Notes\n4. Follow up date\n5. Follow up notes\n\nOr type *cancel* to exit.",
+                f"Pick a field to edit:\n1. Alias\n2. Birthday\n3. Relationship\n4. Context\n"
+                f"5. Notes\n6. Follow up date\n7. Follow up notes\n8. Email\n9. Address\n\n"
+                f"Or type *cancel* to exit.",
                 parse_mode="Markdown"
             )
             return
@@ -823,34 +1205,20 @@ async def send_followup_reminders(app):
 birthday_pending = {}
 
 def ensure_birthday_greeted_column():
-    """Make sure CRM has a Birthday Greeted column."""
-    try:
-        sheet = crm_sheet()
-        headers = sheet.row_values(1)
-        if "Birthday Greeted" not in headers:
-            next_col = len(headers) + 1
-            sheet.update_cell(1, next_col, "Birthday Greeted")
-            print("Added Birthday Greeted column to CRM")
-    except Exception as e:
-        print(f"Error ensuring Birthday Greeted column: {e}")
+    """Birthday Greeted is col 10 in new CRM schema — nothing to add."""
+    pass  # Column already defined in new header structure
 
 def get_birthday_greeted_col():
-    """Return the column index (1-based) of Birthday Greeted."""
-    try:
-        sheet = crm_sheet()
-        headers = sheet.row_values(1)
-        if "Birthday Greeted" in headers:
-            return headers.index("Birthday Greeted") + 1
-        return None
-    except:
-        return None
+    """Return the column index (1-based) of Birthday Greeted — always 10 in new schema."""
+    return 10
 
-def generate_birthday_greeting(name, age, where_met, notes):
+def generate_birthday_greeting(name, age, relationship, context, notes):
     """Generate a personalised birthday greeting via Claude."""
+    context_str = f"Relationship: {relationship}. Context: {context}. Notes: {notes or 'none'}."
     greeting_prompt = (
         f"Write a warm, casual birthday greeting that someone could copy and paste to send to {name}, "
         f"who is turning {age} today.\n\n"
-        f"Context: met at {where_met or 'unknown'}. Notes about them: {notes or 'none'}.\n\n"
+        f"Context: {context_str}\n\n"
         f"Rules:\n"
         f"- Must open with Happy birthday\n"
         f"- Casual and warm throughout, never stiff or corporate\n"
@@ -889,14 +1257,15 @@ async def send_birthday_reminders(app):
                 name = r.get("Name", "")
                 age = calculate_age(bday_str)
                 notes = r.get("Notes", "")
-                where_met = r.get("Where We Met", "")
+                relationship = r.get("Relationship", "")
+                context = r.get("Context", "")
 
                 # Skip if already greeted today
                 already_greeted = r.get("Birthday Greeted", "")
                 if already_greeted == today.strftime("%d/%m/%Y"):
                     continue
 
-                greeting = generate_birthday_greeting(name, age, where_met, notes)
+                greeting = generate_birthday_greeting(name, age, relationship, context, notes)
 
                 msg = (
                     f"It's {name}'s birthday today! Turning {age}. 🎂\n\n"
@@ -1654,19 +2023,55 @@ def is_expense_input(text):
 def is_overseas_mode_request(text):
     """Detect overseas mode toggle."""
     lower = text.lower()
-    return ("overseas" in lower or "travelling" in lower or "traveling" in lower or
+    has_flight = bool(extract_flight_number(text))
+    return (has_flight and any(w in lower for w in ["flying", "flight", "on tr", "on sq", "on ak", "on mh", "boarding"])) or \
+           ("overseas" in lower or "travelling" in lower or "traveling" in lower or
             "i'm in" in lower or "flying to" in lower or "arrived in" in lower or
             "back home" in lower or "returned" in lower or "i'm back" in lower)
 
+def lookup_flight(flight_number):
+    """Look up flight details via AviationStack API. Returns dict or None."""
+    if not AVIATIONSTACK_API_KEY:
+        return None
+    try:
+        url = "http://api.aviationstack.com/v1/flights"
+        params = {
+            "access_key": AVIATIONSTACK_API_KEY,
+            "flight_iata": flight_number.upper()
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        flights = data.get("data", [])
+        if not flights:
+            return None
+        f = flights[0]
+        dep = f.get("departure", {})
+        arr = f.get("arrival", {})
+        return {
+            "flight": flight_number.upper(),
+            "dep_airport": dep.get("airport", ""),
+            "dep_time": dep.get("scheduled", ""),
+            "arr_airport": arr.get("airport", ""),
+            "arr_time": arr.get("scheduled", ""),
+            "destination_city": arr.get("iata", ""),
+        }
+    except Exception as e:
+        print(f"Flight lookup error: {e}")
+        return None
+
+def extract_flight_number(text):
+    """Extract a flight number like TR450, SQ321 from text."""
+    match = re.search(r'\b([A-Z]{1,3}\d{1,4}[A-Z]?)\b', text.upper())
+    return match.group(1) if match else None
+
 def handle_overseas_request(text):
-    """Toggle overseas mode on/off."""
+    """Toggle overseas mode on/off, with optional flight lookup."""
     global overseas_state
     lower = text.lower()
 
     # Check if returning home
     if any(p in lower for p in ["back home", "returned", "i'm back", "landed back", "home now"]):
         overseas_state["active"] = False
-        dest = overseas_state.get("destination", "")
         overseas_state["destination"] = ""
         overseas_state["currency"] = "SGD"
         greetings = ["Welcome back!", "Good to have you back!", "Hope the trip was great!"]
@@ -1674,7 +2079,61 @@ def handle_overseas_request(text):
         greeting = random.choice(greetings)
         return f"{greeting} Switching back to SGD. 🏠"
 
-    # Going overseas — extract destination and currency
+    # Check for flight number in the message
+    flight_number = extract_flight_number(text)
+    if flight_number and AVIATIONSTACK_API_KEY:
+        flight_data = lookup_flight(flight_number)
+        if flight_data:
+            dep_time = flight_data.get("dep_time", "")
+            arr_time = flight_data.get("arr_time", "")
+            arr_airport = flight_data.get("arr_airport", "")
+            # Store pending flight confirmation in overseas_state for next message
+            overseas_state["_pending_flight"] = {
+                "flight_number": flight_number,
+                "dep_time": dep_time,
+                "arr_time": arr_time,
+                "arr_airport": arr_airport,
+                "raw_text": text,
+            }
+            dep_fmt = dep_time[:16] if dep_time else "unknown"
+            arr_fmt = arr_time[:16] if arr_time else "unknown"
+            return (
+                f"Found flight {flight_number} ✈️\n"
+                f"Departs: {dep_fmt}\n"
+                f"Arrives: {arr_fmt} ({arr_airport})\n\n"
+                f"Confirm? Reply Y to set overseas mode, or send the destination manually."
+            )
+        else:
+            # Flight not found — fall through to manual parse
+            pass
+
+    # If confirming a pending flight
+    if text.strip().upper() == "Y" and overseas_state.get("_pending_flight"):
+        pf = overseas_state.pop("_pending_flight")
+        # Extract destination from arr_airport name via Claude
+        prompt = (
+            f"What is the local currency for the airport '{pf['arr_airport']}'? "
+            f"Return ONLY a JSON: {{\"destination\": \"city name\", \"currency\": \"3-letter code\"}}"
+        )
+        resp = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=50,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        try:
+            parsed = json.loads(resp.content[0].text.strip().replace("```json","").replace("```","").strip())
+            dest = parsed.get("destination", pf["arr_airport"])
+            curr = parsed.get("currency", "USD")
+        except:
+            dest = pf["arr_airport"]
+            curr = "USD"
+        overseas_state["active"] = True
+        overseas_state["destination"] = dest
+        overseas_state["currency"] = curr
+        overseas_state["return_date"] = ""
+        return f"Overseas mode on — {dest} ({curr}). I'll log expenses in {curr} with SGD equivalent. ✈️"
+
+    # Going overseas — extract destination and currency via Claude
     prompt = (
         f"Extract travel details from: '{text}'\n\n"
         f"Return ONLY JSON with:\n"
@@ -1767,23 +2226,35 @@ def handle_expense_text(text, user_id):
         sgd_amount = amount
         fx_fee = None
         if currency != "SGD":
-            # We don't have live FX — ask Claude for approximate rate
-            fx_prompt = (
-                f"What is the approximate exchange rate from {currency} to SGD today? "
-                f"Return ONLY a single number (the SGD value of 1 {currency}). No text."
-            )
-            fx_resp = client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=20,
-                messages=[{"role": "user", "content": fx_prompt}]
-            )
-            try:
-                rate = float(fx_resp.content[0].text.strip())
-                sgd_amount = round(amount * rate, 2)
-                if card in CARD_FX_FEES:
-                    fx_fee = round(sgd_amount * CARD_FX_FEES[card] / 100, 2)
-            except:
-                sgd_amount = amount
+            rate = None
+            # Try live exchange rate first
+            if EXCHANGE_RATE_API_KEY:
+                try:
+                    fx_url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_RATE_API_KEY}/pair/{currency}/SGD"
+                    fx_resp = requests.get(fx_url, timeout=8)
+                    fx_data = fx_resp.json()
+                    if fx_data.get("result") == "success":
+                        rate = float(fx_data["conversion_rate"])
+                except Exception as e:
+                    print(f"ExchangeRate-API error: {e}")
+            # Fallback to Claude estimate if no key or request failed
+            if rate is None:
+                try:
+                    fx_prompt = (
+                        f"What is the approximate exchange rate from {currency} to SGD today? "
+                        f"Return ONLY a single number (the SGD value of 1 {currency}). No text."
+                    )
+                    fx_resp_cl = client.messages.create(
+                        model="claude-sonnet-4-5",
+                        max_tokens=20,
+                        messages=[{"role": "user", "content": fx_prompt}]
+                    )
+                    rate = float(fx_resp_cl.content[0].text.strip())
+                except:
+                    rate = 1.0
+            sgd_amount = round(amount * rate, 2)
+            if card in CARD_FX_FEES:
+                fx_fee = round(sgd_amount * CARD_FX_FEES[card] / 100, 2)
 
         # Check merchant memory
         known_cat, known_card = get_merchant_memory(merchant)
@@ -2230,7 +2701,35 @@ MARKET_INDICES = {
 }
 
 def fetch_price(ticker):
-    """Fetch current price for a ticker using Yahoo Finance API."""
+    """Fetch current price — Alpha Vantage primary, Yahoo Finance fallback."""
+    # --- Alpha Vantage ---
+    if ALPHA_VANTAGE_API_KEY:
+        try:
+            url = (
+                f"https://www.alphavantage.co/query"
+                f"?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}"
+            )
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+            quote = data.get("Global Quote", {})
+            if quote.get("05. price"):
+                price = float(quote["05. price"])
+                prev_close = float(quote["08. previous close"])
+                change = float(quote["09. change"])
+                change_pct = float(quote["10. change percent"].replace("%", ""))
+                return {
+                    "ticker": ticker,
+                    "name": ticker,  # Alpha Vantage Global Quote doesn't return company name
+                    "price": price,
+                    "prev_close": prev_close,
+                    "change": change,
+                    "change_pct": change_pct,
+                    "currency": "USD"
+                }
+        except Exception as e:
+            print(f"Alpha Vantage error for {ticker}: {e}")
+
+    # --- Yahoo Finance fallback ---
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2d"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -2254,6 +2753,7 @@ def fetch_price(ticker):
             "currency": currency
         }
     except Exception as e:
+        print(f"Yahoo Finance fallback error for {ticker}: {e}")
         return None
 
 def format_price(data):
@@ -2520,6 +3020,63 @@ def handle_stock_request(text):
         return f"Something went wrong: {str(e)}"
 
 
+# --- Natural Language CRM Update Detection ---
+
+def detect_crm_natural_update(text):
+    """
+    Detect natural language CRM field updates like:
+    "Sarah's email is sarah@gmail.com"
+    "update James's address to 123 Orchard Road"
+    "James referred Sarah"
+    Returns (action, name, field, value) or None.
+    """
+    lower = text.lower()
+
+    # Referral: "X referred Y"
+    ref_match = re.search(
+        r"([a-z][a-z\s']+?)\s+referred\s+([a-z][a-z\s']+?)(?:\s+to\s+me|\s+to\s+us)?\.?$",
+        lower
+    )
+    if ref_match:
+        referrer = ref_match.group(1).strip().title()
+        referred = ref_match.group(2).strip().title()
+        return ("referral", referrer, referred, None)
+
+    # Pattern: "[Name]'s [field] is [value]"
+    is_match = re.search(
+        r"([a-z][a-z\s']+?)'s\s+(email|address|alias|birthday|relationship|context|notes)\s+is\s+(.+)",
+        lower
+    )
+    if is_match:
+        name = is_match.group(1).strip().title()
+        field = is_match.group(2).strip()
+        value = is_match.group(3).strip().rstrip(".")
+        return ("update", name, field, value)
+
+    # Pattern: "update [Name]'s [field] to [value]"
+    update_match = re.search(
+        r"update\s+([a-z][a-z\s']+?)'s\s+(email|address|alias|birthday|relationship|context|notes)\s+to\s+(.+)",
+        lower
+    )
+    if update_match:
+        name = update_match.group(1).strip().title()
+        field = update_match.group(2).strip()
+        value = update_match.group(3).strip().rstrip(".")
+        return ("update", name, field, value)
+
+    # Pattern: "[Name]'s email" / "what's [Name]'s email/address"
+    ask_private = re.search(
+        r"(?:what'?s?\s+)?([a-z][a-z\s']+?)'s\s+(email|address)",
+        lower
+    )
+    if ask_private and any(w in lower for w in ["what", "show", "tell", "give"]):
+        name = ask_private.group(1).strip().title()
+        field = ask_private.group(2).strip()
+        return ("show_private", name, field, None)
+
+    return None
+
+
 # --- Em System Prompt Builder ---
 def build_system_prompt():
     """Build Em's system prompt, incorporating em_profile preferences."""
@@ -2558,12 +3115,15 @@ def build_system_prompt():
         "## CRM Display Format\n"
         "When displaying contact info, always use this exact format:\n\n"
         "[Full Name]\n"
-        "- Met: [where you met]\n"
-        "- Age: [age], [DD MMM YYYY or note if unknown]\n"
+        "- Relationship: [relationship]\n"
+        "- Context: [how you know them]\n"
+        "- Birthday: [DD MMM YYYY (age N)]\n"
         "- Notes:\n"
         "  - [note 1]\n"
         "  - [note 2]\n\n"
         "_Last updated: DD MMM YYYY_\n\n"
+        "Email and Address are private fields — never show them unless the user specifically asks.\n"
+        "Age is calculated on the fly from Birthday — never store or display a static age.\n"
         "Always separate notes into individual bullet points. Never dump them in one line.\n\n"
         "## What You Don't Do\n"
         "- Sound stiff or corporate\n"
@@ -2578,11 +3138,73 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != YOUR_CHAT_ID:
         return
 
+    # Handle document/file uploads (Excel import)
+    if update.message.document:
+        doc = update.message.document
+        fname = doc.file_name or ""
+        if fname.lower().endswith((".xlsx", ".xls")):
+            tg_file = await doc.get_file()
+            file_bytes = bytes(await tg_file.download_as_bytearray())
+
+            # Auto-detect column order from the file's own header row
+            try:
+                import openpyxl
+                wb_peek = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+                ws_peek = wb_peek.active
+                first_row = next(ws_peek.iter_rows(max_row=1, values_only=True), None)
+                auto_cols = [str(c).strip().replace('\xa0','') for c in first_row if c] if first_row else []
+            except:
+                auto_cols = []
+
+            if auto_cols:
+                # Got headers from file — import directly without asking
+                col_str = ", ".join(auto_cols)
+                await update.message.reply_text(f"Detected columns: {col_str}\nImporting now...")
+                await handle_excel_import(file_bytes, auto_cols, update)
+            elif user_id in excel_import_sessions and excel_import_sessions[user_id].get("step") == "awaiting_file":
+                col_order = excel_import_sessions[user_id].get("column_order", [])
+                del excel_import_sessions[user_id]
+                await handle_excel_import(file_bytes, col_order, update)
+            else:
+                excel_import_sessions[user_id] = {
+                    "step": "awaiting_columns",
+                    "file_bytes": file_bytes
+                }
+                await update.message.reply_text(
+                    "Got the file but couldn't read its headers. Tell me the column order — "
+                    "e.g. 'Name, Alias, Email, Date of Birth'"
+                )
+        else:
+            await update.message.reply_text("I can only import .xlsx or .xls files for CRM.")
+        return
+
     text = update.message.text.strip()
     lower = text.lower()
 
     # Check birthday acknowledgement — any incoming message counts
     check_birthday_acknowledgement()
+
+    # Excel import column declaration
+    if user_id in excel_import_sessions:
+        session = excel_import_sessions[user_id]
+        if session.get("step") == "awaiting_columns":
+            cols = parse_excel_column_order(text)
+            if cols:
+                if session.get("file_bytes"):
+                    # File already uploaded, import immediately
+                    file_bytes = session["file_bytes"]
+                    del excel_import_sessions[user_id]
+                    await update.message.reply_text(f"Got it — columns: {', '.join(cols)}. Importing now...")
+                    await handle_excel_import(file_bytes, cols, update)
+                else:
+                    session["column_order"] = cols
+                    session["step"] = "awaiting_file"
+                    await update.message.reply_text(
+                        f"Got it — columns: {', '.join(cols)}. Now send the Excel file."
+                    )
+            else:
+                await update.message.reply_text("Couldn't parse that. Try: 'Name, Email, Date of Birth, Alias'")
+            return
 
     # Handle active meeting recap session
     if user_id in meeting_sessions:
@@ -2597,6 +3219,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle active CRM edit session
     if user_id in edit_sessions:
         await handle_edit_session(user_id, text, update)
+        return
+
+    # Confirm pending flight for overseas mode
+    if text.strip().upper() == "Y" and overseas_state.get("_pending_flight"):
+        reply = handle_overseas_request(text)
+        if reply:
+            try:
+                await update.message.reply_text(reply, parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(reply)
         return
 
     reply = None
@@ -2626,12 +3258,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             edit_sessions[user_id] = {"name": record.get("Name"), "step": "choose_field"}
             reply = (
                 f"Editing *{record.get('Name')}*. Which field?\n\n"
-                f"1. Birthday\n2. Where we met\n3. Notes\n4. Follow up date\n5. Follow up notes\n\n"
+                f"1. Alias\n2. Birthday\n3. Relationship\n4. Context\n5. Notes\n"
+                f"6. Follow up date\n7. Follow up notes\n8. Email\n9. Address\n\n"
                 f"Type the field name or *cancel* to exit."
             )
     elif lower == "cancel":
         if user_id in edit_sessions:
             del edit_sessions[user_id]
+        if user_id in excel_import_sessions:
+            del excel_import_sessions[user_id]
         reply = "Cancelled."
     elif lower == "list":
         reply = list_contacts()
@@ -2647,6 +3282,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = upcoming_birthdays(7)
     elif lower.startswith("lastcontact "):
         reply = last_contact(text[12:])
+
+    # Referral queries
+    elif lower in ["referrals", "all referrals", "show referrals"]:
+        reply = get_all_referrals()
+    elif lower in ["top referrers", "best referrers", "who refers the most"]:
+        reply = get_top_referrers()
+    elif lower.startswith("referrals from ") or lower.startswith("who did "):
+        if lower.startswith("referrals from "):
+            name = text[15:].strip()
+        else:
+            # "who did James refer"
+            m = re.search(r"who did (.+?) refer", lower)
+            name = m.group(1).strip().title() if m else text[8:].strip()
+        reply = get_referrals_by(name)
+
+    # Import
+    elif "import" in lower and ("excel" in lower or "contacts" in lower or "spreadsheet" in lower):
+        excel_import_sessions[user_id] = {"step": "awaiting_columns", "column_order": []}
+        reply = "Sure! Tell me the column order in your Excel first — e.g. 'Name, Email, Date of Birth, Alias'"
 
     # Meeting Recap Commands
     elif lower.startswith("search meetings ") or lower.startswith("find meeting "):
@@ -2718,8 +3372,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif lower in ["portfolio", "my portfolio", "holdings", "portfolio performance"]:
         reply = get_portfolio_performance()
     elif lower in ["market summary", "market today", "how is the market"]:
-        reply = "Pulling latest market data..."
-        # Will be handled async — for now route to handle_stock_request
         reply = handle_stock_request(text) or "Use 'weekly market summary' to get a full breakdown."
     elif is_stock_request(text):
         result = handle_stock_request(text)
@@ -2761,7 +3413,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = (
             "🤖 *Em — here's what I can do:*\n\n"
             "*CRM:*\n"
-            "save, find, note, followup, update, edit, delete, search, list, stats, followups, overdue, birthdays, soon, lastcontact\n\n"
+            "save, find, note, followup, update, edit, delete, search, list, stats, followups, overdue, birthdays, soon, lastcontact\n"
+            "referrals, all referrals, top referrers, referrals from [name]\n"
+            "import excel — import contacts from a spreadsheet\n\n"
             "*Calendar:*\n"
             "Just tell me naturally — 'schedule dinner tomorrow 7pm' or 'add event'\n"
             "events today / events week / delete event\n\n"
@@ -2772,9 +3426,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Or just chat — I'll figure it out 👍"
         )
 
-    # Claude Chat fallback
+    # Claude Chat fallback — with natural language CRM detection
     else:
-        if is_reschedule_request(text) and user_id in last_fired_reminder:
+        # Check for natural language CRM updates first
+        crm_action = detect_crm_natural_update(text)
+        if crm_action:
+            action, name, field_or_referred, value = crm_action
+            if action == "referral":
+                reply = set_referral(name, field_or_referred)
+            elif action == "update":
+                reply = update_contact_field_natural(name, field_or_referred, value)
+            elif action == "show_private":
+                reply = find_contact(name, show_private=True)
+        elif is_reschedule_request(text) and user_id in last_fired_reminder:
             reply = handle_reschedule(text, user_id)
         elif is_reminder_request(text):
             reply = handle_new_reminder(text)
@@ -2852,6 +3516,7 @@ async def post_init(app):
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
     print("Em is running... Press Ctrl+C to stop.")
     app.run_polling()
 
