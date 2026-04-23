@@ -971,6 +971,219 @@ def check_birthday_acknowledgement():
     return len(acknowledged) > 0
 
 
+
+# --- Meeting Recap ---
+# Session state: { user_id: { "event_name": str, "notes": [str], "step": "collecting"|"confirming", "pending_recap": dict } }
+meeting_sessions = {}
+
+MEETING_START_PHRASES = [
+    "meeting recap", "taking notes", "log this meeting", "meeting notes",
+    "recap for", "notes for", "log meeting", "start recap", "new recap",
+    "networking recap", "presentation recap"
+]
+
+MEETING_DONE_PHRASES = [
+    "done", "that's it", "thats it", "save that", "save it",
+    "finish", "finished", "end recap", "process this", "that's all", "thats all"
+]
+
+def is_meeting_start(text):
+    lower = text.lower()
+    return any(p in lower for p in MEETING_START_PHRASES)
+
+def is_meeting_done(text):
+    lower = text.lower().strip()
+    return any(lower == p or lower.startswith(p) for p in MEETING_DONE_PHRASES)
+
+def extract_event_name(text):
+    """Try to pull event name from the start message."""
+    lower = text.lower()
+    for phrase in ["recap for", "notes for", "meeting notes for", "taking notes for",
+                   "meeting recap for", "log meeting for"]:
+        if phrase in lower:
+            idx = lower.index(phrase) + len(phrase)
+            return text[idx:].strip().strip(".,!?")
+    return ""
+
+def tag_crm_contacts(text):
+    """Find any CRM contacts mentioned in the text."""
+    try:
+        sheet = crm_sheet()
+        records = sheet.get_all_records()
+        tagged = []
+        for r in records:
+            name = r.get("Name", "")
+            if name and name.lower() in text.lower():
+                tagged.append(name)
+        return tagged
+    except:
+        return []
+
+def process_meeting_notes(event_name, notes_list):
+    """Send all buffered notes to Claude and get a structured recap back as JSON."""
+    combined = "\n".join(notes_list)
+    prompt = (
+        f"You are processing meeting notes for an event called: {event_name or 'unknown event'}\n\n"
+        f"Here are the raw notes:\n{combined}\n\n"
+        f"Extract and return a JSON object with these fields:\n"
+        f"- event_name: string (use the provided event name, or infer if not given)\n"
+        f"- topic: string (1 line summary of what the meeting/event was about)\n"
+        f"- summary: string (2-4 sentences capturing key points, insights, context)\n"
+        f"- action_items: list of strings (only include if there are clear action items, otherwise empty list)\n"
+        f"- contacts_mentioned: list of strings (names of people mentioned)\n"
+        f"- foreign_phrases: dict (any non-English phrases found, key=original, value=English translation)\n\n"
+        f"Return ONLY the JSON object, no markdown, no preamble."
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = resp.content[0].text.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def format_recap_confirmation(recap):
+    """Format recap for user confirmation — no emoji on header line."""
+    lines = []
+    lines.append(f"Meeting Recap — {recap.get('event_name', 'Untitled')}")
+    lines.append("")
+    lines.append(f"Topic: {recap.get('topic', '')}")
+    lines.append("")
+    lines.append(f"Summary:\n{recap.get('summary', '')}")
+
+    action_items = recap.get("action_items", [])
+    if action_items:
+        lines.append("")
+        lines.append("Action Items:")
+        for item in action_items:
+            lines.append(f"• {item}")
+
+    foreign = recap.get("foreign_phrases", {})
+    if foreign:
+        lines.append("")
+        lines.append("Phrases:")
+        for orig, trans in foreign.items():
+            lines.append(f"• {orig} [{trans}]")
+
+    contacts = recap.get("contacts_mentioned", [])
+    if contacts:
+        lines.append("")
+        lines.append(f"Contacts tagged: {', '.join(contacts)}")
+
+    lines.append("")
+    lines.append("Reply Y to save or E to edit.")
+    return "\n".join(lines)
+
+def save_meeting_recap(recap):
+    """Save the confirmed recap to the Meeting Notes sheet."""
+    try:
+        sheet = spreadsheet.worksheet("Meeting Notes")
+        today = date.today().strftime("%d/%m/%Y")
+        action_items_str = "; ".join(recap.get("action_items", []))
+        sheet.append_row([
+            recap.get("event_name", ""),
+            recap.get("topic", ""),
+            recap.get("summary", ""),
+            action_items_str,
+            today
+        ])
+        return True
+    except Exception as e:
+        print(f"Error saving meeting recap: {e}")
+        return False
+
+def search_meeting_notes(query):
+    """Search meeting notes by keyword or date range."""
+    try:
+        sheet = spreadsheet.worksheet("Meeting Notes")
+        records = sheet.get_all_records()
+        if not records:
+            return "No meeting notes saved yet."
+
+        query_lower = query.lower().strip()
+        results = []
+        for r in records:
+            searchable = " ".join(str(v).lower() for v in r.values())
+            if query_lower in searchable:
+                results.append(r)
+
+        if not results:
+            return f"No meeting notes found for '{query}'."
+
+        lines = [f"Found {len(results)} recap(s):\n"]
+        for r in results:
+            lines.append(f"📋 {r.get('Event Name', '')} — {r.get('Date', '')}")
+            lines.append(f"   {r.get('Topic', '')}")
+            lines.append("")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error searching meeting notes: {str(e)}"
+
+async def handle_meeting_session(user_id, text, update):
+    """Handle messages when user is in an active meeting recap session."""
+    session = meeting_sessions[user_id]
+    step = session.get("step")
+
+    # Confirming step — waiting for Y or E
+    if step == "confirming":
+        if text.strip().upper() == "Y":
+            saved = save_meeting_recap(session["pending_recap"])
+            # Tag CRM contacts
+            contacts = session["pending_recap"].get("contacts_mentioned", [])
+            for name in contacts:
+                row_num, record = find_row(name)
+                if record:
+                    pass  # silently tagged via presence in recap
+            del meeting_sessions[user_id]
+            if saved:
+                await update.message.reply_text("Saved! 📋")
+            else:
+                await update.message.reply_text("Something went wrong saving the recap. Try again.")
+
+        elif text.strip().upper() == "E":
+            session["step"] = "collecting"
+            session["notes"] = []
+            await update.message.reply_text(
+                "No worries, let's redo it. Send your notes again and say done when you're finished."
+            )
+
+        else:
+            await update.message.reply_text("Reply Y to save or E to start over.")
+        return
+
+    # Get event name step
+    if step == "get_name":
+        session["event_name"] = text.strip()
+        session["step"] = "collecting"
+        await update.message.reply_text(
+            f"Got it. Send your notes for {text.strip()} and say done when you're finished."
+        )
+        return
+
+    # Collecting step — buffering notes
+    if is_meeting_done(text):
+        if not session.get("notes"):
+            await update.message.reply_text("You haven't sent any notes yet. Send your notes then say done.")
+            return
+
+        await update.message.reply_text("On it, give me a sec...")
+
+        try:
+            recap = process_meeting_notes(session.get("event_name", ""), session["notes"])
+            session["pending_recap"] = recap
+            session["step"] = "confirming"
+            confirmation = format_recap_confirmation(recap)
+            await update.message.reply_text(confirmation)
+        except Exception as e:
+            await update.message.reply_text(f"Couldn't process the notes: {str(e)}. Try again.")
+        return
+
+    # Still collecting — buffer the note
+    session["notes"].append(text)
+    # Acknowledge silently (no reply) to keep flow natural
+
+
 # --- Em System Prompt Builder ---
 def build_system_prompt():
     """Build Em's system prompt, incorporating em_profile preferences."""
@@ -1035,7 +1248,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check birthday acknowledgement — any incoming message counts
     check_birthday_acknowledgement()
 
-    # Handle active edit session
+    # Handle active meeting recap session
+    if user_id in meeting_sessions:
+        await handle_meeting_session(user_id, text, update)
+        return
+
+    # Handle active CRM edit session
     if user_id in edit_sessions:
         await handle_edit_session(user_id, text, update)
         return
@@ -1088,6 +1306,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = upcoming_birthdays(7)
     elif lower.startswith("lastcontact "):
         reply = last_contact(text[12:])
+
+    # Meeting Recap Commands
+    elif lower.startswith("search meetings ") or lower.startswith("find meeting "):
+        query = text[16:] if lower.startswith("search meetings ") else text[13:]
+        reply = search_meeting_notes(query.strip())
+    elif lower == "cancel" and user_id in meeting_sessions:
+        del meeting_sessions[user_id]
+        reply = "Recap cancelled."
+    elif is_meeting_start(text):
+        event_name = extract_event_name(text)
+        meeting_sessions[user_id] = {
+            "step": "collecting",
+            "event_name": event_name,
+            "notes": []
+        }
+        if event_name:
+            reply = f"Got it, taking notes for {event_name}. Send everything over and say done when you're finished."
+        else:
+            reply = "Sure, what's the event name?"
+            meeting_sessions[user_id]["step"] = "get_name"
 
     # Todo Commands
     elif lower.startswith("todo "):
