@@ -2498,39 +2498,51 @@ def handle_overseas_request(text):
 
     SG_IATA_CODES = {"SIN", "SLM"}
     SG_CITY_KEYWORDS = {"singapore", "changi"}
+    # Words indicating return intent before a flight number
+    RETURN_INTENT = ["returning on", "returning on the", "flying back on", "back on",
+                     "return on", "coming back on", "heading back on"]
 
-    def _is_sg_arrival(flight_info, user_dest_hint=None):
-        """Return True if this flight lands back in Singapore.
-        user_dest_hint: explicit destination from user message — takes priority over AviationStack.
-        """
+    def _has_return_intent(msg, flight_num):
+        """Return True if user's message expresses return intent for this flight."""
+        lower_msg = msg.lower()
+        for phrase in RETURN_INTENT:
+            if phrase in lower_msg and flight_num.lower() in lower_msg:
+                # Check phrase appears before the flight number
+                if lower_msg.index(phrase) < lower_msg.index(flight_num.lower()):
+                    return True
+        return False
+
+    def _is_sg_arrival(flight_info, force_return=False):
+        """Return True if this flight lands back in Singapore."""
+        if force_return:
+            return True
         if not flight_info:
-            return False
-        if user_dest_hint:
-            hint = user_dest_hint.lower()
-            if any(k in hint for k in SG_CITY_KEYWORDS | {"sg", "sin", "home", "singapore"}):
-                return True
-            # Explicit non-SG destination named by user — trust them over AviationStack
             return False
         iata = (flight_info.get("arr_iata") or "").upper()
         city = (flight_info.get("arr_city") or "").lower()
         airport = (flight_info.get("arr_airport") or "").lower()
-        return iata in SG_IATA_CODES or any(k in city for k in SG_CITY_KEYWORDS) or any(k in airport for k in SG_CITY_KEYWORDS)
+        return (iata in SG_IATA_CODES or
+                any(k in city for k in SG_CITY_KEYWORDS) or
+                any(k in airport for k in SG_CITY_KEYWORDS))
 
     def _extract_leg2_dest(msg, flight2):
-        """Extract explicit destination for the second flight from the user message.
-        Handles: 'OD805 KL to BKK', 'OD805 to Bangkok', 'then OD805 to SG', 'back on OD805'.
+        """Extract explicit destination for second flight from user message.
+        Avoids capturing prepositions like 'on', 'the', 'a'.
         """
         f2 = re.escape(flight2)
+        # Patterns: 'TG416 KL to BKK', 'TG416 to Bangkok', 'then TG416 to BKK'
         patterns = [
-            rf"{f2}\s+(?:[A-Z]{{3}}\s+)?to\s+([\w][\w\s]{{1,25}}?)(?:\s+on|\s+Mon|\s+Tue|\s+Wed|\s+Thu|\s+Fri|\s+Sat|\s+Sun|$)",
-            rf"then\s+{f2}\s+(?:[A-Z]{{3}}\s+)?to\s+([\w][\w\s]{{1,25}}?)(?:\s+on|$)",
-            rf"(?:back|return|returning)\s+(?:to\s+)?([\w][\w\s]{{1,25}}?)\s+(?:on\s+)?{f2}",
-            rf"{f2}\s+back\s+(?:to\s+)?([\w][\w\s]{{1,25}}?)(?:\s+on|$)",
+            rf"{f2}\s+(?:[A-Z]{{3}}\s+)?to\s+([A-Za-z][A-Za-z\s]{{2,25}}?)(?:\s+on\s+|\s+Mon|\s+Tue|\s+Wed|\s+Thu|\s+Fri|\s+Sat|\s+Sun|$)",
+            rf"then\s+{f2}\s+(?:[A-Z]{{3}}\s+)?to\s+([A-Za-z][A-Za-z\s]{{2,25}}?)(?:\s+on\s+|$)",
         ]
+        STOPWORDS = {"on", "the", "a", "an", "my", "this", "next"}
         for pat in patterns:
             m = re.search(pat, msg, re.IGNORECASE)
             if m:
-                return m.group(1).strip()
+                dest = m.group(1).strip()
+                # Reject if it's just a stopword
+                if dest.lower() not in STOPWORDS and len(dest) > 2:
+                    return dest
         return None
 
     # Look for flight numbers in message
@@ -2559,7 +2571,7 @@ def handle_overseas_request(text):
                 "return_flight_data": None,
             }
 
-            reply = f"Found {outbound} \u2708\ufe0f\nDeparts: {dep_fmt}\nArrives: {arr_fmt} \u2192 {arr_label}\n"
+            reply = f"Found {outbound} ✈️\nDeparts: {dep_fmt}\nArrives: {arr_fmt} → {arr_label}\n"
 
             if return_flight_num:
                 ret_data = lookup_flight(return_flight_num)
@@ -2568,28 +2580,41 @@ def handle_overseas_request(text):
                     ret_arr = format_flight_time(ret_data["arr_time"])
                     ret_data["flight"] = return_flight_num
 
-                    # Extract explicit destination hint from user message — overrides AviationStack
+                    # 1. Check if user expressed return intent (e.g. "returning on OD805")
+                    force_return = _has_return_intent(text, return_flight_num)
+                    # 2. Check if user named an explicit non-SG destination
                     user_dest_hint = _extract_leg2_dest(text, return_flight_num)
-                    is_return = _is_sg_arrival(ret_data, user_dest_hint)
+                    # 3. Determine if it's a return
+                    is_return = _is_sg_arrival(ret_data, force_return=force_return)
+                    # 4. If user explicitly named a non-SG destination, override to multi-city
+                    if user_dest_hint and not any(k in user_dest_hint.lower() for k in SG_CITY_KEYWORDS | {"sg", "sin", "home", "singapore"}):
+                        is_return = False
 
                     if is_return:
                         pending["return_flight_data"] = ret_data
-                        reply += f"Return {return_flight_num}: {ret_dep} \u2192 {ret_arr} (SIN)\n"
+                        reply += f"Return {return_flight_num}: {ret_dep} → {ret_arr} (SIN)\n"
                     else:
                         ret_arr_label = user_dest_hint or ret_data.get("arr_city") or ret_data.get("arr_airport") or ret_data.get("arr_iata", "")
                         pending["return_flight_data"] = ret_data
-                        reply += f"Leg 2 {return_flight_num}: {ret_dep} \u2192 {ret_arr} ({ret_arr_label})\n"
-                        reply += f"_(Multi-city trip \u2014 {return_flight_num} logged as next leg, not a return to SG)_\n"
+                        reply += f"Leg 2 {return_flight_num}: {ret_dep} → {ret_arr} ({ret_arr_label})\n"
+                        reply += f"_(Multi-city trip — {return_flight_num} logged as next leg)_\n"
+                        reply += f"Got a return flight to SG? Reply with the flight number or \'no\' to log as-is."
                 else:
-                    reply += f"(Couldn't find {return_flight_num} \u2014 I'll skip it)\n"
+                    reply += f"(Couldn't find {return_flight_num} — I'll skip it)\n"
 
-            overseas_state["_pending_flight"] = pending
-            reply += "\nReply Y to confirm \u2014 overseas mode will activate at departure time."
+                overseas_state["_pending_flight"] = pending
+                reply += "\nReply Y to confirm — overseas mode will activate at departure time."
+            else:
+                # Single flight — ask for return
+                overseas_state["_pending_flight"] = pending
+                overseas_state["_awaiting_return_flight"] = True
+                reply += "\nGot a return flight yet? Reply with the flight number or 'no' to log just the departure."
+
             return reply
 
         else:
             return (
-                f"Looked up {outbound} on AviationStack but got no data back \u2014 "
+                f"Looked up {outbound} on AviationStack but got no data back — "
                 f"the flight may not be in their system yet (free tier only covers flights within ~24hrs). "
                 f"Where are you headed and when are you departing and returning?"
             )
@@ -4344,6 +4369,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Pending flight confirmation — intercept the next message entirely
     if overseas_state.get("_pending_flight"):
         pf = overseas_state["_pending_flight"]
+
+        # Waiting for return flight number after single-flight input
+        if overseas_state.get("_awaiting_return_flight"):
+            stripped = text.strip()
+            lower_stripped = stripped.lower()
+            if lower_stripped in ["no", "n", "not yet", "skip", "none"]:
+                overseas_state.pop("_awaiting_return_flight", None)
+                # Proceed with just outbound — fall through to Y handling below
+                text = "Y"
+            elif extract_flight_number(stripped):
+                overseas_state.pop("_awaiting_return_flight", None)
+                ret_num = extract_flight_number(stripped)
+                ret_data = lookup_flight(ret_num)
+                if ret_data:
+                    ret_dep = format_flight_time(ret_data["dep_time"])
+                    ret_arr = format_flight_time(ret_data["arr_time"])
+                    ret_data["flight"] = ret_num
+                    pf["return_flight_data"] = ret_data
+                    overseas_state["_pending_flight"] = pf
+                    arr_label = pf.get("arr_city") or pf.get("arr_airport") or pf.get("arr_iata", "")
+                    dep_fmt = format_flight_time(pf.get("dep_time", ""))
+                    arr_fmt = format_flight_time(pf.get("arr_time", ""))
+                    reply = (
+                        f"Got it ✈️\n"
+                        f"Outbound: {pf['flight_number']} {dep_fmt} → {arr_fmt} ({arr_label})\n"
+                        f"Return: {ret_num} {ret_dep} → {ret_arr} (SIN)\n"
+                        f"\nReply Y to confirm."
+                    )
+                else:
+                    reply = f"Couldn't find {ret_num} on AviationStack. Reply Y to log just the departure, or try another flight number."
+                if reply:
+                    try:
+                        await update.message.reply_text(reply, parse_mode="Markdown")
+                    except Exception:
+                        await update.message.reply_text(reply)
+                return
+            else:
+                reply = "Reply with a return flight number (e.g. OD805) or 'no' to log just the departure."
+                await update.message.reply_text(reply)
+                return
+
         if text.strip().upper() == "Y":
             overseas_state.pop("_pending_flight")
             info = get_dest_info_from_iata(pf.get("arr_iata", ""), pf.get("arr_city", pf.get("arr_airport", "")))
@@ -4620,6 +4686,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply, needs_session, session_data = handle_expense_text(log_text, user_id)
         if needs_session and session_data:
             expense_sessions[user_id] = session_data
+    elif re.match(r"add return flight\s+([A-Z]{1,3}\d{2,4}[A-Z]?)", text.upper()):
+        m = re.match(r"add return flight\s+([A-Z]{1,3}\d{2,4}[A-Z]?)", text.upper())
+        ret_num = m.group(1)
+        ret_data = lookup_flight(ret_num)
+        if ret_data:
+            ret_dep = format_flight_time(ret_data["dep_time"])
+            ret_arr = format_flight_time(ret_data["arr_time"])
+            ret_data["flight"] = ret_num
+            overseas_state["return_flight"] = ret_data
+            reply = f"Return flight added: {ret_num} {ret_dep} → {ret_arr} (SIN) ✅"
+        else:
+            reply = f"Couldn't find {ret_num} on AviationStack. Try again closer to the flight date."
     elif is_overseas_mode_request(text):
         if not extract_flight_number(text) and user_id in conversation_histories:
             history_text = " ".join(
