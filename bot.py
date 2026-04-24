@@ -1933,6 +1933,7 @@ _app_ref = None
 # Pending new merchant — waiting for user to confirm category + card
 # { user_id: { "merchant": str, "amount": float, "currency": str, "step": "category"|"card" } }
 expense_sessions = {}
+delete_sessions = {}
 
 # Reconciliation sessions — { user_id: { "step": str, "unmatched": [...], "index": int } }
 recon_sessions = {}
@@ -2600,6 +2601,79 @@ def delete_last_expense():
         last = all_values[last_row - 1]
         sheet.delete_rows(last_row)
         return f"Deleted last expense: {last[1]} ${last[2]}"
+    except Exception as e:
+        return f"Error deleting expense: {str(e)}"
+
+def get_recent_expenses(n=5):
+    """Return the last N expense rows as list of (sheet_row_index, dict)."""
+    try:
+        sheet = expenses_sheet()
+        all_values = sheet.get_all_values()
+        if len(all_values) <= 1:
+            return []
+        headers = all_values[0]
+        rows = all_values[1:]
+        recent = rows[-(n):]
+        result = []
+        for i, row in enumerate(recent):
+            sheet_row = len(all_values) - len(recent) + i + 1  # 1-indexed sheet row
+            d = {headers[j]: row[j] if j < len(row) else "" for j in range(len(headers))}
+            result.append((sheet_row, d))
+        return list(reversed(result))  # Most recent first
+    except Exception as e:
+        print(f"get_recent_expenses error: {e}")
+        return []
+
+def format_delete_list(expenses):
+    """Format numbered list of expenses for delete selection."""
+    lines = ["Which expense to delete?\n"]
+    for i, (_, r) in enumerate(expenses, 1):
+        merchant = r.get("Merchant", "?")
+        amount = r.get("Amount", "")
+        currency = r.get("Currency", "SGD")
+        sgd = r.get("SGD Amount", "")
+        date_str = r.get("Date", "")
+        category = r.get("Category", "")
+        if currency != "SGD" and sgd:
+            amt_str = f"${float(sgd):.2f} ({currency} {float(amount):,.0f})"
+        else:
+            amt_str = f"${float(amount):.2f}" if amount else "$?"
+        lines.append(f"{i}. {merchant} — {amt_str} | {category} | {date_str}")
+    lines.append("\nReply with a number, or 'search [merchant]' to find another.")
+    return "\n".join(lines)
+
+def search_expenses_by_merchant(query):
+    """Search expenses by merchant name, return list of (sheet_row, dict)."""
+    try:
+        sheet = expenses_sheet()
+        all_values = sheet.get_all_values()
+        if len(all_values) <= 1:
+            return []
+        headers = all_values[0]
+        rows = all_values[1:]
+        q = query.lower().strip()
+        matches = []
+        for i, row in enumerate(rows):
+            d = {headers[j]: row[j] if j < len(row) else "" for j in range(len(headers))}
+            if q in d.get("Merchant", "").lower():
+                matches.append((i + 2, d))  # +2: 1-indexed + header row
+        return list(reversed(matches))[:10]  # Most recent first, cap at 10
+    except Exception as e:
+        print(f"search_expenses_by_merchant error: {e}")
+        return []
+
+def delete_expense_by_row(sheet_row):
+    """Delete an expense by its sheet row number. Returns confirmation string."""
+    try:
+        sheet = expenses_sheet()
+        all_values = sheet.get_all_values()
+        if sheet_row < 2 or sheet_row > len(all_values):
+            return "Couldn't find that expense."
+        row = all_values[sheet_row - 1]
+        merchant = row[1] if len(row) > 1 else "?"
+        amount = row[2] if len(row) > 2 else "?"
+        sheet.delete_rows(sheet_row)
+        return f"Deleted: {merchant} ${amount}"
     except Exception as e:
         return f"Error deleting expense: {str(e)}"
 
@@ -3946,6 +4020,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_expense_session(user_id, text, update)
         return
 
+    # Handle active delete session
+    if user_id in delete_sessions:
+        session = delete_sessions[user_id]
+        step = session.get("step")
+
+        if lower in ["cancel", "nevermind", "never mind", "nvm"]:
+            del delete_sessions[user_id]
+            await update.message.reply_text("Cancelled.")
+            return
+
+        if step == "pick":
+            # User replies with a number
+            if text.strip().isdigit():
+                idx = int(text.strip()) - 1
+                expenses = session.get("expenses", [])
+                if 0 <= idx < len(expenses):
+                    sheet_row, _ = expenses[idx]
+                    reply = delete_expense_by_row(sheet_row)
+                    del delete_sessions[user_id]
+                    await update.message.reply_text(reply)
+                else:
+                    await update.message.reply_text("Invalid number. Try again or 'search [merchant]'.")
+                return
+            # User wants to search instead
+            elif lower.startswith("search "):
+                query = text[7:].strip()
+                results = search_expenses_by_merchant(query)
+                if not results:
+                    await update.message.reply_text(f"No expenses found matching '{query}'.")
+                elif len(results) == 1:
+                    sheet_row, r = results[0]
+                    reply = delete_expense_by_row(sheet_row)
+                    del delete_sessions[user_id]
+                    await update.message.reply_text(reply)
+                else:
+                    delete_sessions[user_id] = {"step": "pick", "expenses": results}
+                    await update.message.reply_text(format_delete_list(results))
+                return
+            elif lower in ["not there", "not here", "none of these", "not in the list"]:
+                await update.message.reply_text("Reply 'search [merchant name]' to find it.")
+                return
+            else:
+                await update.message.reply_text("Reply with a number, 'search [merchant]', or 'cancel'.")
+                return
+
     # Handle active CRM edit session
     if user_id in edit_sessions:
         await handle_edit_session(user_id, text, update)
@@ -4140,6 +4259,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = get_expense_report()
     elif lower in ["delete last expense", "remove last expense"]:
         reply = delete_last_expense()
+    elif lower in ["delete expense", "remove expense", "undo expense", "undo last expense"]:
+        # Show last 5 for selection
+        recent = get_recent_expenses(5)
+        if not recent:
+            reply = "No expenses logged yet."
+        else:
+            delete_sessions[user_id] = {"step": "pick", "expenses": recent}
+            reply = format_delete_list(recent)
+    elif lower.startswith("delete expense ") or lower.startswith("remove expense "):
+        # Direct search — "delete expense Tada"
+        query = re.sub(r"^(delete|remove) expense\s+", "", lower).strip()
+        results = search_expenses_by_merchant(query)
+        if not results:
+            reply = f"No expenses found matching '{query}'."
+        elif len(results) == 1:
+            sheet_row, _ = results[0]
+            reply = delete_expense_by_row(sheet_row)
+        else:
+            delete_sessions[user_id] = {"step": "pick", "expenses": results}
+            reply = format_delete_list(results)
     elif lower in ["last expense", "show last expense", "what did i log"]:
         reply = show_last_expense()
     elif lower in ["trip summary", "trip spend", "how much have i spent", "trip expenses"]:
