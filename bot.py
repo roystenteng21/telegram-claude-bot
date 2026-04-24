@@ -90,18 +90,13 @@ def setup_sheets():
     required_tabs = {
         "Meeting Notes": ["Event Name", "Topic", "Summary", "Action Items", "Date"],
         "Expenses": ["Date", "Merchant", "Amount", "Currency", "SGD Amount", "Category",
-                     "Card", "Receipt Link", "Reconciled", "Notes", "Trip ID"],
+                     "Card", "Receipt Link", "Reconciled", "Notes"],
         "Bills": ["Name", "Bank", "Due Date", "Estimated Amount", "Notes"],
         "Cards": ["Card Name", "Bank", "Type", "Notes"],
         "Merchant Map": ["Merchant", "Category", "Card"],
         "Restaurants": ["Name", "Location", "Country", "Tags", "Notes"],
         "Portfolio": ["Stock", "Quantity", "Buy Price", "Buy Date", "Notes"],
-        "Settings": ["Key", "Value"],
-        "Trips": ["Trip ID", "Leg", "Type", "Flight No", "Airline", "From", "To",
-                  "Dep Date", "Dep Time", "Arr Date", "Arr Time", "Terminal", "Gate",
-                  "Booking Ref", "Timezone", "Status"],
-        "Accommodation": ["Trip ID", "Property Name", "English Address", "Chinese Address",
-                          "Check In", "Check Out"]
+        "Settings": ["Key", "Value"]
     }
 
     existing_now = [ws.title for ws in spreadsheet.worksheets()]
@@ -282,7 +277,6 @@ def run_infrastructure_setup():
     setup_sheets()
     DRIVE_FOLDERS = setup_drive()
     setup_em_profile()
-    auto_restore_overseas_on_startup()
     print("✅ Infrastructure setup complete")
 
 # --- Sheet References (after setup) ---
@@ -1930,7 +1924,6 @@ overseas_state = {
     "return_flight": None,     # return flight data dict
     "trip_start": None,        # date string DD/MM/YYYY when overseas mode activated
     "trip_destinations": [],   # list of destinations visited this trip
-    "trip_id": None,           # active trip ID in Trips sheet
 }
 
 # Global scheduler reference (set in post_init)
@@ -1941,8 +1934,6 @@ _app_ref = None
 # { user_id: { "merchant": str, "amount": float, "currency": str, "step": "category"|"card" } }
 expense_sessions = {}
 delete_sessions = {}
-confirm_sessions = {}  # { user_id: { "action": str, "target": str, "args": [...] } }
-portfolio_delete_sessions = {}
 
 # Reconciliation sessions — { user_id: { "step": str, "unmatched": [...], "index": int } }
 recon_sessions = {}
@@ -2132,14 +2123,13 @@ def parse_expense_text(text):
     raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
-def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link="", reconciled="No", notes="", trip_id=None):
+def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link="", reconciled="No", notes=""):
     """Append expense row to Expenses sheet."""
     today = date.today().strftime("%d/%m/%Y")
-    active_trip = trip_id or overseas_state.get("trip_id", "")
     sheet = expenses_sheet()
     sheet.append_row([
         today, merchant, amount, currency, sgd_amount,
-        category, card, receipt_link, reconciled, notes, active_trip
+        category, card, receipt_link, reconciled, notes
     ])
 
 def format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount=None, receipt_saved=False):
@@ -2250,6 +2240,36 @@ def get_expense_categories():
     numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(cats))
     return f"Your expense categories:\n\n{numbered}"
 
+
+def get_merchant_list():
+    """Pull all known merchants from Merchant Map, grouped by category."""
+    try:
+        sheet = merchant_map_sheet()
+        records = sheet.get_all_records()
+        if not records:
+            return "No merchants saved yet. They are added automatically when you log a new expense."
+        by_cat = {}
+        for r in records:
+            merchant = r.get("Merchant", "").strip()
+            cat = r.get("Category", "").strip() or "Uncategorised"
+            card = r.get("Card", "").strip()
+            if not merchant:
+                continue
+            if cat not in by_cat:
+                by_cat[cat] = []
+            entry = merchant + (f" ({card})" if card else "")
+            by_cat[cat].append(entry)
+        count = sum(len(v) for v in by_cat.values())
+        lines = [f"Merchant Map ({count} merchants):\n"]
+        for cat in sorted(by_cat):
+            lines.append(f"*{cat}*")
+            for m in sorted(by_cat[cat]):
+                lines.append(f"  {m}")
+            lines.append("")
+        return "\n".join(lines).strip()
+    except Exception as e:
+        return f"Error fetching merchants: {e}"
+
 def is_expense_input(text):
     """Detect if message looks like an expense entry or expense question."""
     lower = text.lower()
@@ -2261,7 +2281,9 @@ def is_expense_input(text):
         "trip summary", "last expense", "show last expense",
         "what expense categories", "list my categories", "what categories",
         "show categories", "what are my expense", "list categories",
-        "expense categories", "my categories"
+        "expense categories", "my categories",
+        "what merchants", "my merchants", "merchant map", "list merchants",
+        "show merchants", "known merchants"
     ]
     if any(lower.startswith(e) or lower == e for e in exclusions):
         return False
@@ -2285,16 +2307,35 @@ LOCATION_CONTEXT_WORDS = {
 def is_overseas_mode_request(text):
     """Detect overseas mode toggle. Guards against misfires like 'i'm in a meeting'."""
     lower = text.lower()
-    has_flight = bool(extract_flight_number(text))
-    if has_flight and any(w in lower for w in ["flying", "flight", "on tr", "on sq", "on ak", "on mh", "boarding"]):
+    flights = extract_flight_number(text) if callable(extract_flight_number) else []
+    has_flight = bool(flights)
+    has_multiple_flights = len(re.findall(r'\b[A-Z]{1,3}\d{2,4}[A-Z]?\b', text.upper())) >= 2
+
+    # Two flight numbers in one message = always a travel message
+    if has_multiple_flights:
         return True
+
+    # Single flight + travel intent words
+    travel_words = [
+        "flying", "flight", "boarding", "departure", "departing",
+        "returning", "flying back", "headed to", "heading to",
+        "on tr", "on sq", "on ak", "on mh", "on od", "on ek", "on cx",
+    ]
+    if has_flight and any(w in lower for w in travel_words):
+        return True
+
+    # Explicit travel phrases (no flight number needed)
     if any(phrase in lower for phrase in [
         "overseas", "travelling", "traveling", "flying to", "arrived in",
-        "back home", "i'm back", "landed in", "just landed", "just arrived", "returned home"
+        "back home", "i'm back", "landed in", "just landed", "just arrived",
+        "returned home"
     ]):
         return True
+
+    # "i'm in [location]" — only if followed by a known place name
     if "i'm in" in lower or "im in" in lower:
         return any(loc in lower for loc in LOCATION_CONTEXT_WORDS)
+
     return False
 
 def lookup_flight(flight_number):
@@ -2388,7 +2429,6 @@ def deactivate_overseas_mode():
     overseas_state["return_flight"] = None
     overseas_state["trip_start"] = None
     overseas_state["trip_destinations"] = []
-    overseas_state["trip_id"] = None
     for job_key in ["dep_job_id", "return_job_id"]:
         job_id = overseas_state.get(job_key)
         if job_id and _scheduler:
@@ -2444,292 +2484,6 @@ async def deactivate_and_notify(app):
     except Exception as e:
         print(f"Failed to send return notification: {e}")
 
-# =============================================================================
-# TRIPS & FLIGHT MEMORY
-# =============================================================================
-
-AIRLINE_NAMES = {
-    "TR": "Scoot", "SQ": "Singapore Airlines", "MI": "SilkAir",
-    "OD": "Batik Air", "AK": "AirAsia", "D7": "AirAsia X",
-    "MH": "Malaysia Airlines", "CX": "Cathay Pacific", "KA": "Cathay Dragon",
-    "EK": "Emirates", "QR": "Qatar Airways", "TG": "Thai Airways",
-    "GA": "Garuda Indonesia", "JL": "Japan Airlines", "NH": "ANA",
-    "KE": "Korean Air", "OZ": "Asiana Airlines", "TW": "T'way Air",
-    "VN": "Vietnam Airlines", "QH": "Bamboo Airways",
-    "PR": "Philippine Airlines", "5J": "Cebu Pacific",
-    "CI": "China Airlines", "BR": "EVA Air", "CZ": "China Southern",
-    "CA": "Air China", "MU": "China Eastern", "HX": "Hong Kong Airlines",
-    "LH": "Lufthansa", "BA": "British Airways", "AF": "Air France",
-    "KL": "KLM", "LX": "Swiss", "OS": "Austrian",
-    "QF": "Qantas", "NZ": "Air New Zealand",
-}
-
-def get_airline_name(flight_number):
-    """Return airline name from flight number prefix."""
-    prefix2 = flight_number[:2].upper()
-    prefix3 = flight_number[:3].upper() if len(flight_number) >= 3 else ""
-    return AIRLINE_NAMES.get(prefix2) or AIRLINE_NAMES.get(prefix3) or ""
-
-def trips_sheet():
-    return spreadsheet.worksheet("Trips")
-
-def accommodation_sheet():
-    return spreadsheet.worksheet("Accommodation")
-
-def _next_trip_id():
-    """Generate next sequential trip ID like T001, T002 ..."""
-    try:
-        records = trips_sheet().get_all_records()
-        ids = [r.get("Trip ID", "") for r in records if r.get("Trip ID", "").startswith("T")]
-        if not ids:
-            return "T001"
-        nums = []
-        for tid in ids:
-            try:
-                nums.append(int(tid[1:]))
-            except ValueError:
-                pass
-        return f"T{max(nums)+1:03d}" if nums else "T001"
-    except Exception:
-        return "T001"
-
-def save_trip_leg(trip_id, leg_num, leg_type, flight_data, booking_ref=""):
-    """Write one flight leg to the Trips sheet."""
-    try:
-        sheet = trips_sheet()
-        flight_num = flight_data.get("flight", "")
-        airline = get_airline_name(flight_num)
-        dep_dt = flight_data.get("dep_time", "")
-        arr_dt = flight_data.get("arr_time", "")
-
-        def split_dt(iso):
-            if not iso:
-                return "", ""
-            try:
-                dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-                return dt.strftime("%d/%m/%Y"), dt.strftime("%H:%M")
-            except Exception:
-                return iso[:10], iso[11:16]
-
-        dep_date, dep_time = split_dt(dep_dt)
-        arr_date, arr_time = split_dt(arr_dt)
-        terminal = flight_data.get("dep_terminal", "") or flight_data.get("arr_terminal", "")
-        gate = flight_data.get("dep_gate", "") or flight_data.get("arr_gate", "")
-
-        # Infer timezone from destination
-        arr_city = flight_data.get("arr_city", "") or flight_data.get("arr_airport", "")
-        dest_info = get_dest_info_from_iata(flight_data.get("arr_iata", ""), arr_city)
-        tz = dest_info.get("timezone", "")
-
-        sheet.append_row([
-            trip_id, str(leg_num), leg_type, flight_num, airline,
-            flight_data.get("dep_iata", "") or flight_data.get("dep_airport", ""),
-            flight_data.get("arr_iata", "") or flight_data.get("arr_airport", ""),
-            dep_date, dep_time, arr_date, arr_time,
-            terminal, gate, booking_ref, tz, "Upcoming"
-        ])
-        return True
-    except Exception as e:
-        print(f"save_trip_leg error: {e}")
-        return False
-
-def get_active_trip():
-    """Return the active or most recent upcoming trip as list of leg dicts."""
-    try:
-        records = trips_sheet().get_all_records()
-        if not records:
-            return None, []
-        # Find trips with Active or Upcoming legs
-        trip_ids = []
-        for r in records:
-            tid = r.get("Trip ID", "")
-            status = r.get("Status", "")
-            if tid and status in ("Active", "Upcoming") and tid not in trip_ids:
-                trip_ids.append(tid)
-        if not trip_ids:
-            # Fall back to most recent completed
-            completed = [r.get("Trip ID", "") for r in records if r.get("Status") == "Completed"]
-            if completed:
-                trip_ids = [completed[-1]]
-        if not trip_ids:
-            return None, []
-        # Return legs for the first matching trip
-        trip_id = trip_ids[0]
-        legs = [r for r in records if r.get("Trip ID") == trip_id]
-        return trip_id, legs
-    except Exception as e:
-        print(f"get_active_trip error: {e}")
-        return None, []
-
-def mark_trip_active(trip_id):
-    """Set all Upcoming legs for a trip to Active."""
-    try:
-        sheet = trips_sheet()
-        all_values = sheet.get_all_values()
-        headers = all_values[0]
-        status_col = headers.index("Status") + 1
-        trip_col = headers.index("Trip ID") + 1
-        for i, row in enumerate(all_values[1:], start=2):
-            if len(row) >= trip_col and row[trip_col - 1] == trip_id:
-                if len(row) >= status_col and row[status_col - 1] in ("Upcoming",):
-                    sheet.update_cell(i, status_col, "Active")
-    except Exception as e:
-        print(f"mark_trip_active error: {e}")
-
-def close_trip_in_sheet(trip_id):
-    """Mark all legs of a trip as Completed."""
-    try:
-        sheet = trips_sheet()
-        all_values = sheet.get_all_values()
-        headers = all_values[0]
-        status_col = headers.index("Status") + 1
-        trip_col = headers.index("Trip ID") + 1
-        for i, row in enumerate(all_values[1:], start=2):
-            if len(row) >= trip_col and row[trip_col - 1] == trip_id:
-                sheet.update_cell(i, status_col, "Completed")
-    except Exception as e:
-        print(f"close_trip_in_sheet error: {e}")
-
-def format_trip_itinerary(legs):
-    """Format trip legs into a readable itinerary."""
-    if not legs:
-        return "No legs found."
-    lines = []
-    for leg in legs:
-        flight = leg.get("Flight No", "")
-        airline = leg.get("Airline", "")
-        frm = leg.get("From", "")
-        to = leg.get("To", "")
-        dep_date = leg.get("Dep Date", "")
-        dep_time = leg.get("Dep Time", "")
-        arr_date = leg.get("Arr Date", "")
-        arr_time = leg.get("Arr Time", "")
-        terminal = leg.get("Terminal", "")
-        gate = leg.get("Gate", "")
-        status = leg.get("Status", "")
-        leg_type = leg.get("Type", "")
-
-        line = f"✈️ {flight}"
-        if airline:
-            line += f" ({airline})"
-        line += f" | {frm} → {to}"
-        line += f"\n   {dep_date} {dep_time} → {arr_date} {arr_time}"
-        if terminal:
-            line += f" | Terminal {terminal}"
-        if gate:
-            line += f" Gate {gate}"
-        line += f"\n   [{leg_type} · {status}]"
-        lines.append(line)
-    return "\n\n".join(lines)
-
-def auto_restore_overseas_on_startup():
-    """On restart, check Trips sheet for active/upcoming trip and restore overseas_state."""
-    global overseas_state
-    try:
-        trip_id, legs = get_active_trip()
-        if not trip_id or not legs:
-            return
-        today = date.today()
-        # Find the current leg: most recent Active/Upcoming leg where dep_date has passed
-        current_leg = None
-        for leg in legs:
-            dep_str = leg.get("Dep Date", "")
-            status = leg.get("Status", "")
-            if not dep_str:
-                continue
-            try:
-                dep_dt = datetime.strptime(dep_str, "%d/%m/%Y").date()
-                arr_str = leg.get("Arr Date", "")
-                arr_dt = datetime.strptime(arr_str, "%d/%m/%Y").date() if arr_str else dep_dt
-                # This leg is active if departure has passed and it's not a return leg that's completed
-                if dep_dt <= today and status in ("Active", "Upcoming") and leg.get("Type") != "Return":
-                    current_leg = leg
-            except ValueError:
-                pass
-
-        if not current_leg:
-            return
-
-        # Restore overseas_state from this leg's destination
-        dest_iata = current_leg.get("To", "")
-        dest_info = get_dest_info_from_iata(dest_iata, dest_iata)
-        currency = dest_info.get("currency", "SGD")
-        destination = dest_info.get("destination", dest_iata)
-        if currency == "SGD":
-            return  # Not actually overseas
-
-        overseas_state["active"] = True
-        overseas_state["destination"] = destination
-        overseas_state["currency"] = currency
-        overseas_state["trip_id"] = trip_id
-        if currency not in overseas_state["currencies"]:
-            overseas_state["currencies"].append(currency)
-        trip_start_str = current_leg.get("Dep Date", "")
-        if trip_start_str:
-            overseas_state["trip_start"] = trip_start_str
-
-        print(f"✅ Restored overseas mode: {destination} ({currency}) from trip {trip_id}")
-    except Exception as e:
-        print(f"auto_restore_overseas_on_startup error: {e}")
-
-def get_trip_queries(query_type, trip_id=None, legs=None):
-    """Answer trip-related queries from Trips sheet data."""
-    if legs is None:
-        trip_id, legs = get_active_trip()
-    if not legs:
-        return "No active trip found."
-
-    lower_q = query_type.lower()
-
-    if "itinerary" in lower_q or "schedule" in lower_q:
-        return f"*Trip {trip_id}*\n\n" + format_trip_itinerary(legs)
-
-    if "flight home" in lower_q or "return" in lower_q:
-        return_legs = [l for l in legs if l.get("Type", "").lower() == "return"]
-        if return_legs:
-            r = return_legs[0]
-            return f"Return flight: {r.get('Flight No')} on {r.get('Dep Date')} at {r.get('Dep Time')} from {r.get('From')}"
-        return "No return flight logged for this trip."
-
-    if "land" in lower_q or "arrive" in lower_q or "arrival" in lower_q:
-        upcoming = [l for l in legs if l.get("Status") in ("Active", "Upcoming")]
-        if upcoming:
-            leg = upcoming[0]
-            return f"You land at {leg.get('Arr Time')} on {leg.get('Arr Date')} at {leg.get('To')}."
-        return "No upcoming legs found."
-
-    if "terminal" in lower_q:
-        upcoming = [l for l in legs if l.get("Status") in ("Active", "Upcoming")]
-        if upcoming and upcoming[0].get("Terminal"):
-            return f"Terminal: {upcoming[0].get('Terminal')} ({upcoming[0].get('Flight No')})"
-        return "No terminal info for the next leg."
-
-    if "gate" in lower_q:
-        upcoming = [l for l in legs if l.get("Status") in ("Active", "Upcoming")]
-        if upcoming and upcoming[0].get("Gate"):
-            return f"Gate: {upcoming[0].get('Gate')} ({upcoming[0].get('Flight No')})"
-        return "No gate info yet."
-
-    if "past trip" in lower_q or "past trips" in lower_q:
-        try:
-            records = trips_sheet().get_all_records()
-            completed = {}
-            for r in records:
-                tid = r.get("Trip ID", "")
-                if r.get("Status") == "Completed" and tid not in completed:
-                    completed[tid] = r
-            if not completed:
-                return "No completed trips on record."
-            lines = ["*Past trips:*"]
-            for tid, r in list(completed.items())[-10:]:
-                lines.append(f"• {tid}: {r.get('From')} → {r.get('To')} on {r.get('Dep Date')}")
-            return "\n".join(lines)
-        except Exception as e:
-            return f"Error fetching past trips: {e}"
-
-    return get_trip_queries("itinerary", trip_id, legs)
-
-
 def handle_overseas_request(text):
     """Toggle overseas mode on/off, with optional flight lookup."""
     global overseas_state, _scheduler
@@ -2739,12 +2493,6 @@ def handle_overseas_request(text):
     if any(p in lower for p in ["back home", "returned", "i'm back", "landed back", "home now"]):
         import random
         greeting = random.choice(["Welcome back!", "Good to have you back!", "Hope the trip was great!"])
-        trip_id = overseas_state.get("trip_id")
-        if trip_id:
-            try:
-                close_trip_in_sheet(trip_id)
-            except Exception as e:
-                print(f"close_trip_in_sheet error: {e}")
         deactivate_overseas_mode()
         return f"{greeting} Switching back to SGD. 🏠"
 
@@ -2799,20 +2547,7 @@ def handle_overseas_request(text):
             )
 
     # No flight number — ask for details
-    return "What's your departure date/time and destination? And when are you back in SG?"
-
-def _save_confirmed_trip(outbound_data, return_data=None, booking_ref=""):
-    """Write confirmed trip legs to Trips sheet and return trip_id."""
-    trip_id = _next_trip_id()
-    leg = 1
-    leg_type = "Stay" if return_data else "Outbound"
-    save_trip_leg(trip_id, leg, leg_type, outbound_data, booking_ref)
-    if return_data:
-        return_data_copy = dict(return_data)
-        return_data_copy["flight"] = return_data_copy.get("flight", "")
-        save_trip_leg(trip_id, leg + 1, "Return", return_data_copy, booking_ref)
-    return trip_id
-
+    return "What\'s your departure date/time and destination? And when are you back in SG?"
 
 async def handle_expense_session(user_id, text, update):
     """Handle multi-step expense onboarding — category, card, fx_rate confirmation."""
@@ -2940,40 +2675,6 @@ def _looks_like_command(text):
     if any(lower.startswith(p) for p in COMMAND_PREFIXES):
         return True
     return False
-
-def parse_receipt_image(image_bytes):
-    """Pass receipt image to Claude Vision. Returns dict with merchant, amount, currency, confidence."""
-    import base64
-    overseas_currency = overseas_state["currency"] if overseas_state["active"] else "SGD"
-    try:
-        b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-        prompt = (
-            f"You are reading a receipt image. Extract ONLY the merchant name and total amount paid.\n"
-            f"Rules:\n"
-            f"- merchant: brand name only, strip legal suffixes (Pte Ltd, Sdn Bhd, Restaurant, Cafe etc)\n"
-            f"- amount: the final total paid (largest amount, or labelled Total/Grand Total/Amount Due)\n"
-            f"- currency: 3-letter ISO code. If not visible, use '{overseas_currency}'\n"
-            f"- confidence: \'high\' if both fields are clear, \'low\' if either is uncertain\n"
-            f"- uncertain_fields: list any fields you are not sure about\n"
-            f"Return ONLY a JSON object with keys: merchant, amount, currency, confidence, uncertain_fields.\n"
-            f"No other text."
-        )
-        resp = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=150,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-                    {"type": "text", "text": prompt}
-                ]
-            }]
-        )
-        raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-        return json.loads(raw)
-    except Exception as e:
-        print(f"parse_receipt_image error: {e}")
-        return None
 
 def handle_expense_text(text, user_id, receipt_link=""):
     """
@@ -3181,7 +2882,7 @@ def get_last_expense():
         return None
 
 def edit_last_expense(field, new_value):
-    """Edit a specific field in the last expense row. Validates value and shows before/after."""
+    """Edit a specific field in the last expense row. Validates and shows before/after."""
     try:
         sheet = expenses_sheet()
         all_values = sheet.get_all_values()
@@ -3198,7 +2899,6 @@ def edit_last_expense(field, new_value):
             valid = ", ".join(field_map.keys())
             return f"Can't edit '{field}'. Options: {valid}"
         col_idx = headers.index(col_name) + 1
-
         if col_name == "Amount":
             try:
                 float(new_value.replace(",", "").replace("$", ""))
@@ -3222,7 +2922,6 @@ def edit_last_expense(field, new_value):
             if not matched:
                 return f"Unknown card '{new_value}'. Your cards: {', '.join(EXPENSE_CARDS)}"
             new_value = matched
-
         last_row = all_values[last_row_idx - 1]
         old_value = last_row[col_idx - 1] if col_idx - 1 < len(last_row) else ""
         sheet.update_cell(last_row_idx, col_idx, new_value)
@@ -3732,84 +3431,6 @@ import urllib.request
 price_alerts = {}
 
 # Indices to track for weekly summary
-MARKET_RSS_FEEDS = {
-    "US": [
-        "https://feeds.reuters.com/reuters/businessNews",
-        "https://www.cnbc.com/id/10001147/device/rss/rss.html",
-    ],
-    "China": [
-        "https://feeds.reuters.com/reuters/asiaNews",
-        "https://www.scmp.com/rss/92/feed",
-    ],
-    "India": [
-        "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
-        "https://www.moneycontrol.com/rss/marketreports.xml",
-    ],
-}
-
-MARKET_FLAG = {"US": "🇺🇸", "China": "🇨🇳", "India": "🇮🇳"}
-
-def is_market_summary_request(text):
-    """Detect free-form market summary queries. Returns (True, market_name_or_None)."""
-    lower = text.lower()
-    triggers = [
-        "market summary", "market update", "market today", "how is the market",
-        "how are markets", "any market news", "weekly market", "market news",
-        "what's happening in", "how is the", "give me a summary on",
-        "how is", "market outlook"
-    ]
-    if not any(t in lower for t in triggers):
-        return False, None
-    # Extract specific market if named
-    for market in ["us", "usa", "america", "american", "wall street", "s&p", "nasdaq", "dow"]:
-        if market in lower:
-            return True, "US"
-    for market in ["china", "chinese", "shanghai", "hang seng", "hsi"]:
-        if market in lower:
-            return True, "China"
-    for market in ["india", "indian", "sensex", "nifty", "nse", "bse"]:
-        if market in lower:
-            return True, "India"
-    return True, None  # All markets
-
-def fetch_market_headlines(market):
-    """Fetch top RSS headlines for a market. Returns list of headline strings."""
-    feeds = MARKET_RSS_FEEDS.get(market, [])
-    headlines = []
-    for feed_url in feeds:
-        try:
-            resp = requests.get(feed_url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
-            # Simple XML title extraction — no external library needed
-            titles = re.findall(r"<title><!\[CDATA\[(.+?)\]\]></title>|<title>(?!.*<title)(.+?)</title>", resp.text)
-            for match in titles[:4]:
-                title = (match[0] or match[1]).strip()
-                if title and len(title) > 15 and "rss" not in title.lower() and "feed" not in title.lower():
-                    headlines.append(title)
-            if len(headlines) >= 4:
-                break
-        except Exception as e:
-            print(f"RSS fetch error for {market} ({feed_url}): {e}")
-    return headlines[:5]
-
-def summarise_headlines(market, headlines):
-    """Pass headlines to Claude for a 2-3 sentence market narrative."""
-    if not headlines:
-        return ""
-    try:
-        resp = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=120,
-            messages=[{"role": "user", "content": (
-                f"Summarise these {market} market headlines into 2-3 concise sentences covering what's moving markets. "
-                f"No bullet points. No preamble. Just the summary.\n\n"
-                + "\n".join(f"- {h}" for h in headlines)
-            )}]
-        )
-        return resp.content[0].text.strip()
-    except Exception as e:
-        print(f"summarise_headlines error: {e}")
-        return ""
-
 MARKET_INDICES = {
     "US": {"^GSPC": "S&P 500", "^DJI": "Dow Jones", "^IXIC": "Nasdaq"},
     "China": {"000001.SS": "Shanghai", "^HSI": "Hang Seng"},
@@ -3891,76 +3512,6 @@ def log_portfolio_buy(ticker, quantity, price, buy_date=None):
     sheet = portfolio_sheet()
     today = buy_date or date.today().strftime("%d/%m/%Y")
     sheet.append_row([ticker.upper(), str(quantity), str(price), today, ""])
-
-
-def get_recent_portfolio_entries(n=5):
-    """Return last N portfolio rows as list of (sheet_row, dict)."""
-    try:
-        sheet = portfolio_sheet()
-        all_values = sheet.get_all_values()
-        if len(all_values) <= 1:
-            return []
-        headers = all_values[0]
-        rows = all_values[1:]
-        recent = rows[-n:]
-        result = []
-        for i, row in enumerate(recent):
-            sheet_row = len(all_values) - len(recent) + i + 1
-            d = {headers[j]: row[j] if j < len(row) else "" for j in range(len(headers))}
-            result.append((sheet_row, d))
-        return list(reversed(result))
-    except Exception as e:
-        print(f"get_recent_portfolio_entries error: {e}")
-        return []
-
-def search_portfolio_by_ticker(ticker):
-    """Return all portfolio rows matching ticker as list of (sheet_row, dict)."""
-    try:
-        sheet = portfolio_sheet()
-        all_values = sheet.get_all_values()
-        if len(all_values) <= 1:
-            return []
-        headers = all_values[0]
-        rows = all_values[1:]
-        q = ticker.upper().strip()
-        matches = []
-        for i, row in enumerate(rows):
-            d = {headers[j]: row[j] if j < len(row) else "" for j in range(len(headers))}
-            if d.get("Stock", "").upper() == q:
-                matches.append((i + 2, d))
-        return list(reversed(matches))
-    except Exception as e:
-        print(f"search_portfolio_by_ticker error: {e}")
-        return []
-
-def format_portfolio_delete_list(entries):
-    """Format numbered list of portfolio entries for delete selection."""
-    lines = ["Which entry to delete?\n"]
-    for i, (_, r) in enumerate(entries, 1):
-        ticker = r.get("Stock", "?")
-        qty = r.get("Quantity", "")
-        price = r.get("Buy Price", "")
-        date_str = r.get("Buy Date", "")
-        lines.append(f"{i}. {ticker} — {qty} shares @ ${price} on {date_str}")
-    lines.append("\nReply with a number or 'cancel'.")
-    return "\n".join(lines)
-
-def delete_portfolio_entry_by_row(sheet_row):
-    """Delete a portfolio entry by sheet row. Returns confirmation string."""
-    try:
-        sheet = portfolio_sheet()
-        all_values = sheet.get_all_values()
-        if sheet_row < 2 or sheet_row > len(all_values):
-            return "Couldn't find that entry."
-        row = all_values[sheet_row - 1]
-        ticker = row[0] if row else "?"
-        qty = row[1] if len(row) > 1 else "?"
-        price = row[2] if len(row) > 2 else "?"
-        date_str = row[3] if len(row) > 3 else "?"
-        sheet.delete_rows(sheet_row)
-        return f"Deleted: {ticker} — {qty} shares @ ${price} on {date_str}"
-    except Exception as e:
-        return f"Error deleting entry: {str(e)}"
 
 def get_portfolio_holdings():
     """Get current holdings with average cost."""
@@ -4103,17 +3654,43 @@ async def check_price_alerts(app):
         print(f"Error checking price alerts: {e}")
 
 async def send_weekly_market_summary(app):
-    """Monday 8am — send US, China, India market summary with headlines."""
+    """Monday 8am — send US, China, India market summary."""
     try:
-        msg = "*Weekly Market Summary*\n\n" + get_market_summary_now()
-        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
+        lines = []
+        sentiments = []
+
+        for market, indices in MARKET_INDICES.items():
+            market_lines = [f"{market}"]
+            market_changes = []
+
+            for ticker, name in indices.items():
+                data = fetch_price(ticker)
+                if data:
+                    arrow = "▲" if data["change_pct"] >= 0 else "▼"
+                    market_lines.append(f"• {name}: {arrow} {abs(data['change_pct']):.1f}%")
+                    market_changes.append(data["change_pct"])
+
+            if market_changes:
+                avg = sum(market_changes) / len(market_changes)
+                sentiment = "positive" if avg > 0.3 else "negative" if avg < -0.3 else "mixed"
+                sentiments.append(sentiment)
+                market_lines.append(f"Sentiment: {sentiment.title()}")
+
+            lines.append("\n".join(market_lines))
+
+        # Overall flag
+        if sentiments:
+            overall = "broadly positive" if sentiments.count("positive") >= 2 else                       "broadly negative" if sentiments.count("negative") >= 2 else "mixed"
+            lines.append(f"Overall: {overall}")
+
+        msg = "Weekly Market Summary\n\n" + "\n\n---\n\n".join(lines)
+        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
+
     except Exception as e:
         print(f"Error sending weekly market summary: {e}")
 
 def is_stock_request(text):
-    """Detect stock market related requests using explicit trigger phrases only.
-    Avoids misfires on bare capitalised words like HELP, OK, I need HELP etc.
-    """
+    """Detect stock market related requests using explicit trigger phrases only."""
     lower = text.lower()
     explicit_triggers = [
         "pull up ", "look into ", "price of ", "check ",
@@ -4241,51 +3818,31 @@ def detect_crm_natural_update(text):
     return None
 
 
-def _build_market_block(market, indices):
-    """Build one market's summary block — indices + sentiment + headlines."""
-    flag = MARKET_FLAG.get(market, "")
-    lines = [f"{flag} *{market} Market*", ""]
-    market_changes = []
-
-    for ticker, name in indices.items():
-        data = fetch_price(ticker)
-        if data:
-            arrow = "▲" if data["change_pct"] >= 0 else "▼"
-            lines.append(f"{name} {arrow} {abs(data['change_pct']):.1f}%")
-            market_changes.append(data["change_pct"])
-
-    if market_changes:
-        avg = sum(market_changes) / len(market_changes)
-        sentiment = "Positive" if avg > 0.3 else "Negative" if avg < -0.3 else "Mixed"
-        lines.append(f"Sentiment: {sentiment}")
-
-    # RSS headlines → Claude summary
-    headlines = fetch_market_headlines(market)
-    if headlines:
-        summary = summarise_headlines(market, headlines)
-        if summary:
-            lines.append("")
-            lines.append(f"📰 *What's moving*")
-            lines.append(summary)
-
-    return "\n".join(lines), market_changes
-
-def get_market_summary_now(target_market=None):
-    """Generate on-demand market summary with live indices + RSS headlines."""
+def get_market_summary_now():
+    """Generate on-demand market summary — same logic as weekly job but returns string."""
     try:
-        markets = {target_market: MARKET_INDICES[target_market]} if target_market and target_market in MARKET_INDICES else MARKET_INDICES
-        blocks = []
-        all_changes = []
-        for market, indices in markets.items():
-            block, changes = _build_market_block(market, indices)
-            blocks.append(block)
-            all_changes.extend(changes)
-        result = "\n\n".join(blocks)
-        if not target_market and all_changes:
-            avg_all = sum(all_changes) / len(all_changes)
-            overall = "broadly positive" if avg_all > 0.3 else "broadly negative" if avg_all < -0.3 else "mixed"
-            result += f"\n\nOverall: {overall}"
-        return result
+        lines = []
+        sentiments = []
+        for market, indices in MARKET_INDICES.items():
+            market_lines = [f"{market}"]
+            market_changes = []
+            for ticker, name in indices.items():
+                data = fetch_price(ticker)
+                if data:
+                    arrow = "▲" if data["change_pct"] >= 0 else "▼"
+                    market_lines.append(f"{name}: {arrow} {abs(data['change_pct']):.1f}%")
+                    market_changes.append(data["change_pct"])
+            if market_changes:
+                avg = sum(market_changes) / len(market_changes)
+                sentiment = "positive" if avg > 0.3 else "negative" if avg < -0.3 else "mixed"
+                sentiments.append(sentiment)
+                market_lines.append(f"Sentiment: {sentiment.title()}")
+            lines.append("\n".join(market_lines))
+        if sentiments:
+            overall = "broadly positive" if sentiments.count("positive") >= 2 else \
+                      "broadly negative" if sentiments.count("negative") >= 2 else "mixed"
+            lines.append(f"Overall: {overall}")
+        return "Market Summary\n\n" + "\n\n---\n\n".join(lines)
     except Exception as e:
         return f"Couldn't pull market data right now: {str(e)}"
 
@@ -4610,14 +4167,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("I can only import .xlsx or .xls files for CRM.")
         return
 
-    # Handle photo messages — receipt with or without caption
+    # Handle photo messages — receipt with caption as expense
     if update.message.photo:
         caption = (update.message.caption or "").strip()
         photo = update.message.photo[-1]  # highest resolution
         tg_file = await photo.get_file()
         file_bytes = bytes(await tg_file.download_as_bytearray())
-
-        # Always upload to Drive first
+        # Upload to Drive receipts folder
         receipt_link = ""
         try:
             from googleapiclient.http import MediaIoBaseUpload
@@ -4632,102 +4188,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"Receipt upload error: {e}")
 
-        # Caption takes full priority — existing flow unchanged
-        if caption:
-            if is_expense_input(caption):
-                reply, needs_session, session_data = handle_expense_text(caption, user_id, receipt_link=receipt_link)
-                if needs_session and session_data:
-                    expense_sessions[user_id] = session_data
-                if reply:
-                    try:
-                        await update.message.reply_text(reply, parse_mode="Markdown")
-                    except Exception:
-                        await update.message.reply_text(reply)
-            else:
-                await update.message.reply_text("Got the receipt but couldn't read that as an expense. Try a caption like '1400 Ichiran' or 'spent 45 at Uniqlo'.")
+        if not caption:
+            await update.message.reply_text("Got the receipt 🧾 Add a caption with the expense details — e.g. '1400 Ichiran' and I'll log it.")
             return
 
-        # No caption — use Claude Vision to parse the receipt
-        await update.message.reply_text("Reading receipt...")
-        parsed = parse_receipt_image(file_bytes)
-
-        if not parsed or not parsed.get("merchant") or not parsed.get("amount"):
-            await update.message.reply_text(
-                "Couldn't read the receipt clearly.\n"
-                "Add a caption with the details — e.g. '45.00 Ichiran' and I'll log it."
-            )
-            return
-
-        merchant = parsed.get("merchant", "")
-        try:
-            amount = float(str(parsed.get("amount", 0)).replace(",", ""))
-        except (ValueError, TypeError):
-            amount = 0
-        currency = parsed.get("currency", overseas_state["currency"] if overseas_state["active"] else "SGD")
-        uncertain = parsed.get("uncertain_fields", [])
-
-        if amount == 0:
-            await update.message.reply_text(
-                f"Got the merchant ({merchant}) but couldn't read the total.\n"
-                f"Reply with the amount and I'll log it — e.g. '45.00'"
-            )
-            return
-
-        # FX conversion if needed
-        sgd_amount = amount
-        if currency != "SGD":
-            rate = get_fx_rate(currency)
-            if rate:
-                sgd_amount = round(amount * rate, 2)
-                if overseas_state["active"] and currency not in overseas_state["currencies"]:
-                    overseas_state["currencies"].append(currency)
-
-        # Merchant Map lookup
-        known_cat, known_card, canonical = get_merchant_memory(merchant)
-        if canonical:
-            merchant = canonical
-        category = known_cat or ""
-        card = known_card or ""
-
-        # Build missing fields list
-        missing = []
-        if not category:
-            missing.append("category")
-        if not card:
-            missing.append("card")
-
-        emoji = get_merchant_emoji(category, merchant)
-        amt_str = f"${sgd_amount:.2f} ({currency} {amount:,.0f})" if currency != "SGD" else f"${amount:.2f}"
-
-        if missing:
-            # Ask category + card in one message
-            lines = [f"{emoji} {merchant}", amt_str, ""]
-            if uncertain:
-                lines.append(f"_(uncertain: {', '.join(uncertain)})_")
-                lines.append("")
-            if "category" in missing:
-                lines.append(f"Category? ({' / '.join(EXPENSE_CATEGORIES)})")
-            if "card" in missing:
-                lines.append(f"Card? ({' / '.join(EXPENSE_CARDS)})")
-            expense_sessions[user_id] = {
-                "merchant": merchant, "amount": amount, "currency": currency,
-                "sgd_amount": sgd_amount, "category": category, "card": card,
-                "step": "confirm", "missing_fields": missing,
-                "receipt_link": receipt_link
-            }
-            try:
-                await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-            except Exception:
-                await update.message.reply_text("\n".join(lines))
+        if is_expense_input(caption):
+            reply, needs_session, session_data = handle_expense_text(caption, user_id, receipt_link=receipt_link)
+            if needs_session and session_data:
+                expense_sessions[user_id] = session_data
+            if reply:
+                try:
+                    await update.message.reply_text(reply, parse_mode="Markdown")
+                except Exception:
+                    await update.message.reply_text(reply)
         else:
-            # All fields known — log directly and show confirmation
-            log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
-            save_merchant_memory(merchant, category, card)
-            confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, receipt_saved=True)
-            try:
-                await update.message.reply_text(confirmation, parse_mode="Markdown")
-            except Exception:
-                await update.message.reply_text(confirmation)
+            await update.message.reply_text("Got the receipt but couldn't read that as an expense. Try a caption like '1400 Ichiran' or 'spent 45 at Uniqlo'.")
         return
 
     text = update.message.text.strip()
@@ -4813,79 +4288,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Reply with a number, 'search [merchant]', or 'cancel'.")
                 return
 
-    # Handle active confirm session (destructive operations)
-    if user_id in confirm_sessions:
-        session = confirm_sessions[user_id]
-        response = text.strip().lower()
-        if response in ["yes", "y", "yep", "yeah", "confirm", "ok"]:
-            action = session["action"]
-            args = session.get("args", [])
-            del confirm_sessions[user_id]
-            if action == "delete_contact":
-                reply = delete_contact(args[0])
-            elif action == "delete_bill":
-                reply = delete_bill(args[0])
-            elif action == "delete_restaurant":
-                reply = delete_restaurant(args[0])
-            elif action == "delete_event":
-                reply = delete_calendar_event(args[0])
-            elif action == "rename_category":
-                reply = rename_category(args[0], args[1])
-            else:
-                reply = "Action not recognised."
-        elif response in ["no", "n", "nope", "cancel"]:
-            del confirm_sessions[user_id]
-            reply = "Cancelled."
-        else:
-            target = session.get("target", "")
-            reply = f"Reply *yes* to confirm or *no* to cancel.\n({target})"
-        if reply:
-            try:
-                await update.message.reply_text(reply, parse_mode="Markdown")
-            except Exception:
-                await update.message.reply_text(reply)
-        return
-
-    # Handle active portfolio delete session
-    if user_id in portfolio_delete_sessions:
-        session = portfolio_delete_sessions[user_id]
-        step = session.get("step")
-        if lower in ["cancel", "nevermind", "nvm"]:
-            del portfolio_delete_sessions[user_id]
-            await update.message.reply_text("Cancelled.")
-            return
-        if step == "pick":
-            if text.strip().isdigit():
-                idx = int(text.strip()) - 1
-                entries = session.get("entries", [])
-                if 0 <= idx < len(entries):
-                    sheet_row, r = entries[idx]
-                    ticker = r.get("Stock", "?")
-                    qty = r.get("Quantity", "")
-                    price = r.get("Buy Price", "")
-                    date_str = r.get("Buy Date", "")
-                    desc = f"{ticker} — {qty} shares @ ${price} on {date_str}"
-                    portfolio_delete_sessions[user_id] = {"step": "confirm", "pending": (sheet_row, desc)}
-                    await update.message.reply_text(f"Delete: {desc}? (yes / no)")
-                else:
-                    await update.message.reply_text("Invalid number. Try again or 'cancel'.")
-            else:
-                await update.message.reply_text("Reply with a number or 'cancel'.")
-            return
-        if step == "confirm":
-            if response in ["yes", "y", "yep", "yeah"]:
-                sheet_row, desc = session["pending"]
-                del portfolio_delete_sessions[user_id]
-                result = delete_portfolio_entry_by_row(sheet_row)
-                await update.message.reply_text(result)
-            elif response in ["no", "n", "nope", "cancel"]:
-                del portfolio_delete_sessions[user_id]
-                await update.message.reply_text("Cancelled.")
-            else:
-                _, desc = session["pending"]
-                await update.message.reply_text(f"Delete: {desc}? (yes / no)")
-            return
-
     # Handle active CRM edit session
     if user_id in edit_sessions:
         await handle_edit_session(user_id, text, update)
@@ -4928,27 +4330,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         scheduled = True
                 except Exception as e:
                     print(f"Failed to schedule departure: {e}")
-            # Save trip to Trips sheet regardless of scheduled/immediate
-            try:
-                trip_id = _save_confirmed_trip(pf, return_flight_data)
-                overseas_state["trip_id"] = trip_id
-                if scheduled:
-                    mark_trip_active(trip_id)  # will be marked active at departure
-            except Exception as e:
-                print(f"Trip save error: {e}")
-                trip_id = None
-
             if scheduled:
                 ret_str = ""
                 if return_flight_data:
                     ret_dep = format_flight_time(return_flight_data.get("dep_time", ""))
                     ret_arr = format_flight_time(return_flight_data.get("arr_time", ""))
                     ret_str = f"\nReturn: {return_flight_data.get('flight', '')} {ret_dep} → {ret_arr}"
-                trip_str = f" (Trip {trip_id})" if trip_id else ""
                 reply = (
                     f"Got it ✈️ Overseas mode will activate at departure: {dep_fmt}\n"
                     f"Destination: {dest} ({curr}){ret_str}\n"
-                    f"Saved as {trip_id}.{trip_str} I'll send a confirmation when it kicks in."
+                    f"I'll send a confirmation when it kicks in."
                 )
             else:
                 # Departure already passed or no dep time — activate now
@@ -4961,12 +4352,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 overseas_state["dep_gate"] = pf.get("dep_gate", "")
                 overseas_state["arr_terminal"] = pf.get("arr_terminal", "")
                 overseas_state["arr_gate"] = pf.get("arr_gate", "")
-                overseas_state["trip_start"] = date.today().strftime("%d/%m/%Y")
-                trip_str = f" Trip {trip_id} saved." if trip_id else ""
                 reply = (
                     f"Overseas mode on ✈️\n"
                     f"Destination: {dest}\nCurrency: {curr}\n"
-                    f"I'll log expenses in {curr} with SGD equivalent.{trip_str}"
+                    f"I'll log expenses in {curr} with SGD equivalent."
                 )
         elif text.strip().upper() == "N":
             overseas_state.pop("_pending_flight", None)
@@ -4996,7 +4385,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = set_followup(text[9:])
     elif lower.startswith("update "):
         reply = update_field(text[7:])
-    elif lower.startswith("delete ") and not lower.startswith("delete event") and not lower.startswith("delete expense") and not lower.startswith("delete bill") and not lower.startswith("delete restaurant") and not lower.startswith("delete portfolio") and not lower.startswith("delete last"):
+    elif lower.startswith("delete ") and not lower.startswith("delete event") and not lower.startswith("delete expense") and not lower.startswith("delete bill") and not lower.startswith("delete restaurant") and not lower.startswith("delete last"):
         name = text[7:].strip()
         _, record = find_row(name)
         if not record:
@@ -5007,7 +4396,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply = f"Delete contact *{confirm_name}*? (yes / no)"
     elif lower.startswith("search "):
         reply = search_contacts(text[7:])
-    elif lower.startswith("edit "):
+    elif lower.startswith("edit ") and not lower.startswith("edit last expense") and not lower.startswith("edit expense"):
         name = text[5:].strip()
         _, record = find_row(name)
         if not record:
@@ -5029,8 +4418,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del confirm_sessions[user_id]
         if user_id in delete_sessions:
             del delete_sessions[user_id]
-        if user_id in portfolio_delete_sessions:
-            del portfolio_delete_sessions[user_id]
         reply = "Cancelled."
     elif lower == "list":
         reply = list_contacts()
@@ -5108,6 +4495,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "my expense categories", "expense categories"
     ]):
         reply = get_expense_categories()
+    elif any(lower == p or lower.startswith(p) for p in [
+        "what merchants", "my merchants", "merchant map", "list merchants",
+        "show merchants", "what merchants do we have", "saved merchants",
+        "known merchants"
+    ]):
+        reply = get_merchant_list()
     elif lower in ["expense report", "monthly report", "spending report", "expenses"]:
         reply = get_expense_report()
     elif lower in ["delete last expense", "remove last expense"]:
@@ -5136,25 +4529,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = show_last_expense()
     elif lower in ["trip summary", "trip spend", "how much have i spent", "trip expenses"]:
         reply = get_trip_summary()
-    elif any(lower == p or lower.startswith(p) for p in [
-        "my itinerary", "show my itinerary", "what's my itinerary", "trip itinerary",
-        "what's my flight home", "my flight home", "return flight",
-        "when do i land", "when do i arrive", "what terminal", "what gate",
-        "show past trips", "my past trips", "past trips",
-        "when do i fly next", "next flight"
-    ]):
-        reply = get_trip_queries(lower)
-    elif lower.startswith("how much did i spend in "):
-        dest_q = text[24:].strip()
-        try:
-            trip_id, _ = get_active_trip()
-            sheet = expenses_sheet()
-            records = sheet.get_all_records()
-            trip_records = [r for r in records if r.get("Trip ID") == trip_id] if trip_id else []
-            total = sum(float(r.get("SGD Amount") or r.get("Amount") or 0) for r in trip_records)
-            reply = f"Spent ${total:.2f} SGD in {dest_q} (Trip {trip_id})." if trip_id else f"No active trip to query."
-        except Exception as e:
-            reply = f"Error fetching trip spend: {e}"
     elif lower.startswith("edit last expense ") or lower.startswith("edit expense "):
         # "edit last expense category to FnB" or "edit expense card to Citi"
         m = re.search(r"edit (?:last )?expense (\w+) to (.+)", lower)
@@ -5167,11 +4541,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if m:
             old_cat = m.group(1).strip()
             new_cat = m.group(2).strip()
-            confirm_sessions[user_id] = {
-                "action": "rename_category",
-                "args": [old_cat, new_cat],
-                "target": f"Rename {old_cat} to {new_cat}?"
-            }
+            confirm_sessions[user_id] = {"action": "rename_category", "args": [old_cat, new_cat], "target": f"Rename {old_cat} to {new_cat}?"}
             reply = f"Rename category *{old_cat}* to *{new_cat}*? This will update all expense rows and Merchant Map. (yes / no)"
         else:
             reply = "Try: 'rename category FnB to Food'"
@@ -5245,30 +4615,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Stock Commands
     elif lower in ["portfolio", "my portfolio", "holdings", "portfolio performance"]:
         reply = get_portfolio_performance()
-    elif lower in ["delete portfolio entry", "remove portfolio entry", "delete portfolio"]:
-        entries = get_recent_portfolio_entries(5)
-        if not entries:
-            reply = "No portfolio entries found."
-        else:
-            portfolio_delete_sessions[user_id] = {"step": "pick", "entries": entries}
-            reply = format_portfolio_delete_list(entries)
-    elif re.match(r"delete portfolio (.+)", lower) or re.match(r"remove portfolio (.+)", lower):
-        m = re.match(r"(?:delete|remove) portfolio (.+)", lower)
-        ticker_q = m.group(1).strip().upper()
-        entries = search_portfolio_by_ticker(ticker_q)
-        if not entries:
-            reply = f"No portfolio entries found for {ticker_q}."
-        elif len(entries) == 1:
-            sheet_row, r = entries[0]
-            desc = f"{r.get('Stock')} — {r.get('Quantity')} shares @ ${r.get('Buy Price')} on {r.get('Buy Date')}"
-            portfolio_delete_sessions[user_id] = {"step": "confirm", "pending": (sheet_row, desc)}
-            reply = f"Delete: {desc}? (yes / no)"
-        else:
-            portfolio_delete_sessions[user_id] = {"step": "pick", "entries": entries}
-            reply = format_portfolio_delete_list(entries)
-    elif is_market_summary_request(text)[0]:
-        _, target_mkt = is_market_summary_request(text)
-        reply = get_market_summary_now(target_market=target_mkt)
+    elif lower in ["market summary", "market today", "how is the market", "market update",
+                   "weekly market summary", "how are markets"]:
+        reply = get_market_summary_now()
     elif is_stock_request(text):
         result = handle_stock_request(text)
         if result:
@@ -5356,9 +4705,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply = handle_search_restaurants(text)
         elif is_bill_request(text):
             reply = handle_new_bill(text)
-        elif is_market_summary_request(text)[0]:
-            _, target_mkt = is_market_summary_request(text)
-            reply = get_market_summary_now(target_market=target_mkt)
         elif is_stock_request(text):
             reply = handle_stock_request(text)
         elif is_reminder_request(text):
