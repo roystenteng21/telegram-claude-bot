@@ -2496,6 +2496,18 @@ def handle_overseas_request(text):
         deactivate_overseas_mode()
         return f"{greeting} Switching back to SGD. 🏠"
 
+    SG_IATA_CODES = {"SIN", "SLM"}
+    SG_CITY_KEYWORDS = {"singapore", "changi"}
+
+    def _is_sg_arrival(flight_info):
+        """Return True if this flight lands back in Singapore."""
+        if not flight_info:
+            return False
+        iata = (flight_info.get("arr_iata") or "").upper()
+        city = (flight_info.get("arr_city") or "").lower()
+        airport = (flight_info.get("arr_airport") or "").lower()
+        return iata in SG_IATA_CODES or any(k in city for k in SG_CITY_KEYWORDS) or any(k in airport for k in SG_CITY_KEYWORDS)
+
     # Look for flight numbers in message
     all_flights = extract_all_flight_numbers(text)
     if all_flights and AVIATIONSTACK_API_KEY:
@@ -2530,10 +2542,19 @@ def handle_overseas_request(text):
                     ret_dep = format_flight_time(ret_data["dep_time"])
                     ret_arr = format_flight_time(ret_data["arr_time"])
                     ret_data["flight"] = return_flight_num
-                    pending["return_flight_data"] = ret_data
-                    reply += f"Return {return_flight_num}: {ret_dep} → {ret_arr}\n"
+
+                    if _is_sg_arrival(ret_data):
+                        # Second flight lands in SG — treat as return leg, single trip
+                        pending["return_flight_data"] = ret_data
+                        reply += f"Return {return_flight_num}: {ret_dep} → {ret_arr} (SIN)\n"
+                    else:
+                        # Second flight does NOT land in SG — multi-city trip
+                        ret_arr_label = ret_data.get("arr_city") or ret_data.get("arr_airport") or ret_data.get("arr_iata", "")
+                        pending["return_flight_data"] = ret_data
+                        reply += f"Leg 2 {return_flight_num}: {ret_dep} → {ret_arr} ({ret_arr_label})\n"
+                        reply += f"_(Looks like a multi-city trip — I'll treat {return_flight_num} as your next leg, not a return to SG)_\n"
                 else:
-                    reply += f"(Couldn't find {return_flight_num} — I'll skip the return)\n"
+                    reply += f"(Couldn't find {return_flight_num} — I'll skip it)\n"
 
             overseas_state["_pending_flight"] = pending
             reply += "\nReply Y to confirm — overseas mode will activate at departure time."
