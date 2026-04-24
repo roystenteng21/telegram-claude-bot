@@ -2592,23 +2592,23 @@ def handle_overseas_request(text):
 
                     if is_return:
                         pending["return_flight_data"] = ret_data
-                        reply += f"Return {return_flight_num}: {ret_dep} → {ret_arr} (SIN)\n"
+                        reply += f"\nReturn {return_flight_num}: {ret_dep} → {ret_arr} (SIN)\n"
                     else:
                         ret_arr_label = user_dest_hint or ret_data.get("arr_city") or ret_data.get("arr_airport") or ret_data.get("arr_iata", "")
                         pending["return_flight_data"] = ret_data
-                        reply += f"Leg 2 {return_flight_num}: {ret_dep} → {ret_arr} ({ret_arr_label})\n"
+                        reply += f"\nLeg 2 {return_flight_num}: {ret_dep} → {ret_arr} ({ret_arr_label})\n"
                         reply += f"_(Multi-city trip — {return_flight_num} logged as next leg)_\n"
-                        reply += f"Got a return flight to SG? Reply with the flight number or \'no\' to log as-is."
+                        reply += f"\nGot a return flight to SG? Reply with the flight number or \'no\' to log as-is."
                 else:
                     reply += f"(Couldn't find {return_flight_num} — I'll skip it)\n"
 
                 overseas_state["_pending_flight"] = pending
-                reply += "\nReply Y to confirm — overseas mode will activate at departure time."
+                reply += "\n\nReply Y to confirm — overseas mode will activate at departure time."
             else:
                 # Single flight — ask for return
                 overseas_state["_pending_flight"] = pending
                 overseas_state["_awaiting_return_flight"] = True
-                reply += "\nGot a return flight yet? Reply with the flight number or 'no' to log just the departure."
+                reply += "\n\nGot a return flight yet? Reply with the flight number or 'no' to log just the departure."
 
             return reply
 
