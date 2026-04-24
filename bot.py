@@ -1934,6 +1934,7 @@ _app_ref = None
 # { user_id: { "merchant": str, "amount": float, "currency": str, "step": "category"|"card" } }
 expense_sessions = {}
 delete_sessions = {}
+confirm_sessions = {}  # { user_id: { "action": str, "target": str, "args": [...] } }
 
 # Reconciliation sessions — { user_id: { "step": str, "unmatched": [...], "index": int } }
 recon_sessions = {}
@@ -2260,14 +2261,40 @@ def is_expense_input(text):
                 "recorded in", "will it be", "logged in", "track", "how much have i"]
     return any(t in lower for t in triggers)
 
+LOCATION_CONTEXT_WORDS = {
+    # Countries
+    "japan", "korea", "thailand", "malaysia", "indonesia", "vietnam", "philippines",
+    "australia", "china", "hong kong", "taiwan", "india", "uk", "england", "france",
+    "germany", "italy", "spain", "usa", "america", "canada", "dubai", "uae",
+    # Cities
+    "tokyo", "osaka", "seoul", "bangkok", "kuala lumpur", "kl", "jakarta", "bali",
+    "sydney", "melbourne", "beijing", "shanghai", "guangzhou", "shenzhen",
+    "taipei", "mumbai", "delhi", "london", "paris", "berlin", "rome", "barcelona",
+    "new york", "los angeles", "chicago", "toronto", "vancouver",
+    # Airport codes
+    "hkg", "nrt", "icn", "bkk", "kul", "cgk", "sin", "syd", "pek", "pvg",
+    "tpe", "bom", "del", "lhr", "cdg", "txl", "fco", "jfk", "lax", "yyz",
+}
+
 def is_overseas_mode_request(text):
-    """Detect overseas mode toggle."""
+    """Detect overseas mode toggle. Guards against misfires like 'i'm in a meeting'."""
     lower = text.lower()
     has_flight = bool(extract_flight_number(text))
-    return (has_flight and any(w in lower for w in ["flying", "flight", "on tr", "on sq", "on ak", "on mh", "boarding"])) or \
-           ("overseas" in lower or "travelling" in lower or "traveling" in lower or
-            "i'm in" in lower or "flying to" in lower or "arrived in" in lower or
-            "back home" in lower or "returned" in lower or "i'm back" in lower)
+
+    if has_flight and any(w in lower for w in ["flying", "flight", "on tr", "on sq", "on ak", "on mh", "boarding"]):
+        return True
+
+    if any(phrase in lower for phrase in [
+        "overseas", "travelling", "traveling", "flying to", "arrived in",
+        "back home", "i'm back", "landed in", "just landed", "just arrived", "returned home"
+    ]):
+        return True
+
+    # "i'm in [location]" — only if followed by a known place name, not "i'm in a meeting"
+    if "i'm in" in lower or "im in" in lower:
+        return any(loc in lower for loc in LOCATION_CONTEXT_WORDS)
+
+    return False
 
 def lookup_flight(flight_number):
     """Look up flight details via AviationStack API. Returns dict or None."""
@@ -2813,7 +2840,7 @@ def get_last_expense():
         return None
 
 def edit_last_expense(field, new_value):
-    """Edit a specific field in the last expense row."""
+    """Edit a specific field in the last expense row. Validates value and shows before/after."""
     try:
         sheet = expenses_sheet()
         all_values = sheet.get_all_values()
@@ -2827,10 +2854,41 @@ def edit_last_expense(field, new_value):
         }
         col_name = field_map.get(field.lower())
         if not col_name or col_name not in headers:
-            return f"Can't edit field '{field}'. Try: merchant, amount, currency, sgd, category, card, notes."
+            valid = ", ".join(field_map.keys())
+            return f"Can't edit '{field}'. Options: {valid}"
         col_idx = headers.index(col_name) + 1
+
+        # Validation
+        if col_name == "Amount":
+            try:
+                float(new_value.replace(",", "").replace("$", ""))
+            except ValueError:
+                return "Amount must be a number. Try: edit last expense amount to 12.50"
+        elif col_name == "Category":
+            try:
+                all_cats = sorted(set(
+                    r.get("Category", "").strip()
+                    for r in expenses_sheet().get_all_records()
+                    if r.get("Category", "").strip()
+                )) or EXPENSE_CATEGORIES
+            except Exception:
+                all_cats = EXPENSE_CATEGORIES
+            matched = next((c for c in all_cats if c.lower() == new_value.strip().lower()), None)
+            if not matched:
+                return f"Unknown category '{new_value}'. Your categories: {', '.join(all_cats)}"
+            new_value = matched
+        elif col_name == "Card":
+            matched = next((c for c in EXPENSE_CARDS if c.lower() == new_value.strip().lower()), None)
+            if not matched:
+                return f"Unknown card '{new_value}'. Your cards: {', '.join(EXPENSE_CARDS)}"
+            new_value = matched
+
+        # Read old value for before/after display
+        last_row = all_values[last_row_idx - 1]
+        old_value = last_row[col_idx - 1] if col_idx - 1 < len(last_row) else ""
+
         sheet.update_cell(last_row_idx, col_idx, new_value)
-        return f"Updated {col_name} to '{new_value}'."
+        return f"Updated ✅\n{col_name}: {old_value} → {new_value}"
     except Exception as e:
         return f"Error editing expense: {str(e)}"
 
@@ -3595,20 +3653,25 @@ async def send_weekly_market_summary(app):
         print(f"Error sending weekly market summary: {e}")
 
 def is_stock_request(text):
-    """Detect stock market related requests."""
+    """Detect stock market related requests using explicit trigger phrases only.
+    Avoids misfires on bare capitalised words like HELP, OK, I need HELP etc.
+    """
     lower = text.lower()
-    triggers = [
-        "stock", "share", "ticker", "portfolio", "holdings", "p&l",
-        "aapl", "tsla", "nvda", "price of", "what's ", "alert me if",
-        "alert if", "bought ", "sold ", "suggest stocks", "stock ideas",
-        "market summary", "how is the market", "market today"
+    explicit_triggers = [
+        "pull up ", "look into ", "price of ", "check ",
+        "alert me if", "alert if ", "add to portfolio",
+        "bought ", "sold ", "suggest stocks", "stock ideas",
+        "stock ", "ticker ", "p&l", "holdings",
+        "market summary", "how is the market", "market today",
+        "weekly market", "how are markets", "portfolio performance"
     ]
-    # Also catch common patterns
-    import re
-    ticker_pattern = re.search(r'\b[A-Z]{1,5}\b', text)
-    return any(t in lower for t in triggers) or bool(ticker_pattern and any(
-        t in lower for t in ["price", "at", "worth", "doing", "performing"]
-    ))
+    if any(t in lower for t in explicit_triggers):
+        return True
+    # Ticker + explicit context verb only — e.g. "NVDA doing well?" or "AAPL worth buying?"
+    ticker_match = re.search(r'\b[A-Z]{2,5}\b', text)
+    if ticker_match and any(w in lower for w in ["doing", "worth", "performing", "price", "target", "outlook"]):
+        return True
+    return False
 
 def handle_stock_request(text):
     """Route a stock request to the right handler."""
@@ -4136,6 +4199,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Couldn't parse that. Try: 'Name, Email, Date of Birth, Alias'")
             return
 
+    # Handle active confirm session (destructive operations)
+    if user_id in confirm_sessions:
+        session = confirm_sessions[user_id]
+        response = text.strip().lower()
+        if response in ["yes", "y", "yep", "yeah", "confirm", "ok"]:
+            action = session["action"]
+            args = session.get("args", [])
+            del confirm_sessions[user_id]
+            if action == "delete_contact":
+                reply = delete_contact(args[0])
+            elif action == "delete_bill":
+                reply = delete_bill(args[0])
+            elif action == "delete_restaurant":
+                reply = delete_restaurant(args[0])
+            elif action == "delete_event":
+                reply = delete_calendar_event(args[0])
+            elif action == "rename_category":
+                reply = rename_category(args[0], args[1])
+            else:
+                reply = "Action not recognised."
+        elif response in ["no", "n", "nope", "cancel"]:
+            del confirm_sessions[user_id]
+            reply = "Cancelled."
+        else:
+            target = session.get("target", "")
+            reply = f"Reply *yes* to confirm or *no* to cancel.\n({target})"
+        if reply:
+            try:
+                await update.message.reply_text(reply, parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(reply)
+        return
+
     # Handle active meeting recap session
     if user_id in meeting_sessions:
         await handle_meeting_session(user_id, text, update)
@@ -4288,8 +4384,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = set_followup(text[9:])
     elif lower.startswith("update "):
         reply = update_field(text[7:])
-    elif lower.startswith("delete ") and not lower.startswith("delete event"):
-        reply = delete_contact(text[7:])
+    elif lower.startswith("delete ") and not lower.startswith("delete event") and not lower.startswith("delete expense") and not lower.startswith("delete bill") and not lower.startswith("delete restaurant"):
+        name = text[7:].strip()
+        _, record = find_row(name)
+        if not record:
+            reply = f"❌ No contact found for '{name}'"
+        else:
+            confirm_name = record.get("Name", name)
+            confirm_sessions[user_id] = {"action": "delete_contact", "args": [name], "target": f"Delete contact {confirm_name}?"}
+            reply = f"Delete contact *{confirm_name}*? (yes / no)"
     elif lower.startswith("search "):
         reply = search_contacts(text[7:])
     elif lower.startswith("edit "):
@@ -4310,6 +4413,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del edit_sessions[user_id]
         if user_id in excel_import_sessions:
             del excel_import_sessions[user_id]
+        if user_id in confirm_sessions:
+            del confirm_sessions[user_id]
+        if user_id in delete_sessions:
+            del delete_sessions[user_id]
         reply = "Cancelled."
     elif lower == "list":
         reply = list_contacts()
@@ -4423,12 +4530,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             reply = show_last_expense()
     elif lower.startswith("rename category "):
-        # "rename category FnB to Food"
         m = re.search(r"rename category (.+?) to (.+)", lower)
         if m:
-            reply = rename_category(m.group(1).strip(), m.group(2).strip())
+            old_cat = m.group(1).strip()
+            new_cat = m.group(2).strip()
+            confirm_sessions[user_id] = {
+                "action": "rename_category",
+                "args": [old_cat, new_cat],
+                "target": f"Rename {old_cat} to {new_cat}?"
+            }
+            reply = f"Rename category *{old_cat}* to *{new_cat}*? This will update all expense rows and Merchant Map. (yes / no)"
         else:
-            reply = f"Try: 'rename category FnB to Food'"
+            reply = "Try: 'rename category FnB to Food'"
     elif lower.startswith("now in ") or lower.startswith("switched to ") or lower.startswith("arrived in "):
         # Mid-trip currency switch — "now in Korea", "arrived in Seoul"
         if overseas_state.get("active"):
@@ -4478,14 +4591,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif lower in ["bills", "my bills", "list bills"]:
         reply = list_bills()
     elif lower.startswith("delete bill "):
-        reply = delete_bill(text[12:].strip())
+        bill_name = text[12:].strip()
+        confirm_sessions[user_id] = {"action": "delete_bill", "args": [bill_name], "target": f"Delete bill {bill_name}?"}
+        reply = f"Delete bill *{bill_name}*? (yes / no)"
     elif is_bill_request(text):
         reply = handle_new_bill(text)
 
     # Restaurant Commands
     elif lower.startswith("delete restaurant ") or lower.startswith("remove restaurant "):
-        name = text.split(" ", 2)[2].strip()
-        reply = delete_restaurant(name)
+        rest_name = text.split(" ", 2)[2].strip()
+        confirm_sessions[user_id] = {"action": "delete_restaurant", "args": [rest_name], "target": f"Delete restaurant {rest_name}?"}
+        reply = f"Delete *{rest_name}* from your restaurant list? (yes / no)"
     elif is_restaurant_search(text):
         reply = handle_search_restaurants(text)
     elif is_restaurant_save(text):
@@ -4520,7 +4636,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif lower == "events week":
         reply = get_events(7)
     elif lower.startswith("delete event "):
-        reply = delete_calendar_event(text[13:])
+        event_name = text[13:].strip()
+        confirm_sessions[user_id] = {"action": "delete_event", "args": [event_name], "target": f"Delete event {event_name}?"}
+        reply = f"Delete event *{event_name}*? (yes / no)"
 
     # Infrastructure / Settings
     elif lower == "em status":
