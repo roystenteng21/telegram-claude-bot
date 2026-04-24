@@ -1998,16 +1998,68 @@ async def refresh_fx_rates(app=None):
             except Exception as e:
                 print(f"FX refresh error for {currency}: {e}")
 
-EXPENSE_CONTEXT_EMOJIS = {
-    "FnB": ["☕", "🍜", "🍣", "🥗", "🍕", "🍔", "🧋"],
-    "Entertainment": ["🎬", "🎮", "🎵", "🎭"],
-    "Personal": ["💈", "🛍️", "💊"],
-    "Family": ["👨‍👩‍👧", "🏠", "🎁"],
-    "Work": ["💼", "📊", "🖥️"],
-    "Transport": ["🚗", "🚕", "✈️", "🚌"],
-    "Shopping": ["🛒", "👟", "👗"],
-    "Travel": ["🌏", "🏨", "🗺️"]
+EXPENSE_CATEGORY_EMOJI = {
+    "FnB": "🍽️",
+    "Transport": "🚗",
+    "Entertainment": "🎬",
+    "Personal": "🪞",
+    "Family": "👨‍👩‍👧",
+    "Work": "💼",
+    "Shopping": "🛍️",
+    "Household": "🏠",
+    "Travel": "✈️",
 }
+
+EXPENSE_MERCHANT_OVERRIDES = {
+    "FnB": [
+        (["coffee", "starbucks", "kopitiam", "ya kun", "toast box", "kopi", "cafe", "espresso", "latte"], "☕"),
+        (["ramen", "ichiran", "ippudo", "japanese", "sushi", "yakitori", "donburi", "izakaya"], "🍜"),
+        (["mcdonald", "burger king", "wendy", "burger", "kfc", "popeyes", "fast food"], "🍔"),
+        (["bar", "beer", "wine", "drinks", "cocktail", "pub", "taproom", "brewery"], "🍺"),
+    ],
+    "Transport": [
+        (["flight", "airline", "air asia", "scoot", "singapore airlines", "cathay", "emirates", "jetstar"], "✈️"),
+        (["grab", "gojek", "taxi", "uber", "ryde", "tada"], "🚕"),
+        (["mrt", "bus", "transit", "ez-link", "train"], "🚌"),
+    ],
+    "Entertainment": [
+        (["netflix", "disney", "hbo", "prime video", "apple tv", "streaming", "hulu", "mewatch"], "📺"),
+        (["spotify", "apple music", "tidal", "deezer", "music"], "🎵"),
+        (["cinema", "cathay", "gv", "shaw", "golden village", "movie"], "🎥"),
+        (["steam", "playstation", "xbox", "nintendo", "game"], "🎮"),
+    ],
+    "Shopping": [
+        (["guardian", "watsons", "unity", "pharmacy", "watson"], "💊"),
+        (["ntuc", "giant", "cold storage", "fairprice", "supermarket", "grocery", "market"], "🛒"),
+    ],
+}
+
+_category_emoji_cache = {}
+
+def get_merchant_emoji(category, merchant):
+    """Return contextual emoji based on category + merchant name."""
+    merchant_lower = merchant.lower() if merchant else ""
+    overrides = EXPENSE_MERCHANT_OVERRIDES.get(category, [])
+    for keywords, emoji in overrides:
+        if any(kw in merchant_lower for kw in keywords):
+            return emoji
+    if category in EXPENSE_CATEGORY_EMOJI:
+        return EXPENSE_CATEGORY_EMOJI[category]
+    if category:
+        if category in _category_emoji_cache:
+            return _category_emoji_cache[category]
+        try:
+            resp = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=5,
+                messages=[{"role": "user", "content": f"Return a single emoji that best represents the expense category '{category}'. Return ONLY the emoji, nothing else."}]
+            )
+            inferred = resp.content[0].text.strip()
+            _category_emoji_cache[category] = inferred
+            return inferred
+        except Exception:
+            pass
+    return "💳"
 
 def expenses_sheet():
     return spreadsheet.worksheet("Expenses")
@@ -2049,11 +2101,6 @@ def save_merchant_memory(merchant, category, card):
     except Exception as e:
         print(f"Error saving merchant: {e}")
 
-def get_expense_emoji(category):
-    import random
-    emojis = EXPENSE_CONTEXT_EMOJIS.get(category, ["💳"])
-    return random.choice(emojis)
-
 def parse_expense_text(text):
     """Use Claude to extract expense details from natural language."""
     overseas_currency = overseas_state["currency"] if overseas_state["active"] else "SGD"
@@ -2087,15 +2134,17 @@ def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_
 
 def format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount=None, receipt_saved=False):
     """Format the expense confirmation message."""
-    emoji = get_expense_emoji(category)
-    lines = [f"🏪 {merchant}"]
+    emoji = get_merchant_emoji(category, merchant)
+    lines = [f"{emoji} {merchant}"]
     if currency != "SGD" and sgd_amount is not None:
-        lines.append(f"SGD ${sgd_amount:.2f} ({currency} {amount:,.0f})")
+        lines.append(f"${sgd_amount:.2f} ({currency} {amount:,.0f})")
     else:
-        lines.append(f"SGD ${amount:.2f}")
-    lines.append(f"🗂 {category} | 💳 {card} {emoji}")
+        lines.append(f"${amount:.2f}")
+    lines.append(f"🗂 {category} | 💳 {card}")
     if receipt_saved:
         lines.append("🧾 Receipt saved")
+    lines.append("")
+    lines.append("All good?")
     return "\n".join(lines)
 
 def get_monthly_summary(month=None, year=None):
@@ -2160,11 +2209,54 @@ def get_monthly_summary(month=None, year=None):
     except Exception as e:
         return f"Error generating summary: {str(e)}"
 
+def is_log_prefix_input(text):
+    """Detect 'log [merchant] [amount]' — always routes to expense flow."""
+    return text.lower().startswith("log ") and len(text) > 4
+
+def is_bare_merchant_input(text):
+    """Detect bare merchant name + amount — e.g. 'Starbucks $5.60'.
+    Only triggers if: first word/phrase matches a known merchant AND a dollar amount is present.
+    Safeguard: avoids triggering on sentences like 'Apple announced new products'.
+    """
+    lower = text.lower().strip()
+    # Must contain a dollar amount
+    if not re.search(r"\$[\d,.]+", text):
+        return False
+    # First word must match a known merchant (case-insensitive)
+    first_word = text.strip().split()[0]
+    known_cat, _, _ = get_merchant_memory(first_word)
+    return bool(known_cat)
+
+def get_expense_categories():
+    """Pull live expense categories from the Expenses sheet data, falling back to defaults."""
+    try:
+        sheet = expenses_sheet()
+        records = sheet.get_all_records()
+        cats = sorted(set(r.get("Category", "").strip() for r in records if r.get("Category", "").strip()))
+        if not cats:
+            cats = EXPENSE_CATEGORIES
+    except Exception:
+        cats = EXPENSE_CATEGORIES
+    numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(cats))
+    return f"Your expense categories:\n\n{numbered}"
+
 def is_expense_input(text):
     """Detect if message looks like an expense entry or expense question."""
     lower = text.lower()
+    # Exclude command-style messages that contain expense-related words but aren't entries
+    exclusions = [
+        "delete expense", "remove expense", "undo expense",
+        "edit expense", "edit last expense",
+        "rename category", "expense report", "monthly report",
+        "trip summary", "last expense", "show last expense",
+        "what expense categories", "list my categories", "what categories",
+        "show categories", "what are my expense", "list categories",
+        "expense categories", "my categories"
+    ]
+    if any(lower.startswith(e) or lower == e for e in exclusions):
+        return False
     triggers = ["spent", "paid", "$", "sgd", "charged", "bought", "grabbed",
-                "receipt", "bill was", "cost me", "picked up", "expense",
+                "receipt", "bill was", "cost me", "picked up",
                 "recorded in", "will it be", "logged in", "track", "how much have i"]
     return any(t in lower for t in triggers)
 
@@ -2502,6 +2594,19 @@ def check_same_day_duplicate(merchant, amount, currency):
         print(f"Duplicate check error: {e}")
     return False
 
+QUESTION_WORDS = {"what", "how", "why", "when", "which", "who", "where", "list", "show", "tell", "is", "are", "do", "does", "can", "could", "would", "should"}
+COMMAND_PREFIXES = ["delete", "remove", "undo", "edit", "rename", "show", "list", "what", "how"]
+
+def _looks_like_command(text):
+    """Return True if text looks like a command or question rather than an expense entry."""
+    lower = text.lower().strip()
+    first_word = lower.split()[0] if lower.split() else ""
+    if first_word in QUESTION_WORDS:
+        return True
+    if any(lower.startswith(p) for p in COMMAND_PREFIXES):
+        return True
+    return False
+
 def handle_expense_text(text, user_id, receipt_link=""):
     """
     Process a text expense entry.
@@ -2515,6 +2620,13 @@ def handle_expense_text(text, user_id, receipt_link=""):
         category = parsed.get("category", "")
         card = parsed.get("card", "")
 
+        # Blank expense guard — reject if merchant is empty/unknown-ish or amount is 0
+        if not merchant or merchant.lower() in ("unknown", "") or amount == 0:
+            return (
+                "Wasn't sure what to do with that — did you mean to log an expense, "
+                "or were you asking something else?"
+            ), False, None
+
         # Resolve FX rate if needed
         sgd_amount = amount
         if currency != "SGD":
@@ -2526,8 +2638,9 @@ def handle_expense_text(text, user_id, receipt_link=""):
                     "receipt_link": receipt_link
                 }
                 return (
-                    f"Couldn't get the {currency}/SGD rate. "
-                    f"What's the exchange rate? (e.g. '0.0093' means 1 {currency} = 0.0093 SGD)"
+                    f"Couldn't fetch the {currency}/SGD rate right now.\n"
+                    f"What's the current rate? (e.g. '0.0093' means 1 {currency} = 0.0093 SGD)\n"
+                    f"I'll use it for this expense and retry the live rate next time."
                 ), True, session
             sgd_amount = round(amount * rate, 2)
             # Track currency for this trip
@@ -2569,12 +2682,13 @@ def handle_expense_text(text, user_id, receipt_link=""):
                 "step": "confirm", "missing_fields": missing,
                 "receipt_link": receipt_link
             }
+            _confirm_emoji = get_merchant_emoji(category, merchant)
             lines = [f"Got it —"]
-            lines.append(f"🏪 {merchant}")
+            lines.append(f"{_confirm_emoji} {merchant}")
             if currency != "SGD":
-                lines.append(f"SGD ${sgd_amount:.2f} ({currency} {amount:,.0f})")
+                lines.append(f"${sgd_amount:.2f} ({currency} {amount:,.0f})")
             else:
-                lines.append(f"SGD ${amount:.2f}")
+                lines.append(f"${amount:.2f}")
             if "category" in missing:
                 lines.append(f"\nWhat category?\n{', '.join(EXPENSE_CATEGORIES)}")
             elif "card" in missing:
@@ -2587,8 +2701,17 @@ def handle_expense_text(text, user_id, receipt_link=""):
         confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, receipt_saved)
         return confirmation, False, None
 
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        print(f"parse_expense_text error: {e} | input: {text}")
+        # Try to reconstruct a guess from the raw text for user-facing hint
+        guess = text[:60] + ("..." if len(text) > 60 else "")
+        return (
+            f"Couldn't read that as an expense.\n"
+            f"Try: 'log [merchant] [amount]' — e.g. 'log Starbucks $5.60'"
+        ), False, None
     except Exception as e:
-        return f"Couldn't parse that expense: {str(e)}", False, None
+        print(f"handle_expense_text unexpected error: {e}")
+        return "Something went wrong logging that — try again or use 'log [merchant] [amount]'.", False, None
 
 def delete_last_expense():
     """Delete the most recently added expense row."""
@@ -2719,14 +2842,17 @@ def show_last_expense():
     currency = r.get("Currency", "SGD")
     amount = r.get("Amount", "")
     sgd = r.get("SGD Amount", "")
+    _merchant = r.get('Merchant', '')
+    _cat = r.get('Category', '')
+    _emoji = get_merchant_emoji(_cat, _merchant)
     lines = [
         f"Last expense:",
-        f"🏪 {r.get('Merchant', '')}",
+        f"{_emoji} {_merchant}",
     ]
     if currency != "SGD" and sgd:
-        lines.append(f"SGD ${float(sgd):.2f} ({currency} {float(amount):,.0f})")
+        lines.append(f"${float(sgd):.2f} ({currency} {float(amount):,.0f})")
     else:
-        lines.append(f"SGD ${float(amount):.2f}" if amount else "")
+        lines.append(f"${float(amount):.2f}" if amount else "")
     lines.append(f"🗂 {r.get('Category', '')} | 💳 {r.get('Card', '')}")
     lines.append(f"📅 {r.get('Date', '')}")
     lines.append("\nTo edit: 'edit [field] to [value]' e.g. 'edit category to Transport'")
@@ -4255,6 +4381,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = handle_new_reminder(text)
 
     # Expense Commands
+    elif any(lower == p or lower.startswith(p) for p in [
+        "what expense categories", "list my categories", "what categories",
+        "show categories", "what are my expense categories", "list categories",
+        "my expense categories", "expense categories"
+    ]):
+        reply = get_expense_categories()
     elif lower in ["expense report", "monthly report", "spending report", "expenses"]:
         reply = get_expense_report()
     elif lower in ["delete last expense", "remove last expense"]:
@@ -4318,6 +4450,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply = handle_overseas_request(text)
         else:
             reply = handle_overseas_request(text)
+    elif is_log_prefix_input(text):
+        # "log [merchant] [amount]" — always expense flow, strip the "log " prefix
+        log_text = text[4:].strip()
+        reply, needs_session, session_data = handle_expense_text(log_text, user_id)
+        if needs_session and session_data:
+            expense_sessions[user_id] = session_data
     elif is_overseas_mode_request(text):
         if not extract_flight_number(text) and user_id in conversation_histories:
             history_text = " ".join(
@@ -4431,6 +4569,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_reminder_request(text):
             reply = handle_new_reminder(text)
         elif is_expense_input(text):
+            reply, needs_session, session_data = handle_expense_text(text, user_id)
+            if needs_session and session_data:
+                expense_sessions[user_id] = session_data
+        elif is_bare_merchant_input(text):
             reply, needs_session, session_data = handle_expense_text(text, user_id)
             if needs_session and session_data:
                 expense_sessions[user_id] = session_data
