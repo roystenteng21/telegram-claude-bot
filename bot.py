@@ -2891,7 +2891,7 @@ def format_expense_confirmation(merchant, amount, currency, category, card, sgd_
             prompt = f"yes / enter {missing_fields[0].title()} / skip"
         lines.append(f"\nLog this? ({prompt})")
     else:
-        lines.append("\nLog this? (yes / skip)")
+        lines.append("\nLog this? (yes / edit name · amount · category · card / skip)")
 
     return "\n".join(lines)
 
@@ -3511,6 +3511,61 @@ async def handle_receipt_confirm_session(user_id, text, update):
         session["card"] = card_match
         # Log immediately after card override
         await _finalise_receipt_confirm(user_id, session, update)
+        return True
+
+    # Shorthand edit prompts — "edit name", "edit amount", etc.
+    edit_field_map = {
+        "edit name": "merchant", "edit merchant": "merchant",
+        "edit amount": "amount", "edit price": "amount",
+        "edit category": "category", "edit cat": "category",
+        "edit card": "card", "edit payment": "card",
+    }
+    if lower in edit_field_map:
+        field = edit_field_map[lower]
+        session["_awaiting_edit"] = field
+        receipt_confirm_sessions[user_id] = session
+        field_label = {"merchant": "merchant name", "amount": "amount", "category": "category", "card": "card"}[field]
+        await update.message.reply_text(f"Enter the new {field_label}:")
+        return True
+
+    # Handle awaiting edit value
+    if session.get("_awaiting_edit"):
+        field = session.pop("_awaiting_edit")
+        receipt_confirm_sessions[user_id] = session
+        # Reuse multi-field edit logic by constructing the edit string
+        synthetic = f"{field} {text.strip()}"
+        edits = parse_multi_field_edit(synthetic)
+        if edits:
+            for f, value in edits.items():
+                if f == "merchant":
+                    session["merchant"] = value
+                elif f == "amount":
+                    try:
+                        session["amount"] = float(re.sub(r"[^\d.]", "", value))
+                        if session["currency"] == "SGD":
+                            session["sgd_amount"] = session["amount"]
+                    except ValueError:
+                        pass
+                elif f == "category":
+                    matched_cat, _ = fuzzy_match_category(value)
+                    if matched_cat:
+                        session["category"] = matched_cat
+                        session["card"] = get_card_default_for_category(matched_cat)
+                elif f == "card":
+                    matched_card, _ = fuzzy_match_card(value)
+                    if matched_card:
+                        session["card"] = matched_card
+        receipt_confirm_sessions[user_id] = session
+        await update.message.reply_text(
+            format_expense_confirmation(
+                session["merchant"], session["amount"], session["currency"],
+                session.get("category", ""), session.get("card", ""),
+                session.get("sgd_amount"), receipt_saved=bool(session.get("receipt_link")),
+                last4=session.get("last4"), high_amount=session.get("high_amount", False),
+                use_manual_rate=session.get("use_manual_rate", False),
+                missing_fields=session.get("missing_fields", [])
+            )
+        )
         return True
 
     # Try multi-field edit
@@ -6086,12 +6141,19 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 overseas_state["active"] = True
                 overseas_state["destination"] = dest
                 overseas_state["currency"] = curr
-                overseas_state["dep_flight"] = pf.get("flight_number", "")
-                overseas_state["dep_time"] = pf.get("dep_time", "")
+                overseas_state["currencies"] = [curr] if curr != "SGD" else []
+                overseas_state["trip_destinations"] = [dest]
+                overseas_state["trip_start"] = date.today().strftime("%d/%m/%Y")
+                dep_flight = pf.get("flight_number", "")
+                dep_time = pf.get("dep_time", "")
+                overseas_state["dep_flight"] = dep_flight
+                overseas_state["dep_time"] = dep_time
                 overseas_state["dep_terminal"] = pf.get("dep_terminal", "")
                 overseas_state["dep_gate"] = pf.get("dep_gate", "")
                 overseas_state["arr_terminal"] = pf.get("arr_terminal", "")
                 overseas_state["arr_gate"] = pf.get("arr_gate", "")
+                # Persist to Trips sheet so it survives restarts
+                save_trip(dest, curr, dep_flight, dep_time)
                 reply = (
                     f"Overseas mode on ✈️\n"
                     f"Destination: {dest}\nCurrency: {curr}\n"
@@ -6373,6 +6435,17 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     overseas_state["trip_destinations"].append(new_dest)
                 # Pre-cache the new currency rate
                 get_fx_rate(new_curr)
+                # Update Trips sheet with new destination
+                try:
+                    ws = trips_sheet()
+                    records = ws.get_all_records()
+                    for i, row in enumerate(records, start=2):
+                        if row.get("Status") == "active":
+                            ws.update_cell(i, 2, new_dest)
+                            ws.update_cell(i, 3, new_curr)
+                            break
+                except Exception as e:
+                    print(f"Trips sheet update error: {e}")
                 reply = f"Switched to {new_dest} — expenses will now be logged in {new_curr}."
             else:
                 reply = handle_overseas_request(text)
