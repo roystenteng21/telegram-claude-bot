@@ -376,18 +376,25 @@ async def send_startup_message(app, health):
             else:
                 settings_ws.append_row(["last_deployment_id", RAILWAY_DEPLOYMENT_ID])
 
-        # Build status message
-        all_ok = all("✅" in v for k, v in health.items() if k != "iCloud")
-        icon = "✅" if all_ok else "⚠️"
-        lines = [f"Em is online {icon}"]
+        # Build status message — match em status format exactly
+        issues = []
         for k, v in health.items():
-            lines.append(f"{k}: {v}")
+            if k == "iCloud":
+                continue  # iCloud tested lazily, skip on startup
+            if "❌" in v:
+                issues.append(f"• {k}: {v.replace('❌ ', '')}")
+            elif "⚠️" in v:
+                issues.append(f"• {k}: {v.replace('⚠️ ', '')}")
 
-        # Flag profile failure with reload command
         if "❌" in health.get("Profile", ""):
-            lines.append("\nReply 'reload profile' to retry loading preferences.")
+            issues.append("• Reply 'reload profile' to retry loading preferences.")
 
-        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text="\n".join(lines))
+        if not issues:
+            msg = "✅ Systems all green"
+        else:
+            msg = "⚠️ Issues detected on startup:\n\n" + "\n".join(issues)
+
+        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
 
     except Exception as e:
         print(f"send_startup_message error: {e}")
