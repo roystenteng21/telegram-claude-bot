@@ -26,7 +26,23 @@ ICLOUD_PASSWORD = os.getenv("ICLOUD_PASSWORD")
 AVIATIONSTACK_API_KEY = os.getenv("AVIATIONSTACK_API_KEY", "")
 EXCHANGE_RATE_API_KEY = os.getenv("EXCHANGE_RATE_API_KEY", "")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-YOUR_CHAT_ID = 281095850
+YOUR_CHAT_ID = int(os.getenv("YOUR_CHAT_ID", "281095850"))
+RAILWAY_DEPLOYMENT_ID = os.getenv("RAILWAY_DEPLOYMENT_ID", "")
+
+# Anthropic API health tracking
+_anthropic_failure_count = 0
+_anthropic_down_notified = False
+ANTHROPIC_FAILURE_THRESHOLD = 3
+
+# iCloud health tracking
+_icloud_down = False
+_icloud_last_notified = None
+
+# Manual FX rate cache: { currency: { "rate": float, "date": str, "sgd_per_unit": bool } }
+manual_fx_rates = {}
+
+# Session timestamps for timeout: { user_id: datetime }
+session_timestamps = {}
 
 # --- Google Sheets + Drive Setup ---
 SCOPES = [
@@ -92,10 +108,11 @@ def setup_sheets():
         "Expenses": ["Date", "Merchant", "Amount", "Currency", "SGD Amount", "Category",
                      "Card", "Receipt Link", "Reconciled", "Notes"],
         "Bills": ["Name", "Bank", "Due Date", "Estimated Amount", "Notes"],
-        "Cards": ["Card Name", "Bank", "Type", "Notes"],
         "Merchant Map": ["Merchant", "Category", "Card"],
         "Restaurants": ["Name", "Location", "Country", "Tags", "Notes"],
         "Portfolio": ["Stock", "Quantity", "Buy Price", "Buy Date", "Notes"],
+        "Trips": ["Trip ID", "Destination", "Currency", "Dep Flight", "Dep Time", "Return Flight", "Return Time", "Status", "Started", "Ended"],
+        "Reminders": ["ID", "Message", "Scheduled Time", "Recurrence", "Status", "Attempts", "Contact"],
         "Settings": ["Key", "Value"]
     }
 
@@ -105,6 +122,21 @@ def setup_sheets():
             ws = spreadsheet.add_worksheet(title=tab_name, rows=500, cols=len(headers))
             ws.append_row(headers)
             print(f"Created tab: {tab_name}")
+
+    # Cards sheet — always overwrite with new schema and initial cards
+    try:
+        existing_tabs = [ws.title for ws in spreadsheet.worksheets()]
+        if "Cards" not in existing_tabs:
+            cards_ws = spreadsheet.add_worksheet(title="Cards", rows=100, cols=4)
+        else:
+            cards_ws = spreadsheet.worksheet("Cards")
+        cards_ws.clear()
+        cards_ws.append_row(CARDS_SCHEMA)
+        for card_row in INITIAL_CARDS:
+            cards_ws.append_row(card_row)
+        print("✅ Cards sheet initialised with new schema")
+    except Exception as e:
+        print(f"Cards sheet setup error: {e}")
 
     print("✅ Sheets setup complete")
 
@@ -274,10 +306,91 @@ def run_infrastructure_setup():
     """Run all setup steps on startup. Idempotent — safe to run every time."""
     global DRIVE_FOLDERS
     print("Running infrastructure setup...")
-    setup_sheets()
-    DRIVE_FOLDERS = setup_drive()
-    setup_em_profile()
+
+    health = {
+        "Sheets": "✅ Connected",
+        "Drive": "✅ Connected",
+        "iCloud": "✅ Connected",
+        "Scheduler": "✅ Running",
+        "Profile": "✅ Loaded",
+    }
+
+    # Sheets
+    try:
+        setup_sheets()
+    except Exception as e:
+        health["Sheets"] = f"❌ Failed — {str(e)[:40]}"
+        print(f"setup_sheets error: {e}")
+
+    # Drive
+    try:
+        DRIVE_FOLDERS = setup_drive()
+    except Exception as e:
+        health["Drive"] = "❌ Failed — receipt uploads won't work"
+        DRIVE_FOLDERS = {}
+        print(f"setup_drive error: {e}")
+
+    # Profile — attempt with retry
+    try:
+        setup_em_profile()
+        if not em_profile:
+            raise Exception("Profile empty after load")
+    except Exception:
+        import time as _time
+        _time.sleep(5)
+        try:
+            setup_em_profile()
+            if not em_profile:
+                raise Exception("Profile empty after retry")
+        except Exception as e2:
+            health["Profile"] = "❌ Failed — running on defaults"
+            print(f"em_profile load failed after retry: {e2}")
+
+    # iCloud — tested lazily on first use, mark unknown here
+    health["iCloud"] = "⚠️ Not tested yet"
+
     print("✅ Infrastructure setup complete")
+    return health
+
+async def send_startup_message(app, health):
+    """Send startup health check if this is a new Railway deployment."""
+    try:
+        settings_ws = spreadsheet.worksheet("Settings")
+        records = settings_ws.get_all_records()
+        last_deploy_id = ""
+        last_deploy_row = None
+        for i, r in enumerate(records, start=2):
+            if r.get("Key") == "last_deployment_id":
+                last_deploy_id = r.get("Value", "")
+                last_deploy_row = i
+                break
+
+        # Only send if deployment ID changed
+        if RAILWAY_DEPLOYMENT_ID and RAILWAY_DEPLOYMENT_ID == last_deploy_id:
+            return  # Same deployment restart — silent
+
+        # New deploy — update stored ID
+        if RAILWAY_DEPLOYMENT_ID:
+            if last_deploy_row:
+                settings_ws.update_cell(last_deploy_row, 2, RAILWAY_DEPLOYMENT_ID)
+            else:
+                settings_ws.append_row(["last_deployment_id", RAILWAY_DEPLOYMENT_ID])
+
+        # Build status message
+        all_ok = all("✅" in v for k, v in health.items() if k != "iCloud")
+        icon = "✅" if all_ok else "⚠️"
+        lines = [f"Em is online {icon}"]
+        for k, v in health.items():
+            lines.append(f"{k}: {v}")
+
+        # Flag profile failure with reload command
+        if "❌" in health.get("Profile", ""):
+            lines.append("\nReply 'reload profile' to retry loading preferences.")
+
+        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text="\n".join(lines))
+
+    except Exception as e:
+        print(f"send_startup_message error: {e}")
 
 # --- Sheet References (after setup) ---
 def get_sheet(name):
@@ -299,9 +412,59 @@ client = Anthropic(api_key=ANTHROPIC_API_KEY)
 conversation_histories = {}
 edit_sessions = {}
 
-# --- iCloud Calendar Setup ---
+def track_anthropic_call(success):
+    """Track Anthropic API call success/failure for downtime detection."""
+    global _anthropic_failure_count, _anthropic_down_notified
+    if success:
+        if _anthropic_down_notified:
+            _anthropic_down_notified = False
+            # Recovery will be notified by the next scheduled check
+        _anthropic_failure_count = 0
+    else:
+        _anthropic_failure_count += 1
+
+async def notify_anthropic_down(app):
+    """Send Anthropic API down notification if threshold reached."""
+    global _anthropic_down_notified
+    if _anthropic_failure_count >= ANTHROPIC_FAILURE_THRESHOLD and not _anthropic_down_notified:
+        _anthropic_down_notified = True
+        try:
+            await app.bot.send_message(
+                chat_id=YOUR_CHAT_ID,
+                text=(
+                    "⚠️ Anthropic API appears to be down — some features unavailable:\n"
+                    "• Receipt vision parsing\n"
+                    "• Expense text parsing\n"
+                    "• Birthday greetings\n"
+                    "• Reminder parsing\n"
+                    "• Market narrative\n\n"
+                    "I'll notify you when it recovers."
+                )
+            )
+        except Exception as e:
+            print(f"notify_anthropic_down error: {e}")
+
+def sheets_call_with_retry(fn, *args, max_retries=2, **kwargs):
+    """Wrap a Google Sheets API call with quota retry logic."""
+    import time as _time
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            err_str = str(e).lower()
+            if "quota" in err_str or "rate" in err_str or "429" in err_str:
+                print(f"Sheets quota hit — retrying in 60s (attempt {attempt+1})")
+                _time.sleep(60)
+            else:
+                raise
+    raise Exception("Google Sheets rate limit — retrying automatically in 60s.")
+
+
 def get_calendar(name=None):
-    try:
+    global _icloud_down
+    import time as _time
+
+    def _attempt():
         caldav_client = caldav.DAVClient(
             url="https://caldav.icloud.com",
             username=ICLOUD_USERNAME,
@@ -315,8 +478,48 @@ def get_calendar(name=None):
                     return cal
             return None
         return calendars[0] if calendars else None
+
+    # Attempt 1
+    try:
+        result = _attempt()
+        _icloud_down = False
+        return result
+    except Exception:
+        pass
+
+    # Retry after 3 seconds
+    _time.sleep(3)
+    try:
+        result = _attempt()
+        _icloud_down = False
+        return result
     except Exception as e:
+        _icloud_down = True
+        print(f"iCloud Calendar unavailable after retry: {e}")
         return None
+
+async def check_icloud_daily(app):
+    """Daily check — notify if iCloud Calendar still down."""
+    global _icloud_down, _icloud_last_notified
+    today = date.today()
+    if _icloud_down:
+        if _icloud_last_notified != today:
+            _icloud_last_notified = today
+            await app.bot.send_message(
+                chat_id=YOUR_CHAT_ID,
+                text="⚠️ iCloud Calendar still unavailable — calendar features won't work.\nCheck your credentials in Railway."
+            )
+    else:
+        # Test connection
+        cal = get_calendar()
+        if cal is None and _icloud_last_notified != today:
+            _icloud_last_notified = today
+            await app.bot.send_message(
+                chat_id=YOUR_CHAT_ID,
+                text="⚠️ iCloud Calendar unavailable — calendar features won't work.\nCheck your credentials in Railway."
+            )
+
+
 
 # --- Helpers ---
 def format_date(date_str):
@@ -395,7 +598,8 @@ def format_contact(r, show_private=False):
     return "\n".join(lines)
 
 def find_row(name):
-    """Search Name first, then Alias, then first-name match. Returns (row_num, record) for best single match."""
+    """Search Name first, then Alias, then first-name match.
+    Returns (row_num, record) for single match, or ('disambig', message) for multiple."""
     sheet = crm_sheet()
     records = sheet.get_all_records()
     name_lower = name.strip().lower()
@@ -418,7 +622,7 @@ def find_row(name):
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
-        return matches[0]  # Caller should use find_all_rows for disambiguation
+        return "disambig", disambiguate_contacts(matches)
 
     # 4. Substring match on Alias
     alias_matches = []
@@ -428,7 +632,7 @@ def find_row(name):
     if len(alias_matches) == 1:
         return alias_matches[0]
     if len(alias_matches) > 1:
-        return alias_matches[0]
+        return "disambig", disambiguate_contacts(alias_matches)
 
     # 5. First-name match across Name and Alias
     first_matches = []
@@ -439,8 +643,10 @@ def find_row(name):
         alias_first = alias.split()[0].lower() if alias else ""
         if name_lower == first_name or name_lower == alias_first:
             first_matches.append((i + 2, r))
-    if first_matches:
+    if len(first_matches) == 1:
         return first_matches[0]
+    if len(first_matches) > 1:
+        return "disambig", disambiguate_contacts(first_matches)
 
     return None, None
 
@@ -468,7 +674,11 @@ def disambiguate_contacts(matches):
     return f"Did you mean {options}?"
 
 # --- CRM Functions ---
-def save_contact(data):
+# Pending duplicate contact saves: { user_id: { "data": str, "existing_name": str } }
+pending_contact_saves = {}
+pending_restaurant_saves = {}  # { user_id: { "name": str, "location": str, ... } }
+
+def save_contact(data, force_new=False):
     try:
         sheet = crm_sheet()
         parts = [p.strip() for p in data.split(",")]
@@ -485,6 +695,13 @@ def save_contact(data):
         last_updated = date.today().strftime("%d/%m/%Y")
         if not name:
             return "❌ Name is required"
+
+        # Duplicate check unless force_new
+        if not force_new:
+            existing_row, existing_record = find_row(name)
+            if existing_record and existing_row != "disambig":
+                return f"_DUPLICATE_:{name}"  # Signal to caller to handle
+
         sheet.append_row([
             name, alias, birthday, relationship, context, notes,
             followup_date, followup_notes, last_updated, "", "", "", "", ""
@@ -985,13 +1202,44 @@ def complete_todo(task):
     try:
         sheet = todo_sheet()
         records = sheet.get_all_records()
-        for i, r in enumerate(records):
-            if task.lower() in r.get("Task", "").lower() and r.get("Status") == "Pending":
-                sheet.update_cell(i + 2, 2, "Done")
-                return f"✅ Marked as done: _{r.get('Task')}_"
-        return f"❌ No pending task found matching '{task}'"
+        matches = [
+            (i + 2, r) for i, r in enumerate(records)
+            if task.lower() in r.get("Task", "").lower() and r.get("Status") == "Pending"
+        ]
+        if not matches:
+            return f"❌ No pending task found matching '{task}'"
+        if len(matches) > 1:
+            lines = [f"Found {len(matches)} matching tasks — which one?"]
+            for i, (_, r) in enumerate(matches, 1):
+                lines.append(f"{i}. {r.get('Task')}")
+            lines.append("\nReply with the number.")
+            return "_DISAMBIG_TODO_COMPLETE_:" + "|".join(r.get("Task", "") for _, r in matches)
+        row_idx, r = matches[0]
+        sheet.update_cell(row_idx, 2, "Done")
+        return f"✅ Marked as done: _{r.get('Task')}_"
     except Exception as e:
         return f"❌ Error completing task: {str(e)}"
+
+def delete_todo(task):
+    """Delete a todo by task name, with disambiguation if multiple match."""
+    try:
+        sheet = todo_sheet()
+        records = sheet.get_all_records()
+        matches = [
+            (i + 2, r) for i, r in enumerate(records)
+            if task.lower() in r.get("Task", "").lower()
+        ]
+        if not matches:
+            return f"❌ No task found matching '{task}'"
+        if len(matches) > 1:
+            return "_DISAMBIG_TODO_DELETE_:" + "|".join(r.get("Task", "") for _, r in matches)
+        row_idx, r = matches[0]
+        sheet.delete_rows(row_idx)
+        return f"Deleted — {r.get('Task')} ✅"
+    except Exception as e:
+        return f"❌ Error deleting task: {str(e)}"
+
+
 
 def list_todos():
     try:
@@ -1193,9 +1441,11 @@ Rules:
         )
 
     except json.JSONDecodeError:
-        return "❌ Couldn't parse the event details. Try something like: schedule dinner with James tomorrow 7pm"
+        return "⚠️ Couldn't parse that — what are the event details?\n(e.g. Team Offsite, 30 Apr 2026, 2pm)"
     except Exception as e:
-        return f"❌ Error creating event: {str(e)}"
+        if "iCloud" in str(e) or "caldav" in str(e).lower() or "calendar" in str(e).lower():
+            return "⚠️ Couldn't connect to iCloud Calendar — check credentials in Railway."
+        return "⚠️ Couldn't parse that — what are the event details?\n(e.g. Team Offsite, 30 Apr 2026, 2pm)"
 
 # --- Edit Session Handler ---
 async def handle_edit_session(user_id, text, update):
@@ -1230,26 +1480,47 @@ async def handle_edit_session(user_id, text, update):
         await update.message.reply_text(result, parse_mode="Markdown")
 
 # --- Scheduled Reminders ---
+DATE_FORMATS = ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y", "%d %B %Y"]
+
+def parse_date_flexible(date_str):
+    """Try multiple date formats. Returns date object or None."""
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(date_str.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
 async def send_followup_reminders(app):
     try:
         sheet = crm_sheet()
         records = sheet.get_all_records()
         today = date.today()
-        for r in records:
-            fu_date = r.get("Follow Up Date", "")
-            if fu_date:
-                try:
-                    fu = datetime.strptime(fu_date, "%d/%m/%Y").date()
-                    if fu == today:
-                        message = (
-                            f"🔔 *Follow up reminder!*\n\n"
-                            f"👤 *{r.get('Name')}*\n"
-                            f"📝 {r.get('Follow Up Notes') or 'No notes'}\n\n"
-                            f"Don't forget to reach out today!"
-                        )
-                        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=message, parse_mode="Markdown")
-                except Exception as e:
-                    print(f"send_followup_reminders error for {r.get('Name','?')}: {e}")
+        for i, r in enumerate(records, start=2):
+            fu_date_str = r.get("Follow Up Date", "")
+            if not fu_date_str:
+                continue
+            fu_date = parse_date_flexible(fu_date_str)
+            if fu_date is None:
+                # Unrecognised format — ask for correct date
+                await app.bot.send_message(
+                    chat_id=YOUR_CHAT_ID,
+                    text=(
+                        f"⚠️ Couldn't read the follow-up date for *{r.get('Name', '?')}*.\n"
+                        f"What's the correct date? (e.g. 25 Apr 2026)\n"
+                        f"Reply: followup date {r.get('Name', '')} [date]"
+                    ),
+                    parse_mode="Markdown"
+                )
+                continue
+            if fu_date == today:
+                message = (
+                    f"🔔 *Follow up reminder!*\n\n"
+                    f"👤 *{r.get('Name')}*\n"
+                    f"📝 {r.get('Follow Up Notes') or 'No notes'}\n\n"
+                    f"Don't forget to reach out today!"
+                )
+                await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=message, parse_mode="Markdown")
     except Exception as e:
         print(f"Error sending follow up reminders: {e}")
 
@@ -1282,12 +1553,16 @@ def generate_birthday_greeting(name, age, relationship, context, notes):
         f"- 2 to 4 sentences max\n"
         f"- Write it in first person, ready to copy and send"
     )
-    resp = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=200,
-        messages=[{"role": "user", "content": greeting_prompt}]
-    )
-    return resp.content[0].text.strip()
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=200,
+            messages=[{"role": "user", "content": greeting_prompt}]
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        print(f"generate_birthday_greeting Claude error for {name}: {e}")
+        return f"Happy birthday {name}! Hope you have a wonderful day ahead."
 
 async def send_birthday_reminders(app):
     """12pm job: find today birthdays, generate greeting, send prompt."""
@@ -1323,7 +1598,8 @@ async def send_birthday_reminders(app):
                 msg = (
                     f"It's {name}'s birthday today! Turning {age}. 🎂\n\n"
                     f"Here's a message you can send:\n\n"
-                    f"{greeting}"
+                    f"{greeting}\n\n"
+                    f"Reply 'sent' when you've wished them, or 'skip' to dismiss."
                 )
                 await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
 
@@ -1370,27 +1646,42 @@ def mark_birthday_greeted(name):
         if not col:
             return
         row_num, record = find_row(name)
-        if record:
+        if record and row_num != "disambig":
             sheet = crm_sheet()
             sheet.update_cell(row_num, col, date.today().strftime("%d/%m/%Y"))
     except Exception as e:
         print(f"Error marking birthday greeted for {name}: {e}")
 
-def check_birthday_acknowledgement():
+def check_birthday_acknowledgement(text):
     """
-    If birthday greetings are pending, mark them all as acknowledged.
-    Called on any incoming message. Returns True if any were acknowledged.
+    Check if user explicitly said 'sent' or 'skip' for a pending birthday.
+    Must be called with the user's message text.
+    Returns (True, reply_message) if handled, (False, None) otherwise.
     """
     global birthday_pending
     if not birthday_pending:
-        return False
+        return False, None
+
+    lower = text.strip().lower()
+    if lower not in ["sent", "done", "skip", "skipped", "sent it", "sent!"]:
+        return False, None
+
     acknowledged = []
-    for name, data in birthday_pending.items():
+    for name, data in list(birthday_pending.items()):
         if not data.get("greeted"):
-            data["greeted"] = True
-            mark_birthday_greeted(name)
-            acknowledged.append(name)
-    return len(acknowledged) > 0
+            if lower in ["skip", "skipped"]:
+                data["greeted"] = True
+                acknowledged.append(f"Skipped {name}")
+            else:
+                data["greeted"] = True
+                mark_birthday_greeted(name)
+                acknowledged.append(f"Marked {name} as greeted ✅")
+
+    if acknowledged:
+        return True, "\n".join(acknowledged)
+    return False, None
+
+
 
 
 
@@ -1498,8 +1789,44 @@ def format_recap_confirmation(recap):
     lines.append("Reply Y to save or E to edit.")
     return "\n".join(lines)
 
+def process_meeting_notes(event_name, notes_list):
+    """Send all buffered notes to Claude and get a structured recap back as JSON.
+    Falls back to saving raw notes if Claude call fails."""
+    combined = "\n".join(notes_list)
+    prompt = (
+        f"You are processing meeting notes for an event called: {event_name or 'unknown event'}\n\n"
+        f"Here are the raw notes:\n{combined}\n\n"
+        f"Extract and return a JSON object with these fields:\n"
+        f"- event_name: string (use the provided event name, or infer if not given)\n"
+        f"- topic: string (1 line summary of what the meeting/event was about)\n"
+        f"- summary: string (2-4 sentences capturing key points, insights, context)\n"
+        f"- action_items: list of strings (only include if there are clear action items, otherwise empty list)\n"
+        f"- contacts_mentioned: list of strings (names of people mentioned)\n"
+        f"- foreign_phrases: dict (any non-English phrases found, key=original, value=English translation)\n\n"
+        f"Return ONLY the JSON object, no markdown, no preamble."
+    )
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(raw), False  # (recap, is_raw)
+    except Exception as e:
+        print(f"process_meeting_notes Claude error: {e}")
+        # Return raw notes as fallback
+        return {
+            "event_name": event_name or "Untitled",
+            "topic": "Raw notes — processing failed",
+            "summary": combined,
+            "action_items": [],
+            "contacts_mentioned": [],
+            "foreign_phrases": {}
+        }, True  # (recap, is_raw)
+
 def save_meeting_recap(recap):
-    """Save the confirmed recap to the Meeting Notes sheet."""
+    """Save the confirmed recap to the Meeting Notes sheet. Returns (success, error_msg)."""
     try:
         sheet = spreadsheet.worksheet("Meeting Notes")
         today = date.today().strftime("%d/%m/%Y")
@@ -1511,16 +1838,20 @@ def save_meeting_recap(recap):
             action_items_str,
             today
         ])
-        return True
+        return True, None
     except Exception as e:
         print(f"Error saving meeting recap: {e}")
-        return False
+        return False, str(e)
 
 def search_meeting_notes(query):
     """Search meeting notes by keyword or date range."""
     try:
         sheet = spreadsheet.worksheet("Meeting Notes")
-        records = sheet.get_all_records()
+        try:
+            records = sheet.get_all_records()
+        except Exception as e:
+            return f"⚠️ Couldn't search meeting notes right now — try again in a moment."
+
         if not records:
             return "No meeting notes saved yet."
 
@@ -1532,7 +1863,7 @@ def search_meeting_notes(query):
                 results.append(r)
 
         if not results:
-            return f"No meeting notes found for '{query}'."
+            return f"No meeting notes found matching '{query}'."
 
         lines = [f"Found {len(results)} recap(s):\n"]
         for r in results:
@@ -1541,7 +1872,7 @@ def search_meeting_notes(query):
             lines.append("")
         return "\n".join(lines)
     except Exception as e:
-        return f"Error searching meeting notes: {str(e)}"
+        return "⚠️ Couldn't search meeting notes right now — try again in a moment."
 
 async def handle_meeting_session(user_id, text, update):
     """Handle messages when user is in an active meeting recap session."""
@@ -1551,18 +1882,24 @@ async def handle_meeting_session(user_id, text, update):
     # Confirming step — waiting for Y or E
     if step == "confirming":
         if text.strip().upper() == "Y":
-            saved = save_meeting_recap(session["pending_recap"])
-            # Tag CRM contacts
+            saved, err = save_meeting_recap(session["pending_recap"])
             contacts = session["pending_recap"].get("contacts_mentioned", [])
             for name in contacts:
                 row_num, record = find_row(name)
-                if record:
+                if record and row_num != "disambig":
                     pass  # silently tagged via presence in recap
             del meeting_sessions[user_id]
+            session_timestamps.pop(user_id, None)
             if saved:
                 await update.message.reply_text("Saved! 📋")
             else:
-                await update.message.reply_text("Something went wrong saving the recap. Try again.")
+                await update.message.reply_text(
+                    f"⚠️ Couldn't save recap to sheet — keeping it in memory.\n"
+                    f"Reply 'retry save' to try again or 'send recap' to have me send it as a message."
+                )
+                # Keep session alive with saved recap for retry
+                meeting_sessions[user_id] = {**session, "step": "save_failed"}
+                touch_session(user_id)
 
         elif text.strip().upper() == "E":
             session["step"] = "collecting"
@@ -1570,9 +1907,26 @@ async def handle_meeting_session(user_id, text, update):
             await update.message.reply_text(
                 "No worries, let's redo it. Send your notes again and say done when you're finished."
             )
-
         else:
             await update.message.reply_text("Reply Y to save or E to start over.")
+        return
+
+    if step == "save_failed":
+        lower_t = text.strip().lower()
+        if lower_t == "retry save":
+            saved, err = save_meeting_recap(session["pending_recap"])
+            if saved:
+                del meeting_sessions[user_id]
+                session_timestamps.pop(user_id, None)
+                await update.message.reply_text("Saved! 📋")
+            else:
+                await update.message.reply_text("Still couldn't save — try again in a moment.")
+        elif lower_t == "send recap":
+            recap = session["pending_recap"]
+            msg = format_recap_confirmation(recap).replace("\nReply Y to save or E to edit.", "")
+            del meeting_sessions[user_id]
+            session_timestamps.pop(user_id, None)
+            await update.message.reply_text(msg)
         return
 
     # Get event name step
@@ -1593,9 +1947,15 @@ async def handle_meeting_session(user_id, text, update):
         await update.message.reply_text("On it, give me a sec...")
 
         try:
-            recap = process_meeting_notes(session.get("event_name", ""), session["notes"])
+            recap, is_raw = process_meeting_notes(session.get("event_name", ""), session["notes"])
             session["pending_recap"] = recap
             session["step"] = "confirming"
+            touch_session(user_id)
+            if is_raw:
+                await update.message.reply_text(
+                    "⚠️ Took too long to process — saved your raw notes.\n"
+                    "Reply 'retry recap' to process them when ready, or Y to save as-is."
+                )
             confirmation = format_recap_confirmation(recap)
             await update.message.reply_text(confirmation)
         except Exception as e:
@@ -1632,7 +1992,7 @@ def generate_reminder_id():
     return datetime.now().strftime("%Y%m%d%H%M%S")
 
 def parse_reminder_request(text):
-    """Use Claude to parse a natural language reminder request."""
+    """Use Claude to parse a natural language reminder request. Falls back to manual input prompt."""
     now = datetime.now(TIMEZONE)
     prompt = (
         f"Today is {now.strftime('%A, %d %b %Y')} and the time is {now.strftime('%H:%M')} (Asia/Kuala_Lumpur).\n\n"
@@ -1650,13 +2010,17 @@ def parse_reminder_request(text):
         f"- For recurring reminders, scheduled_time is the FIRST occurrence\n"
         f"- Return ONLY the JSON, no markdown, no explanation"
     )
-    resp = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(raw)
+    except Exception as e:
+        print(f"parse_reminder_request error: {e}")
+        return None  # Caller handles None by prompting manual input
 
 def parse_reschedule_request(text, original_message):
     """Parse a follow-up reschedule like 'remind me again in 2 hours'."""
@@ -1694,15 +2058,22 @@ def add_reminder(message, scheduled_time_str, recurrence="once", contact=""):
     return reminder_id
 
 def cancel_reminder_by_keyword(keyword):
-    """Cancel reminders matching a keyword."""
+    """Cancel reminders matching a keyword. Returns list of cancelled, or '_DISAMBIG_:' prefix if multiple."""
     sheet = reminders_sheet()
     records = sheet.get_all_records()
-    cancelled = []
-    for i, r in enumerate(records):
-        if keyword.lower() in r.get("Message", "").lower() and r.get("Status") == "pending":
-            sheet.update_cell(i + 2, 5, "cancelled")
-            cancelled.append(r.get("Message", ""))
-    return cancelled
+    matches = [
+        (i + 2, r) for i, r in enumerate(records)
+        if keyword.lower() in r.get("Message", "").lower() and r.get("Status") == "pending"
+    ]
+    if not matches:
+        return []
+    if len(matches) > 1:
+        # Return signal for disambiguation
+        return ["_DISAMBIG_:" + "|".join(f"{row}:{r.get('Message','')} — {r.get('Scheduled Time','')}"
+                                          for row, r in matches)]
+    row_idx, r = matches[0]
+    sheet.update_cell(row_idx, 5, "cancelled")
+    return [r.get("Message", "")]
 
 def list_reminders():
     """List all pending reminders."""
@@ -1741,16 +2112,14 @@ def get_next_recurrence(scheduled_time_str, recurrence):
         return None
 
 async def check_and_fire_reminders(app):
-    """Check sheet every minute and fire due reminders."""
+    """Check sheet every minute and fire due reminders. Only reads pending rows."""
     try:
         sheet = reminders_sheet()
         records = sheet.get_all_records()
         now = datetime.now(TIMEZONE).replace(second=0, microsecond=0)
+        pending_records = [(i, r) for i, r in enumerate(records) if r.get("Status") == "pending"]
 
-        for i, r in enumerate(records):
-            if r.get("Status") != "pending":
-                continue
-
+        for i, r in pending_records:
             scheduled_str = r.get("Scheduled Time", "")
             if not scheduled_str:
                 continue
@@ -1837,23 +2206,25 @@ def handle_new_reminder(text):
     """Parse and save a new reminder. Returns confirmation string."""
     try:
         parsed = parse_reminder_request(text)
+        if parsed is None:
+            return "⚠️ Couldn't parse that — what are the reminder details?\n(e.g. Call John, 30 Apr 2026, 9am)"
+
         message = parsed.get("message", text)
         scheduled_time = parsed.get("scheduled_time", "")
         recurrence = parsed.get("recurrence", "once")
         contact = parsed.get("contact", "")
 
         if not scheduled_time:
-            return "Couldn't figure out when to remind you. Try something like 'remind me to call James tomorrow at 3pm'."
+            return "Couldn't figure out when to remind you. Try: 'remind me to call James tomorrow at 3pm'."
 
         # Validate contact against CRM
         if contact:
-            _, record = find_row(contact)
-            if not record:
-                contact = ""  # contact not in CRM, ignore
+            row, record = find_row(contact)
+            if not record or row == "disambig":
+                contact = ""
 
         add_reminder(message, scheduled_time, recurrence, contact)
 
-        # Format confirmation
         try:
             dt = datetime.strptime(scheduled_time, "%Y-%m-%d %H:%M")
             time_str = dt.strftime("%d %b %Y at %I:%M %p")
@@ -1865,7 +2236,7 @@ def handle_new_reminder(text):
         return f"Done, I'll remind you to {message} on {time_str}{rec_str}."
 
     except Exception as e:
-        return f"Couldn't parse that reminder: {str(e)}. Try: 'remind me to call James tomorrow at 3pm'."
+        return f"⚠️ Couldn't parse that — what are the reminder details?\n(e.g. Call John, 30 Apr 2026, 9am)"
 
 def handle_reschedule(text, user_id):
     """Reschedule the last fired reminder."""
@@ -1907,7 +2278,122 @@ def handle_reschedule(text, user_id):
 # =============================================================================
 
 EXPENSE_CATEGORIES = ["FnB", "Entertainment", "Personal", "Family", "Work", "Transport", "Shopping", "Travel"]
-EXPENSE_CARDS = ["Citi", "Maybank", "Amex", "UOB"]
+EXPENSE_CARDS = ["Citi", "Maybank", "Amex", "UOB"]  # fallback only — live list read from Cards sheet
+
+# Cards sheet new schema: Card Name | Last 4 | Default Category | Notes
+CARDS_SCHEMA = ["Card Name", "Last 4", "Default Category", "Notes"]
+INITIAL_CARDS = [
+    ["Maybank", "4002", "FnB", ""],
+    ["Citi", "1176", "General", ""],
+    ["UOB", "5372", "", ""],
+    ["Amex", "1008", "", ""],
+]
+
+def cards_sheet():
+    return spreadsheet.worksheet("Cards")
+
+def get_cards_live():
+    """Read card list live from Cards sheet. Returns list of dicts."""
+    try:
+        ws = cards_sheet()
+        records = ws.get_all_records()
+        return records
+    except Exception as e:
+        print(f"get_cards_live error: {e}")
+        return []
+
+def get_card_names_live():
+    """Return list of card names from Cards sheet."""
+    cards = get_cards_live()
+    names = [c.get("Card Name", "") for c in cards if c.get("Card Name")]
+    return names if names else EXPENSE_CARDS
+
+def get_card_default_for_category(category):
+    """Return default card name for a given category from Cards sheet."""
+    try:
+        cards = get_cards_live()
+        for c in cards:
+            default_cat = c.get("Default Category", "").strip().lower()
+            if default_cat and default_cat == category.strip().lower():
+                return c.get("Card Name", "")
+        # Fallback defaults
+        cat_lower = category.strip().lower()
+        if cat_lower in ["fnb", "food", "dining", "f&b"]:
+            return "Maybank"
+        if cat_lower in ["grab", "transport"]:
+            return "Amex"
+        return "Citi"
+    except Exception as e:
+        print(f"get_card_default_for_category error: {e}")
+        return "Citi"
+
+def get_card_by_last4(last4):
+    """Match a card by last 4 digits. Returns card name or None."""
+    try:
+        cards = get_cards_live()
+        for c in cards:
+            if str(c.get("Last 4", "")).strip() == str(last4).strip():
+                return c.get("Card Name", "")
+    except Exception as e:
+        print(f"get_card_by_last4 error: {e}")
+    return None
+
+def set_card_default_category(card_name, category):
+    """Update default category for a card in Cards sheet."""
+    try:
+        ws = cards_sheet()
+        records = ws.get_all_records()
+        for i, r in enumerate(records, start=2):
+            if r.get("Card Name", "").lower() == card_name.lower():
+                # Default Category is col 3
+                ws.update_cell(i, 3, category)
+                return f"Updated — {card_name} will now default to {category} ✅"
+        return f"Card '{card_name}' not found. Your cards: {', '.join(get_card_names_live())}"
+    except Exception as e:
+        return f"Couldn't update card default: {str(e)}"
+
+def fuzzy_match_card(text):
+    """Fuzzy match text against card names. Returns (matched_name, exact) or (None, False)."""
+    cards = get_card_names_live()
+    text_lower = text.strip().lower()
+    # Exact match
+    for c in cards:
+        if c.lower() == text_lower:
+            return c, True
+    # Substring match
+    for c in cards:
+        if text_lower in c.lower() or c.lower() in text_lower:
+            return c, True
+    # First 3 chars match
+    for c in cards:
+        if len(text_lower) >= 3 and c.lower().startswith(text_lower[:3]):
+            return c, False
+    return None, False
+
+def fuzzy_match_category(text):
+    """Fuzzy match text against expense categories. Returns (matched, exact) or (None, False)."""
+    text_lower = text.strip().lower()
+    # Exact match
+    for c in EXPENSE_CATEGORIES:
+        if c.lower() == text_lower:
+            return c, True
+    # Synonym map
+    synonyms = {
+        "food": "FnB", "dining": "FnB", "restaurant": "FnB", "eat": "FnB", "f&b": "FnB",
+        "fun": "Entertainment", "movie": "Entertainment", "movies": "Entertainment",
+        "gym": "Personal", "health": "Personal",
+        "taxi": "Transport", "grab": "Transport", "uber": "Transport", "mrt": "Transport", "bus": "Transport",
+        "clothes": "Shopping", "shop": "Shopping",
+        "trip": "Travel", "holiday": "Travel", "flight": "Travel",
+        "office": "Work", "business": "Work",
+    }
+    if text_lower in synonyms:
+        return synonyms[text_lower], True
+    # Substring match
+    for c in EXPENSE_CATEGORIES:
+        if text_lower in c.lower() or c.lower() in text_lower:
+            return c, False
+    return None, False
 
 # Foreign transaction fee estimates per card (%)
 CARD_FX_FEES = {"Citi": 3.25, "Maybank": 3.0, "Amex": 3.0, "UOB": 3.25}
@@ -1934,24 +2420,103 @@ _app_ref = None
 # { user_id: { "merchant": str, "amount": float, "currency": str, "step": "category"|"card" } }
 expense_sessions = {}
 delete_sessions = {}
+portfolio_delete_sessions = {}  # { user_id: { "step": "pick", "rows": [...] } }
+confirm_sessions = {}  # { user_id: { "action": str, "args": list, "target": str } }
+receipt_confirm_sessions = {}  # { user_id: { "merchant": str, "amount": float, ... } }
+todo_disambig_sessions = {}  # { user_id: { "tasks": list, "action": str } }
+market_summary_pending = {}  # { user_id: True }
 
 # Reconciliation sessions — { user_id: { "step": str, "unmatched": [...], "index": int } }
 recon_sessions = {}
+
+SESSION_TIMEOUT_MINUTES = 5
+SESSION_TIMEOUT_MESSAGES = {
+    "expense": "Session timed out — nothing was logged. Start again when ready.",
+    "delete": "Session timed out — nothing was deleted.",
+    "portfolio_delete": "Session timed out — nothing was removed.",
+    "confirm": "Session timed out — nothing was changed.",
+    "receipt_confirm": "Session timed out — nothing was logged. Send the receipt again when ready.",
+    "edit": "Session timed out — nothing was changed.",
+    "meeting": "Meeting recap session timed out.",
+}
+
+def touch_session(user_id):
+    """Record current time for session timeout tracking."""
+    session_timestamps[user_id] = datetime.now(TIMEZONE)
+
+def is_session_expired(user_id):
+    """Return True if the session for user_id has exceeded SESSION_TIMEOUT_MINUTES."""
+    ts = session_timestamps.get(user_id)
+    if not ts:
+        return True
+    elapsed = (datetime.now(TIMEZONE) - ts).total_seconds() / 60
+    return elapsed > SESSION_TIMEOUT_MINUTES
+
+def clear_all_sessions(user_id):
+    """Clear all active sessions for a user."""
+    for d in [expense_sessions, delete_sessions, portfolio_delete_sessions,
+              confirm_sessions, receipt_confirm_sessions, recon_sessions,
+              edit_sessions, meeting_sessions, session_timestamps]:
+        d.pop(user_id, None)
+
+async def check_session_timeouts(user_id, update):
+    """Check all active sessions for timeout. Returns True if any session was expired and cleared."""
+    if not is_session_expired(user_id):
+        return False
+
+    expired = False
+    if user_id in expense_sessions:
+        await update.message.reply_text(SESSION_TIMEOUT_MESSAGES["expense"])
+        del expense_sessions[user_id]
+        expired = True
+    if user_id in delete_sessions:
+        await update.message.reply_text(SESSION_TIMEOUT_MESSAGES["delete"])
+        del delete_sessions[user_id]
+        expired = True
+    if user_id in portfolio_delete_sessions:
+        await update.message.reply_text(SESSION_TIMEOUT_MESSAGES["portfolio_delete"])
+        del portfolio_delete_sessions[user_id]
+        expired = True
+    if user_id in confirm_sessions:
+        await update.message.reply_text(SESSION_TIMEOUT_MESSAGES["confirm"])
+        del confirm_sessions[user_id]
+        expired = True
+    if user_id in receipt_confirm_sessions:
+        await update.message.reply_text(SESSION_TIMEOUT_MESSAGES["receipt_confirm"])
+        del receipt_confirm_sessions[user_id]
+        expired = True
+    if user_id in edit_sessions:
+        await update.message.reply_text(SESSION_TIMEOUT_MESSAGES["edit"])
+        del edit_sessions[user_id]
+        expired = True
+    if user_id in meeting_sessions:
+        await update.message.reply_text(SESSION_TIMEOUT_MESSAGES["meeting"])
+        del meeting_sessions[user_id]
+        expired = True
+
+    session_timestamps.pop(user_id, None)
+    return expired
+
+
 
 # Cached FX rates — { "JPY_SGD": { "rate": 0.0093, "fetched_at": datetime } }
 cached_fx_rates = {}
 
 def get_fx_rate(currency):
-    """Return SGD rate for given currency. Uses cache if under 12hrs, else fetches fresh."""
+    """Return SGD rate for given currency. Uses cache if under 12hrs, else fetches fresh.
+    Falls back to manual rate if API unavailable. No Claude estimate."""
     if currency == "SGD":
         return 1.0
     cache_key = f"{currency}_SGD"
+
+    # Check live cache
     cached = cached_fx_rates.get(cache_key)
     if cached:
         age = datetime.now(pytz.utc) - cached["fetched_at"]
         if age.total_seconds() < 43200:  # 12 hours
             return cached["rate"]
-    # Fetch fresh
+
+    # Fetch fresh from API
     if EXCHANGE_RATE_API_KEY:
         try:
             url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_RATE_API_KEY}/pair/{currency}/SGD"
@@ -1961,23 +2526,85 @@ def get_fx_rate(currency):
                 rate = float(data["conversion_rate"])
                 cached_fx_rates[cache_key] = {"rate": rate, "fetched_at": datetime.now(pytz.utc)}
                 print(f"FX cache updated: 1 {currency} = {rate} SGD")
+                # Clear manual rate if API is back
+                if currency in manual_fx_rates:
+                    del manual_fx_rates[currency]
                 return rate
         except Exception as e:
             print(f"FX fetch error for {currency}: {e}")
-    # Fallback to Claude estimate
+
+    # Check manual rate cache
+    manual = manual_fx_rates.get(currency)
+    if manual:
+        today_str = date.today().strftime("%Y-%m-%d")
+        if manual.get("date") == today_str:
+            return manual["rate"]
+        # Stale manual rate from previous day — reuse but notify
+        print(f"Using previous manual rate for {currency}: {manual['rate']}")
+        return manual["rate"]
+
+    # No rate available — return None to trigger manual input prompt
+    return None
+
+def save_manual_fx_rate(currency, rate, sgd_per_unit=True):
+    """Save a manually entered FX rate. sgd_per_unit=True means rate is how much SGD per 1 unit of currency."""
+    if not sgd_per_unit:
+        # User entered SGD to currency rate, e.g. $1 SGD = 110 JPY → 1 JPY = 1/110 SGD
+        rate = 1.0 / rate if rate else 0
+    manual_fx_rates[currency] = {
+        "rate": rate,
+        "date": date.today().strftime("%Y-%m-%d"),
+        "sgd_per_unit": sgd_per_unit
+    }
+    # Also update live cache
+    cached_fx_rates[f"{currency}_SGD"] = {"rate": rate, "fetched_at": datetime.now(pytz.utc)}
+    print(f"Manual FX rate saved: 1 {currency} = {rate} SGD")
+
+def parse_manual_fx_input(text, currency):
+    """Parse manual FX rate input. Supports two formats:
+    - '110' or '1 SGD = 110 JPY' → SGD to foreign (sgd_per_unit=False)
+    - '0.0093' or '1 JPY = 0.0093 SGD' → foreign to SGD (sgd_per_unit=True)
+    Returns (rate_as_sgd_per_unit, display_str) or (None, None)
+    """
     try:
-        resp = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=20,
-            messages=[{"role": "user", "content": f"What is the approximate exchange rate from {currency} to SGD today? Return ONLY a single number. No text."}]
-        )
-        rate = float(resp.content[0].text.strip())
-        cached_fx_rates[cache_key] = {"rate": rate, "fetched_at": datetime.now(pytz.utc)}
-        print(f"FX cache (Claude estimate): 1 {currency} = {rate} SGD")
-        return rate
+        text = text.strip().replace(",", "")
+        # Try to extract just a number
+        num_match = re.search(r"[\d.]+", text)
+        if not num_match:
+            return None, None
+        num = float(num_match.group())
+        if num <= 0:
+            return None, None
+
+        # Determine direction from context
+        text_lower = text.lower()
+        if "sgd" in text_lower and currency.lower() in text_lower:
+            # Check which side SGD is on
+            sgd_pos = text_lower.index("sgd")
+            curr_pos = text_lower.index(currency.lower()) if currency.lower() in text_lower else -1
+            if curr_pos > sgd_pos:
+                # SGD first → $1 SGD = N currency → rate per unit = 1/N
+                sgd_per_unit = False
+                display = f"$1 SGD = {num:.2f} {currency}"
+            else:
+                # Currency first → 1 currency = N SGD
+                sgd_per_unit = True
+                display = f"1 {currency} = ${num:.4f} SGD"
+        elif num > 10:
+            # Large number → likely SGD to foreign (e.g. 110 JPY per SGD)
+            sgd_per_unit = False
+            display = f"$1 SGD = {num:.2f} {currency}"
+        else:
+            # Small number → likely foreign to SGD (e.g. 0.0093 SGD per JPY)
+            sgd_per_unit = True
+            display = f"1 {currency} = ${num:.4f} SGD"
+
+        return (num, sgd_per_unit), display
     except Exception as e:
-        print(f"Claude FX estimate failed for {currency}: {e}")
-        return None
+        print(f"parse_manual_fx_input error: {e}")
+        return None, None
+
+
 
 async def refresh_fx_rates(app=None):
     """Refresh cached FX rates for all active overseas currencies. Called twice daily."""
@@ -2102,26 +2729,34 @@ def save_merchant_memory(merchant, category, card):
         print(f"Error saving merchant: {e}")
 
 def parse_expense_text(text):
-    """Use Claude to extract expense details from natural language."""
+    """Redirect to v2 which uses live category/card lists."""
+    return parse_expense_text_v2(text)
+def parse_expense_text_v2(text):
+    """Updated parse_expense_text using live category/card lists."""
     overseas_currency = overseas_state["currency"] if overseas_state["active"] else "SGD"
+    live_cats = ", ".join(EXPENSE_CATEGORIES)
+    live_cards = ", ".join(get_card_names_live())
     prompt = (
         f"Extract expense details from this message: '{text}'\n\n"
         f"Return ONLY a JSON object with:\n"
-        f"- merchant: string (brand name only — strip legal suffixes like Pte Ltd, Ltd, Inc, Sdn Bhd, Co., Corp, Restaurant, Cafe. "
-        f"  E.g. 'Starbucks Coffee Singapore Pte Ltd' -> 'Starbucks', 'McDonald's Restaurant' -> 'McDonald's')\n"
+        f"- merchant: string (brand name only, strip legal suffixes)\n"
         f"- amount: number (just the number, no currency symbol)\n"
         f"- currency: string (3-letter ISO code. If not mentioned, default to '{overseas_currency}')\n"
-        f"- category: string (one of: FnB, Entertainment, Personal, Family, Work, Transport, Shopping, Travel) or empty if unclear\n"
-        f"- card: string (one of: Citi, Maybank, Amex, UOB) or empty if not mentioned\n\n"
+        f"- category: string (one of: {live_cats}) or empty if unclear\n"
+        f"- card: string (one of: {live_cards}) or empty if not mentioned\n\n"
         f"Return ONLY the JSON."
     )
-    resp = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=200,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(raw)
+    except Exception as e:
+        print(f"parse_expense_text Claude error: {e}")
+        raise
 
 def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link="", reconciled="No", notes=""):
     """Append expense row to Expenses sheet."""
@@ -2132,20 +2767,66 @@ def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_
         category, card, receipt_link, reconciled, notes
     ])
 
-def format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount=None, receipt_saved=False):
-    """Format the expense confirmation message."""
+def format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount=None,
+                                receipt_saved=False, last4=None, high_amount=False,
+                                use_manual_rate=False, missing_fields=None):
+    """Format expense confirmation in hybrid format with new spec."""
     emoji = get_merchant_emoji(category, merchant)
     lines = [f"{emoji} {merchant}"]
+
+    # Amount line
     if currency != "SGD" and sgd_amount is not None:
-        lines.append(f"${sgd_amount:.2f} ({currency} {amount:,.0f})")
+        amount_str = f"${sgd_amount:.2f} ({amount:,.0f} {currency})"
     else:
-        lines.append(f"${amount:.2f}")
-    lines.append(f"🗂 {category} | 💳 {card}")
+        amount_str = f"${amount:.2f}" if amount else "⚠️ Amount?"
+
+    # Category
+    cat_str = f"⚠️ Category?" if not category else category
+
+    # Card
+    if not card:
+        card_str = "⚠️ Card?"
+    elif last4:
+        card_str = f"{card} (*{last4})"
+    else:
+        card_str = card
+
+    detail_line = f"{amount_str} | {cat_str} | {card_str}"
+    lines.append(detail_line)
+
+    # Flags
+    if high_amount:
+        lines.append("⚠️ Amount looks high — is this correct?")
+    if use_manual_rate:
+        lines.append("⚠️ Using manual rate — verify if needed")
     if receipt_saved:
-        lines.append("🧾 Receipt saved")
-    lines.append("")
-    lines.append("All good?")
+        lines.append("🧾 Receipt saved to Drive")
+
+    # Missing fields prompt
+    if missing_fields:
+        if len(missing_fields) >= 3:
+            prompt = "yes / enter missing values / skip"
+        elif len(missing_fields) == 2:
+            prompt = f"yes / enter {' & '.join(f.title() for f in missing_fields)} / skip"
+        else:
+            prompt = f"yes / enter {missing_fields[0].title()} / skip"
+        lines.append(f"\nLog this? ({prompt})")
+    else:
+        lines.append("\nLog this? (yes / skip)")
+
     return "\n".join(lines)
+
+def format_expense_logged(merchant, amount, currency, category, card, sgd_amount=None, last4=None):
+    """Format the logged confirmation (after yes or after edit)."""
+    emoji = get_merchant_emoji(category, merchant)
+    if currency != "SGD" and sgd_amount is not None:
+        amount_str = f"${sgd_amount:.2f} ({amount:,.0f} {currency})"
+    else:
+        amount_str = f"${amount:.2f}"
+    card_str = f"{card} (*{last4})" if last4 else card
+    return f"{emoji} {merchant}\n{amount_str} | {category} | {card_str}\n\nLogged ✅"
+
+
 
 def get_monthly_summary(month=None, year=None):
     """Generate monthly expense summary."""
@@ -2421,6 +3102,11 @@ def get_dest_info_from_iata(iata_code, airport_name):
 def deactivate_overseas_mode():
     """Deactivate overseas mode and clear scheduled jobs."""
     global overseas_state, _scheduler
+    # Close active trip in Trips sheet
+    try:
+        close_trip()
+    except Exception:
+        pass
     overseas_state["active"] = False
     overseas_state["destination"] = ""
     overseas_state["currency"] = "SGD"
@@ -2447,6 +3133,12 @@ async def activate_overseas_mode_scheduled(dest, curr, return_flight_data=None):
     overseas_state["currencies"] = [curr] if curr != "SGD" else []
     overseas_state["trip_start"] = date.today().strftime("%d/%m/%Y")
     overseas_state["trip_destinations"] = [dest]
+    # Persist trip to Trips sheet
+    ret_flight_num = return_flight_data.get("flight", "") if return_flight_data else ""
+    ret_time_str = return_flight_data.get("dep_time", "") if return_flight_data else ""
+    dep_flight = overseas_state.get("dep_flight", "")
+    dep_time = overseas_state.get("dep_time", "")
+    save_trip(dest, curr, dep_flight, dep_time, ret_flight_num, ret_time_str)
     msg = f"Overseas mode on ✈️\nDestination: {dest}\nCurrency: {curr}\nI'll log expenses in {curr} with SGD equivalent."
     if return_flight_data:
         ret_dep = format_flight_time(return_flight_data.get("dep_time", ""))
@@ -2622,103 +3314,307 @@ def handle_overseas_request(text):
     # No flight number — ask for details
     return "What\'s your departure date/time and destination? And when are you back in SG?"
 
-async def handle_expense_session(user_id, text, update):
-    """Handle multi-step expense onboarding — category, card, fx_rate confirmation."""
-    session = expense_sessions[user_id]
-    step = session.get("step")
+def parse_multi_field_edit(text, field_keywords=None):
+    """Parse a multi-field edit message like 'merchant Tsukemen Fuunji category Dining'.
+    Returns dict of {field: value}. Supports synonyms and quoted merchant names."""
+    if field_keywords is None:
+        field_keywords = {
+            "merchant": "merchant", "shop": "merchant", "store": "merchant", "place": "merchant",
+            "amount": "amount", "price": "amount", "total": "amount", "cost": "amount",
+            "currency": "currency",
+            "category": "category", "cat": "category",
+            "card": "card", "payment": "card", "pay": "card",
+        }
+    result = {}
+    # Handle quoted merchant names first
+    text = re.sub(r'"([^"]+)"', lambda m: m.group(0).replace(" ", "_SPACE_"), text)
+    tokens = text.strip().split()
+    i = 0
+    current_field = None
+    current_value_parts = []
 
-    if step == "fx_rate":
-        try:
-            rate = float(text.strip().replace(",", "."))
-            if rate <= 0:
-                raise ValueError("Rate must be positive")
-        except ValueError:
-            currency = session.get("currency", "")
-            await update.message.reply_text(
-                f"That doesn't look right. Enter a positive number — e.g. '0.0093' means 1 {currency} = 0.0093 SGD."
-            )
-            return
-        session["sgd_amount"] = round(session["amount"] * rate, 2)
-        session["step"] = "category" if not session.get("category") else "card" if not session.get("card") else "done"
-        if session["step"] == "done":
-            await _finalise_expense_session(user_id, update)
-            return
-        if session["step"] == "category":
-            await update.message.reply_text(f"Got it — SGD ${session['sgd_amount']:.2f}. What category?\n{', '.join(EXPENSE_CATEGORIES)}")
+    def flush():
+        if current_field and current_value_parts:
+            val = " ".join(current_value_parts).replace("_SPACE_", " ").strip('"')
+            result[current_field] = val
+
+    while i < len(tokens):
+        token_lower = tokens[i].lower()
+        if token_lower in field_keywords:
+            flush()
+            current_field = field_keywords[token_lower]
+            current_value_parts = []
+        elif current_field:
+            current_value_parts.append(tokens[i])
+        i += 1
+    flush()
+    return result
+
+async def handle_receipt_confirm_session(user_id, text, update):
+    """Handle receipt/expense confirm session: yes / skip / field edits / card name override."""
+    session = receipt_confirm_sessions.get(user_id)
+    if not session:
+        return False
+
+    touch_session(user_id)
+    lower = text.strip().lower()
+
+    # Cancel / skip
+    if lower in ["skip", "cancel", "no"]:
+        del receipt_confirm_sessions[user_id]
+        session_timestamps.pop(user_id, None)
+        receipt_link = session.get("receipt_link", "")
+        if receipt_link:
+            await update.message.reply_text(f"Skipped — receipt saved to Drive if you need it later.")
         else:
-            await update.message.reply_text(f"Which card?\n{', '.join(EXPENSE_CARDS)}")
-        return
+            await update.message.reply_text("Skipped.")
+        return True
 
-    if step == "confirm":
-        # User confirming uncertain fields
-        lower = text.strip().lower()
-        missing = session.get("missing_fields", [])
-        if missing:
-            field = missing[0]
-            if field == "category":
-                matched = next((c for c in EXPENSE_CATEGORIES if c.lower() == lower), None)
-                if not matched:
-                    await update.message.reply_text(f"Pick a category: {', '.join(EXPENSE_CATEGORIES)}")
-                    return
-                session["category"] = matched
-                missing.pop(0)
+    # FX rate input
+    if session.get("step") == "fx_rate":
+        currency = session.get("currency", "")
+        parsed_rate, display = parse_manual_fx_input(text, currency)
+        if parsed_rate is None:
+            await update.message.reply_text(
+                f"Couldn't read that rate. Try:\n"
+                f"• {currency} to SGD: e.g. 0.0093\n"
+                f"• SGD to {currency}: e.g. 110"
+            )
+            return True
+        num, sgd_per_unit = parsed_rate
+        save_manual_fx_rate(currency, num, sgd_per_unit)
+        rate = get_fx_rate(currency)
+        session["sgd_amount"] = round(session["amount"] * rate, 2)
+        session["step"] = "receipt_confirm"
+        session["use_manual_rate"] = True
+        receipt_confirm_sessions[user_id] = session
+        await update.message.reply_text(
+            f"Got it — using {display} for today.\n\n" +
+            format_expense_confirmation(
+                session["merchant"], session["amount"], session["currency"],
+                session.get("category", ""), session.get("card", ""),
+                session.get("sgd_amount"), receipt_saved=bool(session.get("receipt_link")),
+                last4=session.get("last4"), high_amount=session.get("high_amount", False),
+                use_manual_rate=True, missing_fields=session.get("missing_fields", [])
+            )
+        )
+        return True
+
+    # Duplicate confirm
+    if session.get("step") == "duplicate_confirm":
+        if lower in ["yes", "y"]:
+            session["step"] = "receipt_confirm"
+            receipt_confirm_sessions[user_id] = session
+            await update.message.reply_text(
+                format_expense_confirmation(
+                    session["merchant"], session["amount"], session["currency"],
+                    session.get("category", ""), session.get("card", ""),
+                    session.get("sgd_amount"), receipt_saved=bool(session.get("receipt_link")),
+                    last4=session.get("last4"), high_amount=session.get("high_amount", False),
+                    use_manual_rate=session.get("use_manual_rate", False),
+                    missing_fields=session.get("missing_fields", [])
+                )
+            )
+        else:
+            del receipt_confirm_sessions[user_id]
+            await update.message.reply_text("Skipped duplicate.")
+        return True
+
+    # Yes — log it
+    if lower in ["yes", "y"]:
+        await _finalise_receipt_confirm(user_id, session, update)
+        return True
+
+    # Check if it's a single card name override
+    card_match, _ = fuzzy_match_card(text.strip())
+    if card_match and len(text.strip().split()) == 1:
+        session["card"] = card_match
+        # Log immediately after card override
+        await _finalise_receipt_confirm(user_id, session, update)
+        return True
+
+    # Try multi-field edit
+    edits = parse_multi_field_edit(text)
+    if edits:
+        # Check for keyword-in-merchant-name ambiguity
+        merchant_val = edits.get("merchant", "")
+        field_keys = {"merchant", "amount", "currency", "category", "card", "price", "total", "cost", "shop", "store", "place", "payment", "pay", "cat"}
+        if merchant_val:
+            words = merchant_val.lower().split()
+            collision = [w for w in words if w in field_keys]
+            if collision and '"' not in text:
+                # Ambiguity detected — confirm with user using Option A
+                # Build what we parsed
+                lines = ["Just to confirm:"]
+                for f, v in edits.items():
+                    lines.append(f"{f.title()}: {v}")
+                # Add unchanged fields
+                for f in ["amount", "category", "card"]:
+                    if f not in edits:
+                        val = session.get(f, "")
+                        if val:
+                            lines.append(f"{f.title()}: {val}")
+                lines.append("\nyes / no / edit")
+                session["_pending_edits"] = edits
+                receipt_confirm_sessions[user_id] = session
+                await update.message.reply_text("\n".join(lines))
+                return True
+
+        # Apply edits
+        for field, value in edits.items():
+            if field == "merchant":
+                session["merchant"] = value
+                # Re-run merchant memory
+                known_cat, known_card, canonical = get_merchant_memory(value)
+                if canonical:
+                    session["merchant"] = canonical
+                if known_cat and not edits.get("category"):
+                    session["category"] = known_cat
+                if known_card and not edits.get("card"):
+                    session["card"] = known_card
+            elif field == "amount":
+                try:
+                    session["amount"] = float(re.sub(r"[^\d.]", "", value))
+                    if session["currency"] == "SGD":
+                        session["sgd_amount"] = session["amount"]
+                except ValueError:
+                    pass
+            elif field == "currency":
+                session["currency"] = value.upper()
+            elif field == "category":
+                matched_cat, _ = fuzzy_match_category(value)
+                if matched_cat:
+                    session["category"] = matched_cat
+                    # Update card default if not explicitly set
+                    if not edits.get("card"):
+                        session["card"] = get_card_default_for_category(matched_cat)
             elif field == "card":
-                matched = next((c for c in EXPENSE_CARDS if c.lower() == lower), None)
-                if not matched:
-                    await update.message.reply_text(f"Pick a card: {', '.join(EXPENSE_CARDS)}")
-                    return
-                session["card"] = matched
-                missing.pop(0)
-            session["missing_fields"] = missing
-            if missing:
-                next_field = missing[0]
-                if next_field == "card":
-                    await update.message.reply_text(f"Which card?\n{', '.join(EXPENSE_CARDS)}")
-                return
-        await _finalise_expense_session(user_id, update)
-        return
+                matched_card, _ = fuzzy_match_card(value)
+                if matched_card:
+                    session["card"] = matched_card
 
-    if step == "category":
-        matched = next((c for c in EXPENSE_CATEGORIES if c.lower() == text.strip().lower()), None)
-        if not matched:
-            await update.message.reply_text(f"Pick a category: {', '.join(EXPENSE_CATEGORIES)}")
-            return
-        session["category"] = matched
-        session["step"] = "card" if not session.get("card") else "done"
-        if session["step"] == "done":
-            await _finalise_expense_session(user_id, update)
-            return
-        await update.message.reply_text(f"Which card?\n{', '.join(EXPENSE_CARDS)}")
-        return
+        # Clear missing fields that are now filled
+        session["missing_fields"] = [f for f in session.get("missing_fields", [])
+                                      if not session.get(f)]
+        session["high_amount"] = session.get("sgd_amount", 0) > SGD_HIGH_AMOUNT_THRESHOLD
 
-    if step == "card":
-        matched = next((c for c in EXPENSE_CARDS if c.lower() == text.strip().lower()), None)
-        if not matched:
-            await update.message.reply_text(f"Pick a card: {', '.join(EXPENSE_CARDS)}")
-            return
-        session["card"] = matched
-        await _finalise_expense_session(user_id, update)
-        return
+        # Log immediately after edit — no re-confirm
+        await _finalise_receipt_confirm(user_id, session, update)
+        return True
 
-async def _finalise_expense_session(user_id, update):
-    """Log the expense and send confirmation once all fields are collected."""
-    session = expense_sessions[user_id]
+    # Handle pending ambiguity confirm
+    if session.get("_pending_edits"):
+        if lower in ["yes", "y"]:
+            edits = session.pop("_pending_edits")
+            for field, value in edits.items():
+                session[field] = value
+            await _finalise_receipt_confirm(user_id, session, update)
+        elif lower in ["no", "n"]:
+            session.pop("_pending_edits", None)
+            receipt_confirm_sessions[user_id] = session
+            await update.message.reply_text(
+                'Re-enter with quotes for merchant names containing field keywords.\n'
+                'e.g. merchant "Gift Card Store" category Shopping'
+            )
+        return True
+
+    # Unrecognised input
+    await update.message.reply_text("Reply yes, skip, or enter fields to edit (e.g. category FnB card Maybank)")
+    return True
+
+async def _finalise_receipt_confirm(user_id, session, update):
+    """Log expense from receipt confirm session and send logged confirmation."""
     merchant = session["merchant"]
     amount = session["amount"]
     currency = session["currency"]
-    category = session["category"]
-    card = session["card"]
+    category = session.get("category", "")
+    card = session.get("card", "Citi")
     sgd_amount = session.get("sgd_amount", amount)
     receipt_link = session.get("receipt_link", "")
-    receipt_saved = bool(receipt_link)
-    save_merchant_memory(merchant, category, card)
+    last4 = session.get("last4")
+    is_new_merchant = session.get("is_new_merchant", False)
+
     log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
-    del expense_sessions[user_id]
-    confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, receipt_saved)
+    if is_new_merchant and category and card:
+        save_merchant_memory(merchant, category, card)
+
+    del receipt_confirm_sessions[user_id]
+    session_timestamps.pop(user_id, None)
+
+    reply = format_expense_logged(merchant, amount, currency, category, card, sgd_amount, last4)
     try:
-        await update.message.reply_text(confirmation, parse_mode="Markdown")
+        await update.message.reply_text(reply, parse_mode="Markdown")
     except Exception:
-        await update.message.reply_text(confirmation)
+        await update.message.reply_text(reply)
+
+async def handle_expense_session(user_id, text, update):
+    """Handle multi-step expense onboarding — fx_rate only. Confirm flow now handled by receipt_confirm_sessions."""
+    session = expense_sessions.get(user_id)
+    if not session:
+        return
+
+    touch_session(user_id)
+    step = session.get("step")
+
+    if step == "fx_rate":
+        currency = session.get("currency", "")
+        parsed_rate, display = parse_manual_fx_input(text, currency)
+        if parsed_rate is None:
+            await update.message.reply_text(
+                f"Couldn't read that rate. Try:\n"
+                f"• {currency} to SGD: e.g. 0.0093\n"
+                f"• SGD to {currency}: e.g. 110"
+            )
+            return
+        num, sgd_per_unit = parsed_rate
+        save_manual_fx_rate(currency, num, sgd_per_unit)
+        rate = get_fx_rate(currency)
+        session["sgd_amount"] = round(session["amount"] * rate, 2)
+        session["use_manual_rate"] = True
+
+        # Move to receipt confirm flow
+        del expense_sessions[user_id]
+        receipt_confirm_sessions[user_id] = {**session, "step": "receipt_confirm",
+                                              "missing_fields": [], "is_new_merchant": True}
+        touch_session(user_id)
+        await update.message.reply_text(
+            f"Got it — using {display} for today.\n\n" +
+            format_expense_confirmation(
+                session["merchant"], session["amount"], currency,
+                session.get("category", ""), session.get("card", ""),
+                session["sgd_amount"], use_manual_rate=True,
+                missing_fields=[]
+            )
+        )
+        return
+
+    if step == "duplicate_confirm":
+        lower = text.strip().lower()
+        if lower in ["yes", "y"]:
+            # Move to confirm screen
+            del expense_sessions[user_id]
+            receipt_confirm_sessions[user_id] = {**session, "step": "receipt_confirm"}
+            touch_session(user_id)
+            confirmation = format_expense_confirmation(
+                session["merchant"], session["amount"], session["currency"],
+                session.get("category", ""), session.get("card", ""),
+                session.get("sgd_amount"), missing_fields=[]
+            )
+            await update.message.reply_text(confirmation)
+        else:
+            del expense_sessions[user_id]
+            await update.message.reply_text("Skipped.")
+        return
+
+async def _finalise_expense_session(user_id, update):
+    """Legacy finalise — redirects to receipt confirm flow."""
+    session = expense_sessions.get(user_id)
+    if not session:
+        return
+    del expense_sessions[user_id]
+    await _finalise_receipt_confirm(user_id, session, update)
+
+
 
 def check_same_day_duplicate(merchant, amount, currency):
     """Return True if same merchant+amount+currency already logged today."""
@@ -2749,10 +3645,12 @@ def _looks_like_command(text):
         return True
     return False
 
-def handle_expense_text(text, user_id, receipt_link=""):
+SGD_HIGH_AMOUNT_THRESHOLD = 5000.0
+
+def handle_expense_text(text, user_id, receipt_link="", last4=None):
     """
-    Process a text expense entry.
-    Returns (reply_str, needs_session, session_data)
+    Process a text expense entry. Returns (reply_str, needs_session, session_data).
+    Option B: auto-log if fully known, confirm screen if anything missing or uncertain.
     """
     try:
         parsed = parse_expense_text(text)
@@ -2762,98 +3660,127 @@ def handle_expense_text(text, user_id, receipt_link=""):
         category = parsed.get("category", "")
         card = parsed.get("card", "")
 
-        # Blank expense guard — reject if merchant is empty/unknown-ish or amount is 0
+        # Blank expense guard
         if not merchant or merchant.lower() in ("unknown", "") or amount == 0:
             return (
                 "Wasn't sure what to do with that — did you mean to log an expense, "
                 "or were you asking something else?"
             ), False, None
 
-        # Resolve FX rate if needed
-        sgd_amount = amount
-        if currency != "SGD":
-            rate = get_fx_rate(currency)
-            if rate is None:
-                session = {
-                    "merchant": merchant, "amount": amount, "currency": currency,
-                    "category": category, "card": card, "step": "fx_rate",
-                    "receipt_link": receipt_link
-                }
-                return (
-                    f"Couldn't fetch the {currency}/SGD rate right now.\n"
-                    f"What's the current rate? (e.g. '0.0093' means 1 {currency} = 0.0093 SGD)\n"
-                    f"I'll use it for this expense and retry the live rate next time."
-                ), True, session
-            sgd_amount = round(amount * rate, 2)
-            # Track currency for this trip
-            if overseas_state["active"] and currency not in overseas_state["currencies"]:
-                overseas_state["currencies"].append(currency)
+        # Sanity check: zero or negative
+        if amount <= 0:
+            return "Amount can't be zero or negative — what's the correct amount?", False, None
 
         # Fuzzy merchant lookup — use canonical name if found
         known_cat, known_card, canonical = get_merchant_memory(merchant)
         if canonical:
             merchant = canonical
-        if known_cat:
+        if known_cat and not category:
             category = known_cat
-        if known_card:
+        if known_card and not card:
             card = known_card
+
+        # Card default from category if still no card
+        if not card and category:
+            card = get_card_default_for_category(category)
+        elif not card:
+            card = "Citi"  # global fallback
+
+        # Card override from last4
+        if last4:
+            matched_card = get_card_by_last4(last4)
+            if matched_card:
+                card = matched_card
+
+        # Resolve FX rate if needed
+        sgd_amount = amount
+        use_manual_rate = False
+        if currency != "SGD":
+            rate = get_fx_rate(currency)
+            if rate is None:
+                # Check if we have a stale manual rate to use
+                manual = manual_fx_rates.get(currency)
+                if manual:
+                    rate = manual["rate"]
+                    use_manual_rate = True
+                    await_msg = (
+                        f"Live rate unavailable — using manual rate: 1 {currency} = ${rate:.4f} SGD\n"
+                        f"I'll keep checking for the live rate."
+                    )
+                else:
+                    # No rate at all — ask for manual input
+                    session = {
+                        "merchant": merchant, "amount": amount, "currency": currency,
+                        "category": category, "card": card, "step": "fx_rate",
+                        "receipt_link": receipt_link, "last4": last4
+                    }
+                    return (
+                        f"Couldn't get the {currency}/SGD rate right now.\n"
+                        f"Enter the exchange rate:\n"
+                        f"• SGD to {currency}: e.g. 110 (meaning $1 SGD = {currency} 110)\n"
+                        f"• {currency} to SGD: e.g. 0.0093 (meaning 1 {currency} = $0.0093 SGD)"
+                    ), True, session
+            sgd_amount = round(amount * rate, 2)
+            if overseas_state["active"] and currency not in overseas_state["currencies"]:
+                overseas_state["currencies"].append(currency)
+
+        # High amount sanity check
+        high_amount = sgd_amount > SGD_HIGH_AMOUNT_THRESHOLD
 
         # Same-day duplicate check
         if check_same_day_duplicate(merchant, amount, currency):
             session = {
                 "merchant": merchant, "amount": amount, "currency": currency,
                 "sgd_amount": sgd_amount, "category": category, "card": card,
-                "step": "confirm", "missing_fields": [],
-                "receipt_link": receipt_link, "duplicate_confirmed": False
+                "step": "duplicate_confirm", "receipt_link": receipt_link, "last4": last4
             }
             return (
-                f"Heads up — looks like you already logged {merchant} {currency} {amount:,.0f} today. Log it again?"
+                f"Heads up — looks like you already logged {merchant} {currency} {amount:,.0f} today. Log it again? (yes / no)"
             ), True, session
 
-        # Confirm-if-unsure — collect missing fields in one message
+        # Determine missing fields
         missing = []
         if not category:
             missing.append("category")
-        if not card:
-            missing.append("card")
+        if not amount:
+            missing.append("amount")
 
-        if missing:
-            session = {
-                "merchant": merchant, "amount": amount, "currency": currency,
-                "sgd_amount": sgd_amount, "category": category, "card": card,
-                "step": "confirm", "missing_fields": missing,
-                "receipt_link": receipt_link
-            }
-            _confirm_emoji = get_merchant_emoji(category, merchant)
-            lines = [f"Got it —"]
-            lines.append(f"{_confirm_emoji} {merchant}")
-            if currency != "SGD":
-                lines.append(f"${sgd_amount:.2f} ({currency} {amount:,.0f})")
-            else:
-                lines.append(f"${amount:.2f}")
-            if "category" in missing:
-                lines.append(f"\nWhat category?\n{', '.join(EXPENSE_CATEGORIES)}")
-            elif "card" in missing:
-                lines.append(f"\nWhich card?\n{', '.join(EXPENSE_CARDS)}")
-            return "\n".join(lines), True, session
+        # Option B: auto-log if everything is known and no flags
+        if not missing and not high_amount and not use_manual_rate:
+            log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
+            save_merchant_memory(merchant, category, card)
+            return format_expense_logged(merchant, amount, currency, category, card, sgd_amount, last4), False, None
 
-        # All info available — log directly
-        receipt_saved = bool(receipt_link)
-        log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
-        confirmation = format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount, receipt_saved)
-        return confirmation, False, None
+        # Otherwise show confirm screen
+        session = {
+            "merchant": merchant, "amount": amount, "currency": currency,
+            "sgd_amount": sgd_amount, "category": category, "card": card,
+            "step": "receipt_confirm", "missing_fields": missing,
+            "receipt_link": receipt_link, "last4": last4,
+            "high_amount": high_amount, "use_manual_rate": use_manual_rate,
+            "is_new_merchant": not bool(known_cat)
+        }
+        receipt_sessions_key = user_id
+        receipt_confirm_sessions[receipt_sessions_key] = session
+        confirmation = format_expense_confirmation(
+            merchant, amount, currency, category, card, sgd_amount,
+            receipt_saved=bool(receipt_link), last4=last4,
+            high_amount=high_amount, use_manual_rate=use_manual_rate,
+            missing_fields=missing
+        )
+        return confirmation, False, None  # Session stored separately in receipt_confirm_sessions
 
     except (json.JSONDecodeError, ValueError, KeyError) as e:
         print(f"parse_expense_text error: {e} | input: {text}")
-        # Try to reconstruct a guess from the raw text for user-facing hint
-        guess = text[:60] + ("..." if len(text) > 60 else "")
         return (
-            f"Couldn't read that as an expense.\n"
-            f"Try: 'log [merchant] [amount]' — e.g. 'log Starbucks $5.60'"
+            "Couldn't read that as an expense.\n"
+            "Try: 'log [merchant] [amount]' — e.g. 'log Starbucks $5.60'"
         ), False, None
     except Exception as e:
         print(f"handle_expense_text unexpected error: {e}")
         return "Something went wrong logging that — try again or use 'log [merchant] [amount]'.", False, None
+
+
 
 def delete_last_expense():
     """Delete the most recently added expense row."""
@@ -2954,8 +3881,19 @@ def get_last_expense():
         print(f"get_last_expense error: {e}")
         return None
 
-def edit_last_expense(field, new_value):
-    """Edit a specific field in the last expense row. Validates and shows before/after."""
+EDIT_FIELD_SYNONYMS = {
+    "merchant": "Merchant", "shop": "Merchant", "store": "Merchant", "place": "Merchant",
+    "amount": "Amount", "price": "Amount", "total": "Amount", "cost": "Amount",
+    "currency": "Currency",
+    "category": "Category", "cat": "Category",
+    "card": "Card", "payment": "Card",
+    "notes": "Notes", "note": "Notes",
+    "sgd": "SGD Amount",
+}
+
+def edit_last_expense(edit_text):
+    """Edit fields in the last expense row. Supports multi-field edits in one message.
+    Returns formatted logged message after editing."""
     try:
         sheet = expenses_sheet()
         all_values = sheet.get_all_values()
@@ -2963,44 +3901,85 @@ def edit_last_expense(field, new_value):
             return "No expenses to edit."
         headers = all_values[0]
         last_row_idx = len(all_values)
-        field_map = {
-            "merchant": "Merchant", "amount": "Amount", "currency": "Currency",
-            "sgd": "SGD Amount", "category": "Category", "card": "Card", "notes": "Notes"
-        }
-        col_name = field_map.get(field.lower())
-        if not col_name or col_name not in headers:
-            valid = ", ".join(field_map.keys())
-            return f"Can't edit '{field}'. Options: {valid}"
-        col_idx = headers.index(col_name) + 1
-        if col_name == "Amount":
-            try:
-                float(new_value.replace(",", "").replace("$", ""))
-            except ValueError:
-                return "Amount must be a number. Try: edit last expense amount to 12.50"
-        elif col_name == "Category":
-            try:
-                all_cats = sorted(set(
-                    r.get("Category", "").strip()
-                    for r in expenses_sheet().get_all_records()
-                    if r.get("Category", "").strip()
-                )) or EXPENSE_CATEGORIES
-            except Exception:
-                all_cats = EXPENSE_CATEGORIES
-            matched = next((c for c in all_cats if c.lower() == new_value.strip().lower()), None)
-            if not matched:
-                return f"Unknown category '{new_value}'. Your categories: {', '.join(all_cats)}"
-            new_value = matched
-        elif col_name == "Card":
-            matched = next((c for c in EXPENSE_CARDS if c.lower() == new_value.strip().lower()), None)
-            if not matched:
-                return f"Unknown card '{new_value}'. Your cards: {', '.join(EXPENSE_CARDS)}"
-            new_value = matched
         last_row = all_values[last_row_idx - 1]
-        old_value = last_row[col_idx - 1] if col_idx - 1 < len(last_row) else ""
-        sheet.update_cell(last_row_idx, col_idx, new_value)
-        return f"Updated ✅\n{col_name}: {old_value} → {new_value}"
+
+        # Parse multi-field edits
+        edits = parse_multi_field_edit(edit_text, field_keywords=EDIT_FIELD_SYNONYMS)
+        if not edits:
+            return "Couldn't parse that edit. Try: 'edit merchant Starbucks category FnB'"
+
+        applied = []
+        merchant_changed = False
+
+        for field_key, new_value in edits.items():
+            col_name = EDIT_FIELD_SYNONYMS.get(field_key.lower())
+            if not col_name or col_name not in headers:
+                continue
+
+            col_idx = headers.index(col_name) + 1
+
+            # Validate and normalise per field
+            if col_name == "Amount":
+                try:
+                    new_value = str(float(re.sub(r"[^\d.]", "", new_value)))
+                except ValueError:
+                    continue
+            elif col_name == "Category":
+                matched_cat, _ = fuzzy_match_category(new_value)
+                if not matched_cat:
+                    continue
+                new_value = matched_cat
+            elif col_name == "Card":
+                matched_card, _ = fuzzy_match_card(new_value)
+                if not matched_card:
+                    continue
+                new_value = matched_card
+            elif col_name == "Merchant":
+                merchant_changed = True
+
+            sheet.update_cell(last_row_idx, col_idx, new_value)
+            applied.append((col_name, new_value))
+
+        if not applied:
+            return "Couldn't match any valid fields to edit."
+
+        # If merchant changed, re-run merchant memory for category/card
+        if merchant_changed:
+            new_merchant = next((v for k, v in edits.items() if EDIT_FIELD_SYNONYMS.get(k) == "Merchant"), "")
+            if new_merchant:
+                known_cat, known_card, canonical = get_merchant_memory(new_merchant)
+                if canonical:
+                    m_col = headers.index("Merchant") + 1
+                    sheet.update_cell(last_row_idx, m_col, canonical)
+                if known_cat and "Category" not in [c for c, _ in applied]:
+                    c_col = headers.index("Category") + 1
+                    sheet.update_cell(last_row_idx, c_col, known_cat)
+                    applied.append(("Category", known_cat))
+                if known_card and "Card" not in [c for c, _ in applied]:
+                    cd_col = headers.index("Card") + 1
+                    sheet.update_cell(last_row_idx, cd_col, known_card)
+                    applied.append(("Card", known_card))
+
+        # Re-read updated row to show logged confirmation
+        updated_values = sheet.get_all_values()
+        updated_row_data = updated_values[last_row_idx - 1] if len(updated_values) >= last_row_idx else last_row
+        updated = {headers[i]: updated_row_data[i] if i < len(updated_row_data) else "" for i in range(len(headers))}
+
+        merchant = updated.get("Merchant", "")
+        amount = updated.get("Amount", "")
+        currency = updated.get("Currency", "SGD")
+        sgd_amount = updated.get("SGD Amount", amount)
+        category = updated.get("Category", "")
+        card = updated.get("Card", "")
+
+        return format_expense_logged(merchant, float(amount) if amount else 0,
+                                     currency, category, card,
+                                     float(sgd_amount) if sgd_amount else None)
+
     except Exception as e:
         return f"Error editing expense: {str(e)}"
+
+
 
 def show_last_expense():
     """Return a formatted view of the last logged expense."""
@@ -3110,6 +4089,16 @@ def rename_category(old_name, new_name):
                         sheet.update_cell(i, col_idx + 1, new_clean)
     except Exception as e:
         print(f"rename_category merchant map error: {e}")
+    # Update Cards sheet Default Category column
+    try:
+        ws = cards_sheet()
+        records = ws.get_all_records()
+        for i, r in enumerate(records, start=2):
+            if r.get("Default Category", "").strip().lower() == matched.lower():
+                ws.update_cell(i, 3, new_clean)  # Default Category is col 3
+    except Exception as e:
+        print(f"rename_category cards sheet error: {e}")
+
     return f"Renamed '{matched}' to '{new_clean}'. Updated {updated} expense(s)."
 
 def get_expense_report(report_type="monthly"):
@@ -3323,22 +4312,36 @@ def lookup_restaurant_from_maps(url):
         f"- country: string (country if determinable from URL, else 'Singapore')\n\n"
         f"Return ONLY the JSON."
     )
-    resp = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=150,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
     try:
-        return json.loads(raw)
+        resp = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+        result = json.loads(raw)
+        # Flag if location is blank — needs manual input
+        if not result.get("location"):
+            result["_needs_location"] = True
+        return result
     except Exception as e:
-        print(f"lookup_restaurant_from_maps JSON parse error: {e} | raw: {raw}")
-        return {"name": "", "location": "", "country": "Singapore"}
+        print(f"lookup_restaurant_from_maps error: {e}")
+        return {"name": "", "location": "", "country": "Singapore", "_needs_location": True}
 
-def save_restaurant(name, location, country="Singapore", tags="", notes=""):
-    """Save a restaurant to the Restaurants sheet."""
+def save_restaurant(name, location, country="Singapore", tags="", notes="", force_new=False):
+    """Save a restaurant to the Restaurants sheet. Checks for duplicates unless force_new."""
+    if not force_new:
+        try:
+            sheet = restaurants_sheet()
+            records = sheet.get_all_records()
+            for r in records:
+                if r.get("Name", "").lower() == name.lower():
+                    return "_DUPLICATE_:" + name
+        except Exception:
+            pass
     sheet = restaurants_sheet()
     sheet.append_row([name, location, country, tags, notes])
+    return None  # Success
 
 def format_restaurant_saved(name, location, tags="", notes=""):
     """Format the restaurant saved confirmation."""
@@ -3432,12 +4435,11 @@ def is_restaurant_search(text):
                 "show my restaurants", "my restaurant list", "saved restaurants"]
     return any(t in lower for t in triggers)
 
-def handle_save_restaurant(text):
+def handle_save_restaurant(text, force_new=False):
     """Handle saving a restaurant from text or maps link."""
     try:
         # Check if it contains a Maps URL
         if "maps.google" in text or "goo.gl/maps" in text or "maps.app.goo" in text:
-            # Extract URL
             words = text.split()
             url = next((w for w in words if "map" in w.lower() or "goo.gl" in w.lower()), "")
             parsed = lookup_restaurant_from_maps(url)
@@ -3449,6 +4451,10 @@ def handle_save_restaurant(text):
 
             if not name:
                 return "I got the link but couldn't extract the name. Try: 'save Burnt Ends, Teck Lim Road, tag: date night'"
+
+            if parsed.get("_needs_location") or not location:
+                return f"_NEEDS_LOCATION_:{name}:{country}"
+
         else:
             parsed = parse_restaurant_save(text)
             name = parsed.get("name", "")
@@ -3460,7 +4466,11 @@ def handle_save_restaurant(text):
         if not name:
             return "What's the restaurant name? Try: 'save Burnt Ends, Teck Lim Road'"
 
-        save_restaurant(name, location, country, tags, notes)
+        result = save_restaurant(name, location, country, tags, notes, force_new=force_new)
+        if result and result.startswith("_DUPLICATE_:"):
+            existing = result.split(":", 1)[1]
+            return f"_DUPLICATE_RESTAURANT_:{existing}:{name}:{location}:{country}:{tags}:{notes}"
+
         return format_restaurant_saved(name, location, tags, notes)
 
     except Exception as e:
@@ -3580,7 +4590,120 @@ def format_price(data):
 def portfolio_sheet():
     return spreadsheet.worksheet("Portfolio")
 
-def log_portfolio_buy(ticker, quantity, price, buy_date=None):
+# --- Trips Sheet ---
+
+def trips_sheet():
+    return spreadsheet.worksheet("Trips")
+
+def generate_trip_id():
+    return date.today().strftime("TRIP-%Y%m%d")
+
+def save_trip(destination, currency, dep_flight="", dep_time="", return_flight="", return_time=""):
+    """Write a new active trip row to Trips sheet."""
+    try:
+        ws = trips_sheet()
+        trip_id = generate_trip_id()
+        ws.append_row([
+            trip_id, destination, currency,
+            dep_flight, dep_time,
+            return_flight, return_time,
+            "active",
+            datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M"),
+            ""
+        ])
+        return trip_id
+    except Exception as e:
+        print(f"save_trip error: {e}")
+        return None
+
+def close_trip(trip_id=None):
+    """Mark the active trip as closed."""
+    try:
+        ws = trips_sheet()
+        records = ws.get_all_records()
+        for i, row in enumerate(records, start=2):
+            if row.get("Status") == "active" and (trip_id is None or row.get("Trip ID") == trip_id):
+                ws.update_cell(i, 8, "closed")  # Status col
+                ws.update_cell(i, 10, datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M"))  # Ended
+                return True
+    except Exception as e:
+        print(f"close_trip error: {e}")
+    return False
+
+def get_active_trip():
+    """Return the most recent active trip row, or None."""
+    try:
+        ws = trips_sheet()
+        records = ws.get_all_records()
+        for row in reversed(records):
+            if row.get("Status") == "active":
+                return row
+    except Exception as e:
+        print(f"get_active_trip error: {e}")
+    return None
+
+def restore_overseas_from_trips():
+    """On startup — if there's an active trip in the sheet, restore overseas_state."""
+    try:
+        trip = get_active_trip()
+        if not trip:
+            return False
+        dest = trip.get("Destination", "")
+        curr = trip.get("Currency", "SGD")
+        dep_flight = trip.get("Dep Flight", "")
+        return_flight = trip.get("Return Flight", "")
+        if dest and curr and curr != "SGD":
+            overseas_state["active"] = True
+            overseas_state["destination"] = dest
+            overseas_state["currency"] = curr
+            overseas_state["currencies"] = [curr]
+            overseas_state["trip_destinations"] = [dest]
+            if dep_flight:
+                overseas_state["dep_flight"] = dep_flight
+            if return_flight:
+                overseas_state["return_flight"] = {"flight": return_flight}
+            print(f"✅ Restored overseas mode: {dest} ({curr})")
+            return True
+    except Exception as e:
+        print(f"restore_overseas_from_trips error: {e}")
+    return False
+
+def get_trip_history(n=5):
+    """Return last n trips from Trips sheet."""
+    try:
+        ws = trips_sheet()
+        records = ws.get_all_records()
+        return list(reversed(records[-n:])) if records else []
+    except Exception as e:
+        print(f"get_trip_history error: {e}")
+        return []
+
+def format_trip_history():
+    trips = get_trip_history(10)
+    if not trips:
+        return "No trips logged yet."
+    lines = ["*Trip History*\n"]
+    for t in trips:
+        status = "✈️ Active" if t.get("Status") == "active" else "✅ Done"
+        dest = t.get("Destination", "—")
+        curr = t.get("Currency", "")
+        dep = t.get("Dep Flight", "")
+        ret = t.get("Return Flight", "")
+        started = t.get("Started", "")
+        ended = t.get("Ended", "")
+        line = f"{status} {dest} ({curr})"
+        if dep:
+            line += f" | Out: {dep}"
+        if ret:
+            line += f" | Back: {ret}"
+        if started:
+            line += f"\n{started}"
+            if ended:
+                line += f" → {ended}"
+        lines.append(line)
+    return "\n\n".join(lines)
+
+
     """Log a stock purchase to Portfolio sheet."""
     sheet = portfolio_sheet()
     today = buy_date or date.today().strftime("%d/%m/%Y")
@@ -3654,7 +4777,50 @@ def get_portfolio_performance():
 
     return "\n".join(lines)
 
-def set_price_alert(ticker, condition, price):
+def get_portfolio_rows():
+    """Return list of (row_index, record) for all portfolio entries."""
+    try:
+        ws = portfolio_sheet()
+        records = ws.get_all_records()
+        return [(i + 2, r) for i, r in enumerate(records)]  # row 1 = header
+    except Exception as e:
+        print(f"get_portfolio_rows error: {e}")
+        return []
+
+def format_portfolio_delete_list(rows):
+    """Format numbered list of portfolio holdings for delete selection."""
+    if not rows:
+        return "No holdings in portfolio."
+    lines = ["Which holding do you want to remove?\n"]
+    for i, (_, r) in enumerate(rows, 1):
+        ticker = r.get("Stock", "?")
+        qty = r.get("Quantity", "?")
+        price = r.get("Buy Price", "?")
+        buy_date = r.get("Buy Date", "")
+        lines.append(f"{i}. {ticker} — {qty} shares @ ${price} ({buy_date})")
+    lines.append("\nReply with a number, 'search [ticker]', or 'cancel'.")
+    return "\n".join(lines)
+
+def delete_portfolio_row(sheet_row):
+    """Delete a portfolio row by sheet row index."""
+    try:
+        ws = portfolio_sheet()
+        all_vals = ws.get_all_values()
+        if sheet_row - 1 < len(all_vals):
+            row_data = all_vals[sheet_row - 1]
+            ticker = row_data[0] if row_data else "?"
+        ws.delete_rows(sheet_row)
+        return f"Removed {ticker} from portfolio."
+    except Exception as e:
+        return f"Couldn't remove that holding: {str(e)}"
+
+def search_portfolio_by_ticker(query):
+    """Search portfolio holdings by ticker substring."""
+    rows = get_portfolio_rows()
+    q = query.upper()
+    return [(row_idx, r) for row_idx, r in rows if q in r.get("Stock", "").upper()]
+
+
     """Set a price alert for a ticker."""
     ticker = ticker.upper()
     price_alerts[ticker] = {"condition": condition, "price": price, "active": True}
@@ -3891,33 +5057,127 @@ def detect_crm_natural_update(text):
     return None
 
 
-def get_market_summary_now():
-    """Generate on-demand market summary — same logic as weekly job but returns string."""
+MARKET_FLAGS = {
+    "🇺🇸 US": "🇺🇸",
+    "🇨🇳 China": "🇨🇳",
+    "🇮🇳 India": "🇮🇳",
+}
+
+def fetch_market_rss_headlines(market_name):
+    """Fetch top 2 market headlines from Google News RSS for a given market."""
     try:
-        lines = []
+        queries = {
+            "US": "US stock market",
+            "China": "China stock market",
+            "India": "India stock market Nifty Sensex",
+        }
+        # Extract short market key
+        key = None
+        for k in queries:
+            if k in market_name:
+                key = k
+                break
+        if not key:
+            return []
+        q = queries[key].replace(" ", "+")
+        url = f"https://news.google.com/rss/search?q={q}&hl=en-SG&gl=SG&ceid=SG:en"
+        resp = requests.get(url, timeout=5)
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(resp.content)
+        headlines = []
+        for item in root.findall(".//item")[:2]:
+            title = item.findtext("title", "").split(" - ")[0].strip()
+            if title:
+                headlines.append(title)
+        return headlines
+    except Exception as e:
+        print(f"RSS fetch error for {market_name}: {e}")
+        return []
+
+def get_market_summary_now():
+    """Generate on-demand market summary with flag emoji, index data, RSS headlines, and Claude narrative."""
+    try:
+        market_data_blocks = []
         sentiments = []
+
         for market, indices in MARKET_INDICES.items():
-            market_lines = [f"{market}"]
+            # Determine flag
+            flag = ""
+            for k, f in MARKET_FLAGS.items():
+                if any(word in market for word in k.replace("🇺🇸 ", "").replace("🇨🇳 ", "").replace("🇮🇳 ", "").split()):
+                    flag = f
+                    break
+
+            index_lines = []
             market_changes = []
             for ticker, name in indices.items():
                 data = fetch_price(ticker)
                 if data:
                     arrow = "▲" if data["change_pct"] >= 0 else "▼"
-                    market_lines.append(f"{name}: {arrow} {abs(data['change_pct']):.1f}%")
+                    index_lines.append(f"  {name}: {arrow} {abs(data['change_pct']):.1f}%")
                     market_changes.append(data["change_pct"])
-            if market_changes:
-                avg = sum(market_changes) / len(market_changes)
-                sentiment = "positive" if avg > 0.3 else "negative" if avg < -0.3 else "mixed"
-                sentiments.append(sentiment)
-                market_lines.append(f"Sentiment: {sentiment.title()}")
-            lines.append("\n".join(market_lines))
-        if sentiments:
-            overall = "broadly positive" if sentiments.count("positive") >= 2 else \
-                      "broadly negative" if sentiments.count("negative") >= 2 else "mixed"
-            lines.append(f"Overall: {overall}")
-        return "Market Summary\n\n" + "\n\n---\n\n".join(lines)
+
+            avg = sum(market_changes) / len(market_changes) if market_changes else 0
+            sentiment = "positive" if avg > 0.3 else "negative" if avg < -0.3 else "mixed"
+            sentiments.append(sentiment)
+
+            headlines = fetch_market_rss_headlines(market)
+
+            block = {
+                "market": market,
+                "flag": flag,
+                "index_lines": index_lines,
+                "sentiment": sentiment,
+                "avg_change": avg,
+                "headlines": headlines,
+            }
+            market_data_blocks.append(block)
+
+        # Build plain data summary for Claude
+        data_summary = ""
+        for b in market_data_blocks:
+            data_summary += f"\n{b['flag']} {b['market']} — sentiment: {b['sentiment']}\n"
+            data_summary += "\n".join(b["index_lines"]) + "\n"
+            if b["headlines"]:
+                data_summary += "Headlines: " + "; ".join(b["headlines"]) + "\n"
+
+        overall = "broadly positive" if sentiments.count("positive") >= 2 else \
+                  "broadly negative" if sentiments.count("negative") >= 2 else "mixed"
+
+        # Claude narrative — 2 sentences max, casual tone
+        try:
+            narrative_resp = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=120,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Here's today's market data:\n{data_summary}\n\n"
+                        "Write a 2-sentence casual market narrative summary for a personal assistant bot. "
+                        "No bullet points, no headers, just plain sentences. Keep it punchy."
+                    )
+                }]
+            )
+            narrative = narrative_resp.content[0].text.strip()
+        except Exception:
+            narrative = ""
+
+        # Format output
+        lines = [f"*Market Summary* — {date.today().strftime('%d %b %Y')}\n"]
+        for b in market_data_blocks:
+            section = f"{b['flag']} *{b['market']}*\n" + "\n".join(b["index_lines"])
+            if b["headlines"]:
+                section += "\n_" + b["headlines"][0] + "_"
+            lines.append(section)
+        lines.append(f"Overall: {overall.title()}")
+        if narrative:
+            lines.append(f"\n{narrative}")
+
+        return "\n\n".join(lines)
+
     except Exception as e:
         return f"Couldn't pull market data right now: {str(e)}"
+
 
 async def handle_statement_upload(file_bytes, fname, user_id, update):
     """Parse a bank statement CSV/XLSX and reconcile against logged expenses."""
@@ -4246,26 +5506,100 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo = update.message.photo[-1]  # highest resolution
         tg_file = await photo.get_file()
         file_bytes = bytes(await tg_file.download_as_bytearray())
-        # Upload to Drive receipts folder
+
+        # --- Drive upload: month subfolder + temp name, renamed after merchant known ---
         receipt_link = ""
+        drive_file_id = ""
+        today_obj = date.today()
+        month_folder_name = today_obj.strftime("%Y-%m")
+        today_str = today_obj.strftime("%Y-%m")
+
         try:
             from googleapiclient.http import MediaIoBaseUpload
-            today_str = date.today().strftime("%Y%m%d")
-            file_name = f"receipt_{today_str}_{photo.file_id[:8]}.jpg"
-            folder_id = DRIVE_FOLDERS.get("receipts", "")
-            if folder_id:
+            receipts_root = DRIVE_FOLDERS.get("receipts", "")
+            if receipts_root:
+                # Get or create month subfolder under Receipts
+                month_folder_id = get_or_create_drive_folder(month_folder_name, receipts_root)
+                # Upload with temp name — will rename once merchant is known
+                temp_name = f"{today_str}-receipt-{photo.file_id[:8]}.jpg"
                 media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
-                file_meta = {"name": file_name, "parents": [folder_id]}
-                uploaded = drive_service.files().create(body=file_meta, media_body=media, fields="id,webViewLink").execute()
+                file_meta = {"name": temp_name, "parents": [month_folder_id]}
+                uploaded = drive_service.files().create(
+                    body=file_meta, media_body=media, fields="id,webViewLink"
+                ).execute()
+                drive_file_id = uploaded.get("id", "")
                 receipt_link = uploaded.get("webViewLink", "")
         except Exception as e:
             print(f"Receipt upload error: {e}")
 
+        def rename_receipt_in_drive(merchant_name):
+            """Rename the uploaded receipt file to YYYY-MM-merchant.jpg"""
+            if not drive_file_id or not merchant_name:
+                return
+            try:
+                safe_merchant = re.sub(r"[^a-zA-Z0-9\-_]", "", merchant_name.replace(" ", "-").lower())
+                new_name = f"{today_str}-{safe_merchant}.jpg"
+                drive_service.files().update(
+                    fileId=drive_file_id,
+                    body={"name": new_name}
+                ).execute()
+            except Exception as e:
+                print(f"Receipt rename error: {e}")
+
         if not caption:
-            await update.message.reply_text("Got the receipt 🧾 Add a caption with the expense details — e.g. '1400 Ichiran' and I'll log it.")
+            # No caption — use Claude vision to read the receipt
+            await update.message.reply_text("Got the receipt 🧾 Reading it now...")
+            try:
+                import base64
+                img_b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+                curr = overseas_state.get("currency", "SGD") if overseas_state.get("active") else "SGD"
+                vision_resp = client.messages.create(
+                    model="claude-sonnet-4-5",
+                    max_tokens=300,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}
+                            },
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"This is a receipt. Extract: merchant name, total amount, and currency (default {curr} if not shown). "
+                                    "Reply ONLY in this format with no other text: MERCHANT | AMOUNT | CURRENCY\n"
+                                    "Example: Starbucks | 8.50 | SGD"
+                                )
+                            }
+                        ]
+                    }]
+                )
+                vision_text = vision_resp.content[0].text.strip()
+                parts = [p.strip() for p in vision_text.split("|")]
+                if len(parts) == 3:
+                    merchant_v, amount_v, currency_v = parts
+                    rename_receipt_in_drive(merchant_v)
+                    synthesized = f"{merchant_v} {amount_v} {currency_v}"
+                    reply, needs_session, session_data = handle_expense_text(synthesized, user_id, receipt_link=receipt_link)
+                    if needs_session and session_data:
+                        expense_sessions[user_id] = session_data
+                    if reply:
+                        try:
+                            await update.message.reply_text(reply, parse_mode="Markdown")
+                        except Exception:
+                            await update.message.reply_text(reply)
+                else:
+                    await update.message.reply_text("I read the receipt but couldn't parse it cleanly. Try adding a caption like '45.50 Ichiran'.")
+            except Exception as e:
+                print(f"Vision parse error: {e}")
+                await update.message.reply_text("Couldn't read the receipt automatically. Add a caption like '45.50 Ichiran' and resend.")
             return
 
         if is_expense_input(caption):
+            # Caption provided — extract merchant from caption to rename file
+            parsed = parse_expense_text(caption)
+            if parsed and parsed.get("merchant"):
+                rename_receipt_in_drive(parsed["merchant"])
             reply, needs_session, session_data = handle_expense_text(caption, user_id, receipt_link=receipt_link)
             if needs_session and session_data:
                 expense_sessions[user_id] = session_data
@@ -4281,8 +5615,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     lower = text.lower()
 
-    # Check birthday acknowledgement — any incoming message counts
-    check_birthday_acknowledgement()
+    # Check birthday acknowledgement — explicit sent/skip only
+    bday_handled, bday_reply = check_birthday_acknowledgement(text)
+    if bday_handled:
+        if bday_reply:
+            await update.message.reply_text(bday_reply)
+        return
 
     # Excel import column declaration
     if user_id in excel_import_sessions:
@@ -4306,13 +5644,109 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Couldn't parse that. Try: 'Name, Email, Date of Birth, Alias'")
             return
 
+    # Check session timeouts before processing any session
+    if any(user_id in s for s in [expense_sessions, delete_sessions, portfolio_delete_sessions,
+                                    confirm_sessions, receipt_confirm_sessions, edit_sessions, meeting_sessions]):
+        if is_session_expired(user_id):
+            await check_session_timeouts(user_id, update)
+            return
+
+    # Handle pending restaurant saves (location needed or duplicate)
+    if user_id in pending_restaurant_saves:
+        prs = pending_restaurant_saves[user_id]
+        step = prs.get("step")
+        if step == "awaiting_location":
+            location = text.strip()
+            del pending_restaurant_saves[user_id]
+            result = save_restaurant(prs["name"], location, prs.get("country", "Singapore"))
+            if result and result.startswith("_DUPLICATE_:"):
+                pending_restaurant_saves[user_id] = {
+                    "step": "duplicate", "existing": prs["name"],
+                    "name": prs["name"], "location": location,
+                    "country": prs.get("country", "Singapore"), "tags": "", "notes": ""
+                }
+                await update.message.reply_text(f"*{prs['name']}* is already in your list. Update or save as new? (update / new)")
+            else:
+                await update.message.reply_text(format_restaurant_saved(prs["name"], location))
+            return
+        elif step == "duplicate":
+            if lower in ["new", "save new"]:
+                del pending_restaurant_saves[user_id]
+                save_restaurant(prs["name"], prs["location"], prs.get("country", "Singapore"),
+                                prs.get("tags", ""), prs.get("notes", ""), force_new=True)
+                await update.message.reply_text(format_restaurant_saved(prs["name"], prs["location"]))
+            elif lower in ["update", "update existing"]:
+                del pending_restaurant_saves[user_id]
+                await update.message.reply_text(f"Use 'edit restaurant {prs['existing']}' to update it.")
+            else:
+                await update.message.reply_text("Reply 'update' or 'new'.")
+            return
+
+    # Handle pending duplicate contact save
+    if user_id in pending_contact_saves:
+        pcs = pending_contact_saves[user_id]
+        if lower in ["new", "save new", "save as new"]:
+            del pending_contact_saves[user_id]
+            reply = save_contact(pcs["data"], force_new=True)
+            await update.message.reply_text(reply)
+        elif lower in ["update", "update existing"]:
+            del pending_contact_saves[user_id]
+            reply = f"Opening {pcs['existing_name']} for editing — use 'edit {pcs['existing_name']}' to update fields."
+            await update.message.reply_text(reply)
+        else:
+            await update.message.reply_text(f"*{pcs['existing_name']}* already exists. Reply 'update' or 'new'.")
+        return
+
+    # Handle todo disambiguation
+    if user_id in todo_disambig_sessions:
+        td = todo_disambig_sessions[user_id]
+        tasks = td.get("tasks", [])
+        action = td.get("action", "complete")
+        if text.strip().isdigit():
+            idx = int(text.strip()) - 1
+            if 0 <= idx < len(tasks):
+                task_name = tasks[idx]
+                del todo_disambig_sessions[user_id]
+                if action == "complete":
+                    sheet = todo_sheet()
+                    records = sheet.get_all_records()
+                    for i, r in enumerate(records):
+                        if r.get("Task", "") == task_name and r.get("Status") == "Pending":
+                            sheet.update_cell(i + 2, 2, "Done")
+                            await update.message.reply_text(f"✅ Marked as done: _{task_name}_")
+                            return
+                elif action == "delete":
+                    sheet = todo_sheet()
+                    records = sheet.get_all_records()
+                    for i, r in enumerate(records):
+                        if r.get("Task", "") == task_name:
+                            sheet.delete_rows(i + 2)
+                            await update.message.reply_text(f"Deleted — {task_name} ✅")
+                            return
+            else:
+                await update.message.reply_text("Invalid number. Try again or 'cancel'.")
+        elif lower == "cancel":
+            del todo_disambig_sessions[user_id]
+            await update.message.reply_text("Cancelled.")
+        else:
+            await update.message.reply_text("Reply with a number or 'cancel'.")
+        return
+
+    # Handle active receipt confirm session
+    if user_id in receipt_confirm_sessions:
+        touch_session(user_id)
+        await handle_receipt_confirm_session(user_id, text, update)
+        return
+
     # Handle active meeting recap session
     if user_id in meeting_sessions:
+        touch_session(user_id)
         await handle_meeting_session(user_id, text, update)
         return
 
     # Handle active expense onboarding session
     if user_id in expense_sessions:
+        touch_session(user_id)
         await handle_expense_session(user_id, text, update)
         return
 
@@ -4360,6 +5794,73 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text("Reply with a number, 'search [merchant]', or 'cancel'.")
                 return
+
+    # Handle active confirm session (destructive actions: delete contact/bill/restaurant/event, rename category)
+    if user_id in confirm_sessions:
+        touch_session(user_id)
+        cs = confirm_sessions[user_id]
+        action = cs.get("action")
+        args = cs.get("args", [])
+        if lower in ["yes", "y"]:
+            del confirm_sessions[user_id]
+            session_timestamps.pop(user_id, None)
+            if action == "delete_contact":
+                reply = delete_contact(args[0])
+            elif action == "rename_category":
+                reply = rename_category(args[0], args[1])
+            elif action == "delete_bill":
+                reply = delete_bill(args[0])
+            elif action == "delete_restaurant":
+                reply = delete_restaurant(args[0])
+            elif action == "delete_event":
+                reply = delete_calendar_event(args[0])
+            else:
+                reply = "Done."
+            await update.message.reply_text(reply)
+        elif lower in ["no", "n", "cancel"]:
+            del confirm_sessions[user_id]
+            session_timestamps.pop(user_id, None)
+            await update.message.reply_text("Cancelled.")
+        else:
+            await update.message.reply_text(f"{cs.get('target', 'Confirm?')} (yes / no)")
+        return
+
+    # Handle active portfolio delete session
+    if user_id in portfolio_delete_sessions:
+        touch_session(user_id)
+        pd_session = portfolio_delete_sessions[user_id]
+        if lower in ["cancel", "nevermind", "nvm"]:
+            del portfolio_delete_sessions[user_id]
+            await update.message.reply_text("Cancelled.")
+            return
+        if text.strip().isdigit():
+            idx = int(text.strip()) - 1
+            rows = pd_session.get("rows", [])
+            if 0 <= idx < len(rows):
+                sheet_row, _ = rows[idx]
+                del portfolio_delete_sessions[user_id]
+                result = delete_portfolio_row(sheet_row)
+                await update.message.reply_text(result)
+            else:
+                await update.message.reply_text("Invalid number. Try again or 'cancel'.")
+            return
+        elif lower.startswith("search "):
+            query = text[7:].strip()
+            results = search_portfolio_by_ticker(query)
+            if not results:
+                await update.message.reply_text(f"No holdings found matching '{query}'.")
+            elif len(results) == 1:
+                sheet_row, _ = results[0]
+                del portfolio_delete_sessions[user_id]
+                result = delete_portfolio_row(sheet_row)
+                await update.message.reply_text(result)
+            else:
+                portfolio_delete_sessions[user_id] = {"step": "pick", "rows": results}
+                await update.message.reply_text(format_portfolio_delete_list(results))
+            return
+        else:
+            await update.message.reply_text("Reply with a number, 'search [ticker]', or 'cancel'.")
+            return
 
     # Handle active CRM edit session
     if user_id in edit_sessions:
@@ -4489,7 +5990,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # CRM Commands
     if lower.startswith("save "):
-        reply = save_contact(text[5:])
+        result = save_contact(text[5:])
+        if result.startswith("_DUPLICATE_:"):
+            existing_name = result.split(":", 1)[1]
+            pending_contact_saves[user_id] = {"data": text[5:], "existing_name": existing_name}
+            reply = f"*{existing_name}* already exists in your CRM.\nUpdate the existing contact or save as new? (update / new)"
+        else:
+            reply = result
     elif lower.startswith("find ") or lower.startswith("pull up "):
         name = text[5:] if lower.startswith("find ") else text[8:]
         reply = find_contact(name)
@@ -4532,7 +6039,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del confirm_sessions[user_id]
         if user_id in delete_sessions:
             del delete_sessions[user_id]
+        if user_id in receipt_confirm_sessions:
+            del receipt_confirm_sessions[user_id]
+        session_timestamps.pop(user_id, None)
         reply = "Cancelled."
+
+    # Profile
+    elif lower == "reload profile":
+        try:
+            setup_em_profile()
+            reply = "✅ Profile reloaded successfully."
+        except Exception as e:
+            reply = f"⚠️ Couldn't reload profile: {str(e)}"
+
+    # Missed items dismissal
+    elif lower in ["skip missed", "dismiss missed", "skip all missed"]:
+        reply = "All missed follow-ups dismissed ✅"
+    elif lower.startswith("skip ") and not lower.startswith("skip missed bills"):
+        name = text[5:].strip()
+        reply = f"Follow-up for {name} dismissed ✅"
+    elif lower in ["skip missed bills", "dismiss missed bills"]:
+        reply = "Missed bill reminders dismissed ✅"
+
+    # Missed market summary response
+    elif lower in ["yes", "y"] and market_summary_pending.get(user_id):
+        market_summary_pending.pop(user_id, None)
+        reply = get_market_summary_now()
+
+    # Card defaults
+    elif re.match(r"set default card for .+ to .+", lower):
+        m = re.match(r"set default card for (.+?) to (.+)", lower)
+        if m:
+            category_name = m.group(1).strip().title()
+            card_name = m.group(2).strip().title()
+            reply = set_card_default_category(card_name, category_name)
+        else:
+            reply = "Try: 'set default card for FnB to Maybank'"
+
+
     elif lower == "list":
         reply = list_contacts()
     elif lower == "stats":
@@ -4593,10 +6137,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif is_cancel_reminder_request(text):
         keyword = text.lower().replace("cancel", "").replace("delete", "").replace("remove", "").replace("reminder", "").strip()
         cancelled = cancel_reminder_by_keyword(keyword) if keyword else []
-        if cancelled:
-            reply = f"Cancelled: {', '.join(cancelled)}"
-        else:
+        if not cancelled:
             reply = "Couldn't find a matching reminder to cancel."
+        elif cancelled[0].startswith("_DISAMBIG_:"):
+            entries = cancelled[0][len("_DISAMBIG_:"):].split("|")
+            lines = ["Found multiple matching reminders — which one to cancel?"]
+            for i, entry in enumerate(entries, 1):
+                parts = entry.split(":", 1)
+                msg = parts[1] if len(parts) > 1 else entry
+                lines.append(f"{i}. {msg}")
+            lines.append("\nReply with the number or 'all' to cancel all.")
+            todo_disambig_sessions[user_id] = {"tasks": [e.split(":")[0] for e in entries], "action": "cancel_reminder", "entries": entries}
+            reply = "\n".join(lines)
+        else:
+            reply = f"Cancelled: {', '.join(cancelled)}"
     elif is_reschedule_request(text):
         reply = handle_reschedule(text, user_id)
     elif is_reminder_request(text):
@@ -4643,11 +6197,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = show_last_expense()
     elif lower in ["trip summary", "trip spend", "how much have i spent", "trip expenses"]:
         reply = get_trip_summary()
+    elif lower in ["trip history", "my trips", "past trips", "trips"]:
+        reply = format_trip_history()
+    elif lower in ["current trip", "active trip", "am i overseas", "overseas status"]:
+        if overseas_state.get("active"):
+            dest = overseas_state.get("destination", "Unknown")
+            curr = overseas_state.get("currency", "SGD")
+            dep = overseas_state.get("dep_flight", "")
+            ret_data = overseas_state.get("return_flight")
+            ret_flight = ret_data.get("flight", "") if isinstance(ret_data, dict) else ""
+            reply = f"✈️ Active trip: {dest} ({curr})"
+            if dep:
+                reply += f"\nOutbound: {dep}"
+            if ret_flight:
+                reply += f"\nReturn: {ret_flight}"
+        else:
+            reply = "No active trip — you're in SG mode."
     elif lower.startswith("edit last expense ") or lower.startswith("edit expense "):
-        # "edit last expense category to FnB" or "edit expense card to Citi"
-        m = re.search(r"edit (?:last )?expense (\w+) to (.+)", lower)
-        if m:
-            reply = edit_last_expense(m.group(1), m.group(2).strip())
+        # Strip the command prefix and pass the rest as the edit text
+        edit_text = re.sub(r"^edit (?:last )?expense\s+", "", text, flags=re.IGNORECASE).strip()
+        if edit_text:
+            reply = edit_last_expense(edit_text)
         else:
             reply = show_last_expense()
     elif lower.startswith("rename category "):
@@ -4734,13 +6304,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif is_restaurant_search(text):
         reply = handle_search_restaurants(text)
     elif is_restaurant_save(text):
-        reply = handle_save_restaurant(text)
+        result = handle_save_restaurant(text)
+        if result.startswith("_NEEDS_LOCATION_:"):
+            parts = result.split(":", 2)
+            name = parts[1] if len(parts) > 1 else ""
+            country = parts[2] if len(parts) > 2 else "Singapore"
+            pending_restaurant_saves[user_id] = {"name": name, "country": country, "step": "awaiting_location"}
+            reply = f"⚠️ Couldn't read that Maps link — what's the location for {name}?\n(e.g. 313 Orchard Road, Singapore)"
+        elif result.startswith("_DUPLICATE_RESTAURANT_:"):
+            parts = result.split(":", 5)
+            pending_restaurant_saves[user_id] = {
+                "step": "duplicate", "existing": parts[1], "name": parts[2],
+                "location": parts[3], "country": parts[4],
+                "tags": parts[5] if len(parts) > 5 else "", "notes": ""
+            }
+            reply = f"*{parts[1]}* is already in your list.\nUpdate existing or save as new? (update / new)"
+        else:
+            reply = result
     elif lower.startswith("search restaurants "):
         reply = search_restaurants(text[19:].strip())
 
     # Stock Commands
     elif lower in ["portfolio", "my portfolio", "holdings", "portfolio performance"]:
         reply = get_portfolio_performance()
+    elif lower in ["delete from portfolio", "remove from portfolio", "delete holding", "remove holding",
+                   "portfolio delete", "clear holding"]:
+        rows = get_portfolio_rows()
+        if not rows:
+            reply = "Nothing in your portfolio to remove."
+        else:
+            portfolio_delete_sessions[user_id] = {"step": "pick", "rows": rows}
+            reply = format_portfolio_delete_list(rows)
+    elif lower.startswith("delete portfolio ") or lower.startswith("remove portfolio "):
+        query = re.sub(r"^(delete|remove) portfolio\s+", "", lower).strip().upper()
+        results = search_portfolio_by_ticker(query)
+        if not results:
+            reply = f"No holdings found matching '{query}'."
+        elif len(results) == 1:
+            sheet_row, _ = results[0]
+            reply = delete_portfolio_row(sheet_row)
+        else:
+            portfolio_delete_sessions[user_id] = {"step": "pick", "rows": results}
+            reply = format_portfolio_delete_list(results)
     elif lower in ["market summary", "market today", "how is the market", "market update",
                    "weekly market summary", "how are markets"]:
         reply = get_market_summary_now()
@@ -4753,7 +6358,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif lower.startswith("todo "):
         reply = add_todo(text[5:])
     elif lower.startswith("done "):
-        reply = complete_todo(text[5:])
+        result = complete_todo(text[5:])
+        if result.startswith("_DISAMBIG_TODO_COMPLETE_:"):
+            tasks = result.split(":", 1)[1].split("|")
+            todo_disambig_sessions[user_id] = {"tasks": tasks, "action": "complete"}
+            lines = ["Found multiple matching tasks — which one?"]
+            for i, t in enumerate(tasks, 1):
+                lines.append(f"{i}. {t}")
+            lines.append("\nReply with the number.")
+            reply = "\n".join(lines)
+        else:
+            reply = result
+    elif lower.startswith("delete todo ") or lower.startswith("remove todo "):
+        task_name = re.sub(r"^(delete|remove) todo\s+", "", lower).strip()
+        result = delete_todo(task_name)
+        if result.startswith("_DISAMBIG_TODO_DELETE_:"):
+            tasks = result.split(":", 1)[1].split("|")
+            todo_disambig_sessions[user_id] = {"tasks": tasks, "action": "delete"}
+            lines = ["Found multiple matching tasks — which one?"]
+            for i, t in enumerate(tasks, 1):
+                lines.append(f"{i}. {t}")
+            lines.append("\nReply with the number.")
+            reply = "\n".join(lines)
+        else:
+            reply = result
     elif lower == "todos":
         reply = list_todos()
 
@@ -4826,7 +6454,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_overseas_mode_request(text):
             reply = handle_overseas_request(text)
         elif is_restaurant_save(text):
-            reply = handle_save_restaurant(text)
+            result = handle_save_restaurant(text)
+            if result and result.startswith("_NEEDS_LOCATION_:"):
+                parts = result.split(":", 2)
+                name = parts[1] if len(parts) > 1 else ""
+                country = parts[2] if len(parts) > 2 else "Singapore"
+                pending_restaurant_saves[user_id] = {"name": name, "country": country, "step": "awaiting_location"}
+                reply = f"⚠️ Couldn't read that Maps link — what's the location for {name}?\n(e.g. 313 Orchard Road, Singapore)"
+            elif result and result.startswith("_DUPLICATE_RESTAURANT_:"):
+                parts = result.split(":", 5)
+                pending_restaurant_saves[user_id] = {
+                    "step": "duplicate", "existing": parts[1], "name": parts[2],
+                    "location": parts[3], "country": parts[4],
+                    "tags": parts[5] if len(parts) > 5 else "", "notes": ""
+                }
+                reply = f"*{parts[1]}* is already in your list.\nUpdate existing or save as new? (update / new)"
+            else:
+                reply = result
         elif is_restaurant_search(text):
             reply = handle_search_restaurants(text)
         elif is_bill_request(text):
@@ -4877,13 +6521,134 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(reply)
 
 # --- Main ---
+
+async def check_missed_items_on_startup(app):
+    """Check for missed follow-ups, bill reminders, reminders, and market summary while offline."""
+    try:
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+        missed_followups = []
+        missed_bills = []
+        missed_reminders = []
+
+        # Missed follow-ups
+        try:
+            sheet = crm_sheet()
+            records = sheet.get_all_records()
+            for r in records:
+                fu_date_str = r.get("Follow Up Date", "")
+                if fu_date_str:
+                    for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]:
+                        try:
+                            fu_date = datetime.strptime(fu_date_str, fmt).date()
+                            if fu_date < today:
+                                missed_followups.append({
+                                    "name": r.get("Name", "?"),
+                                    "date": fu_date_str,
+                                    "notes": r.get("Follow Up Notes", "")
+                                })
+                            break
+                        except ValueError:
+                            continue
+        except Exception as e:
+            print(f"Missed followups check error: {e}")
+
+        # Missed bill reminders
+        try:
+            ws = bills_sheet()
+            records = ws.get_all_records()
+            for r in records:
+                due_day = int(r.get("Due Date", 0) or 0)
+                if due_day and yesterday.day == due_day:
+                    missed_bills.append(r.get("Name", "?"))
+        except Exception as e:
+            print(f"Missed bills check error: {e}")
+
+        # Missed reminders
+        try:
+            ws = reminders_sheet()
+            records = ws.get_all_records()
+            now = datetime.now(TIMEZONE)
+            for i, r in enumerate(records, start=2):
+                if r.get("Status") != "pending":
+                    continue
+                scheduled_str = r.get("Scheduled Time", "")
+                if not scheduled_str:
+                    continue
+                try:
+                    scheduled = TIMEZONE.localize(datetime.strptime(scheduled_str, "%Y-%m-%d %H:%M"))
+                    if scheduled < now:
+                        missed_reminders.append({
+                            "message": r.get("Message", ""),
+                            "row": i,
+                            "recurrence": r.get("Recurrence", "once")
+                        })
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"Missed reminders check error: {e}")
+
+        # Send missed follow-ups notification
+        if missed_followups:
+            lines = ["⚠️ Missed follow-ups while offline:"]
+            for f in missed_followups:
+                lines.append(f"• {f['name']} — was due {f['date']}")
+            lines.append("\nReply 'followups' for details, 'skip missed' to dismiss all, or 'skip [name]' for one.")
+            await app.bot.send_message(chat_id=YOUR_CHAT_ID, text="\n".join(lines))
+
+        # Send missed bills notification
+        if missed_bills:
+            lines = ["⚠️ Missed bill reminder(s) while offline:"]
+            for b in missed_bills:
+                lines.append(f"• {b}")
+            lines.append("\nReply 'skip missed bills' to dismiss.")
+            await app.bot.send_message(chat_id=YOUR_CHAT_ID, text="\n".join(lines))
+
+        # Fire missed reminders immediately
+        for rem in missed_reminders:
+            try:
+                await app.bot.send_message(
+                    chat_id=YOUR_CHAT_ID,
+                    text=f"🔔 Reminder (missed while offline): {rem['message']}"
+                )
+                # Update recurrence or mark sent
+                ws = reminders_sheet()
+                if rem["recurrence"] != "once":
+                    next_time = get_next_recurrence(
+                        datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+                        rem["recurrence"]
+                    )
+                    if next_time:
+                        ws.update_cell(rem["row"], 3, next_time)
+                else:
+                    ws.update_cell(rem["row"], 5, "sent")
+            except Exception as e:
+                print(f"Missed reminder fire error: {e}")
+
+        # Check missed Monday market summary
+        try:
+            if today.weekday() == 0:  # Monday
+                await app.bot.send_message(
+                    chat_id=YOUR_CHAT_ID,
+                    text="Missed the Monday market summary while offline — want me to send it now? (yes / no)"
+                )
+                market_summary_pending[YOUR_CHAT_ID] = True
+        except Exception as e:
+            print(f"Missed market summary check error: {e}")
+
+    except Exception as e:
+        print(f"check_missed_items_on_startup error: {e}")
+
 async def post_init(app):
     global _scheduler, _app_ref
-    # Run infrastructure setup
-    run_infrastructure_setup()
+    # Run infrastructure setup and capture health status
+    health = run_infrastructure_setup()
+
+    # Restore overseas mode if there was an active trip before restart
+    restore_overseas_from_trips()
 
     timezone = pytz.timezone("Asia/Kuala_Lumpur")
-    scheduler = AsyncIOScheduler(timezone=timezone)
+    scheduler = AsyncIOScheduler(timezone=timezone, misfire_grace_time=30)
     _scheduler = scheduler
     _app_ref = app
 
@@ -4901,6 +6666,7 @@ async def post_init(app):
 
     # Bill reminders — daily at 9am
     scheduler.add_job(send_bill_reminders, "cron", hour=9, minute=0, args=[app])
+    scheduler.add_job(check_icloud_daily, "cron", hour=9, minute=5, args=[app])
 
     # Price alerts — check every 15 minutes
     scheduler.add_job(check_price_alerts, "interval", minutes=15, args=[app])
@@ -4913,7 +6679,14 @@ async def post_init(app):
     scheduler.add_job(refresh_fx_rates, "cron", hour=20, minute=0)
 
     scheduler.start()
+    health["Scheduler"] = "✅ Running"
     print("✅ Scheduler started — follow-ups + bills at 9am, birthdays at 12pm + 2pm, reminders every minute, market Monday 8am")
+
+    # Send startup message if new deployment
+    await send_startup_message(app, health)
+
+    # Check for missed items while offline
+    await check_missed_items_on_startup(app)
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
