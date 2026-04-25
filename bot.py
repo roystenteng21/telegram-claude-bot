@@ -2782,6 +2782,31 @@ def save_merchant_memory(merchant, category, card):
     except Exception as e:
         print(f"Error saving merchant: {e}")
 
+def delete_merchant(merchant_name):
+    """Delete a merchant from the Merchant Map by name (fuzzy match)."""
+    try:
+        sheet = merchant_map_sheet()
+        records = sheet.get_all_values()
+        if len(records) <= 1:
+            return "No merchants saved yet."
+        matches = []
+        for i, row in enumerate(records[1:], start=2):
+            if row and merchant_name.lower() in row[0].lower():
+                matches.append((i, row[0]))
+        if not matches:
+            return f"No merchant found matching \'{merchant_name}\'."
+        if len(matches) == 1:
+            row_idx, found_name = matches[0]
+            sheet.delete_rows(row_idx)
+            return f"Deleted \'{found_name}\' from merchant memory ✅\nNext time you log there, I\'ll ask for category and card again."
+        lines = [f"Found {len(matches)} merchants matching \'{merchant_name}\' — which one?"]
+        for i, (_, name) in enumerate(matches, 1):
+            lines.append(f"{i}. {name}")
+        lines.append("\nReply \'delete merchant [exact name]\' to remove a specific one.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error deleting merchant: {e}"
+
 def parse_expense_text(text):
     """Redirect to v2 which uses live category/card lists."""
     return parse_expense_text_v2(text)
@@ -6269,6 +6294,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         "known merchants"
     ]):
         reply = get_merchant_list()
+    elif lower.startswith("delete merchant ") or lower.startswith("remove merchant ") or lower.startswith("forget merchant "):
+        merchant_name = text.split(" ", 2)[2].strip()
+        reply = delete_merchant(merchant_name)
     elif lower in ["expense report", "monthly report", "spending report", "expenses"]:
         reply = get_expense_report()
     elif lower in ["delete last expense", "remove last expense"]:
