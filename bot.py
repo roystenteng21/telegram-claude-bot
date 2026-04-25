@@ -209,17 +209,18 @@ def get_or_create_drive_folder(name, parent_id=None):
     print(f"Created Drive folder: {name}")
     return folder["id"]
 
+RECEIPTS_FOLDER_ID = os.getenv("RECEIPTS_FOLDER_ID", "14pG1lNPANRwehiW_xSFjoHzt-AUk5-Xb")
+
 def setup_drive():
     """Create Em's Drive folder structure."""
     em_id = get_or_create_drive_folder("Em")
-    receipts_id = get_or_create_drive_folder("Receipts", em_id)
     meeting_notes_id = get_or_create_drive_folder("Meeting Notes", em_id)
     backups_id = get_or_create_drive_folder("Backups", em_id)
     settings_id = get_or_create_drive_folder("Settings", em_id)
     print("✅ Drive folders setup complete")
     return {
         "em": em_id,
-        "receipts": receipts_id,
+        "receipts": RECEIPTS_FOLDER_ID,  # shared folder — no service account quota issues
         "meeting_notes": meeting_notes_id,
         "backups": backups_id,
         "settings": settings_id
