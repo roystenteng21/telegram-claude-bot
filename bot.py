@@ -3470,8 +3470,9 @@ async def handle_receipt_confirm_session(user_id, text, update):
                     session["merchant"] = canonical
                 if known_cat and not edits.get("category"):
                     session["category"] = known_cat
-                if known_card and not edits.get("card"):
-                    session["card"] = known_card
+                # Always re-derive card from category, not merchant memory
+                if session.get("category") and not edits.get("card"):
+                    session["card"] = get_card_default_for_category(session["category"])
             elif field == "amount":
                 try:
                     session["amount"] = float(re.sub(r"[^\d.]", "", value))
@@ -3677,13 +3678,12 @@ def handle_expense_text(text, user_id, receipt_link="", last4=None):
             merchant = canonical
         if known_cat and not category:
             category = known_cat
-        if known_card and not card:
-            card = known_card
+        # Card always derived from category default, never from merchant memory
 
-        # Card default from category if still no card
-        if not card and category:
+        # Card default from category
+        if category:
             card = get_card_default_for_category(category)
-        elif not card:
+        else:
             card = "Citi"  # global fallback
 
         # Card override from last4
