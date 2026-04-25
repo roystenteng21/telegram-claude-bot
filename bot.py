@@ -2537,6 +2537,8 @@ def get_fx_rate(currency):
                 if currency in manual_fx_rates:
                     del manual_fx_rates[currency]
                 return rate
+            else:
+                print(f"FX API non-success for {currency}: {data.get('error-type', data)}")
         except Exception as e:
             print(f"FX fetch error for {currency}: {e}")
 
