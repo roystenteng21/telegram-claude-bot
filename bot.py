@@ -2561,14 +2561,57 @@ def save_manual_fx_rate(currency, rate, sgd_per_unit=True):
     print(f"Manual FX rate saved: 1 {currency} = {rate} SGD")
 
 def parse_manual_fx_input(text, currency):
-    """Parse manual FX rate input. Supports two formats:
+    """Parse manual FX rate input. Supports multiple formats:
     - '110' or '1 SGD = 110 JPY' → SGD to foreign (sgd_per_unit=False)
     - '0.0093' or '1 JPY = 0.0093 SGD' → foreign to SGD (sgd_per_unit=True)
+    - '1sgd to 3.11 myr' or '1sgd to 3.11 my' → SGD to foreign (partial currency codes accepted)
     Returns (rate_as_sgd_per_unit, display_str) or (None, None)
     """
     try:
         text = text.strip().replace(",", "")
-        # Try to extract just a number
+        text_lower = text.lower()
+
+        # Normalise partial currency codes to 3-letter (e.g. "my" → "myr", "rp" → "idr")
+        partial_currency_map = {
+            "my": "myr", "rm": "myr",
+            "rp": "idr",
+            "bt": "thb", "baht": "thb",
+            "vnd": "vnd", "dong": "vnd",
+            "php": "php", "peso": "php",
+        }
+        for partial, full in partial_currency_map.items():
+            text_lower = re.sub(rf"\b{partial}\b", full, text_lower)
+
+        # Extract all numbers from text
+        nums = re.findall(r"[\d]+\.[\d]+|[\d]+", text_lower)
+        if not nums:
+            return None, None
+
+        # Try to detect "1 SGD to X CURRENCY" pattern
+        to_pattern = re.search(
+            r"1\s*sgd\s+(?:to|=|:)\s*([\d.]+)\s*\w*", text_lower
+        )
+        if to_pattern:
+            num = float(to_pattern.group(1))
+            if num <= 0:
+                return None, None
+            sgd_per_unit = False
+            display = f"$1 SGD = {num:.4f} {currency}"
+            return (num, sgd_per_unit), display
+
+        # Try to detect "1 CURRENCY to X SGD" pattern
+        curr_to_sgd = re.search(
+            rf"1\s*{re.escape(currency.lower())}\s+(?:to|=|:)\s*([\d.]+)\s*(?:sgd)?", text_lower
+        )
+        if curr_to_sgd:
+            num = float(curr_to_sgd.group(1))
+            if num <= 0:
+                return None, None
+            sgd_per_unit = True
+            display = f"1 {currency} = ${num:.4f} SGD"
+            return (num, sgd_per_unit), display
+
+        # Fall back to extracting first number and inferring direction
         num_match = re.search(r"[\d.]+", text)
         if not num_match:
             return None, None
@@ -2576,18 +2619,14 @@ def parse_manual_fx_input(text, currency):
         if num <= 0:
             return None, None
 
-        # Determine direction from context
-        text_lower = text.lower()
+        # Determine direction from keyword context
         if "sgd" in text_lower and currency.lower() in text_lower:
-            # Check which side SGD is on
             sgd_pos = text_lower.index("sgd")
             curr_pos = text_lower.index(currency.lower()) if currency.lower() in text_lower else -1
             if curr_pos > sgd_pos:
-                # SGD first → $1 SGD = N currency → rate per unit = 1/N
                 sgd_per_unit = False
-                display = f"$1 SGD = {num:.2f} {currency}"
+                display = f"$1 SGD = {num:.4f} {currency}"
             else:
-                # Currency first → 1 currency = N SGD
                 sgd_per_unit = True
                 display = f"1 {currency} = ${num:.4f} SGD"
         elif num > 10:
@@ -3376,11 +3415,12 @@ async def handle_receipt_confirm_session(user_id, text, update):
         parsed_rate, display = parse_manual_fx_input(text, currency)
         if parsed_rate is None:
             await update.message.reply_text(
-                f"Couldn't read that rate. Try:\n"
-                f"• {currency} to SGD: e.g. 0.0093\n"
-                f"• SGD to {currency}: e.g. 110"
+                f"Couldn't read that rate — try one of these formats:\n"
+                f"• `3.11` (1 {currency} = 3.11 SGD)\n"
+                f"• `1 SGD to 3.11 {currency}`\n"
+                f"• `1 {currency} = 3.11 SGD`"
             )
-            return True
+            return True  # Stay in session, don't drop
         num, sgd_per_unit = parsed_rate
         save_manual_fx_rate(currency, num, sgd_per_unit)
         rate = get_fx_rate(currency)
@@ -3520,7 +3560,7 @@ async def handle_receipt_confirm_session(user_id, text, update):
         return True
 
     # Unrecognised input
-    await update.message.reply_text("Reply yes, skip, or enter fields to edit (e.g. category FnB card Maybank)")
+    await update.message.reply_text("Didn't catch that — reply yes to log, skip to cancel, or edit fields (e.g. category FnB card Citi)")
     return True
 
 async def _finalise_receipt_confirm(user_id, session, update):
@@ -3562,11 +3602,12 @@ async def handle_expense_session(user_id, text, update):
         parsed_rate, display = parse_manual_fx_input(text, currency)
         if parsed_rate is None:
             await update.message.reply_text(
-                f"Couldn't read that rate. Try:\n"
-                f"• {currency} to SGD: e.g. 0.0093\n"
-                f"• SGD to {currency}: e.g. 110"
+                f"Couldn't read that rate — try one of these formats:\n"
+                f"• `3.11` (1 {currency} = 3.11 SGD)\n"
+                f"• `1 SGD to 3.11 {currency}`\n"
+                f"• `1 {currency} = 3.11 SGD`"
             )
-            return
+            return  # Stay in session, don't drop
         num, sgd_per_unit = parsed_rate
         save_manual_fx_rate(currency, num, sgd_per_unit)
         rate = get_fx_rate(currency)
@@ -3678,16 +3719,20 @@ def handle_expense_text(text, user_id, receipt_link="", last4=None):
             merchant = canonical
         if known_cat and not category:
             category = known_cat
-        # Card always derived from category default, never from merchant memory
+        # Card priority: (1) explicit user input, (2) category default, (3) global fallback
+        # Never let merchant memory or category default override an explicit card from the user
+        explicit_card = card  # preserve what the parser extracted from user text
 
-        # Card default from category
-        if category:
-            card = get_card_default_for_category(category)
-        else:
-            card = "Citi"  # global fallback
+        if not explicit_card:
+            # No explicit card — derive from category
+            if category:
+                card = get_card_default_for_category(category)
+            else:
+                card = "Citi"  # global fallback
+        # else: keep explicit_card as-is
 
-        # Card override from last4
-        if last4:
+        # Card override from last4 (receipt scan) — only if no explicit card
+        if last4 and not explicit_card:
             matched_card = get_card_by_last4(last4)
             if matched_card:
                 card = matched_card
@@ -3745,8 +3790,11 @@ def handle_expense_text(text, user_id, receipt_link="", last4=None):
         if not amount:
             missing.append("amount")
 
-        # Option B: auto-log if everything is known and no flags
-        if not missing and not high_amount and not use_manual_rate:
+        is_new_merchant = not bool(known_cat)
+
+        # Option B: auto-log only if everything known, no flags, AND it's a known merchant
+        # New merchants always go through confirm screen
+        if not missing and not high_amount and not use_manual_rate and not is_new_merchant:
             log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
             save_merchant_memory(merchant, category, card)
             return format_expense_logged(merchant, amount, currency, category, card, sgd_amount, last4), False, None
@@ -3758,7 +3806,7 @@ def handle_expense_text(text, user_id, receipt_link="", last4=None):
             "step": "receipt_confirm", "missing_fields": missing,
             "receipt_link": receipt_link, "last4": last4,
             "high_amount": high_amount, "use_manual_rate": use_manual_rate,
-            "is_new_merchant": not bool(known_cat)
+            "is_new_merchant": is_new_merchant
         }
         receipt_sessions_key = user_id
         receipt_confirm_sessions[receipt_sessions_key] = session
@@ -3773,12 +3821,12 @@ def handle_expense_text(text, user_id, receipt_link="", last4=None):
     except (json.JSONDecodeError, ValueError, KeyError) as e:
         print(f"parse_expense_text error: {e} | input: {text}")
         return (
-            "Couldn't read that as an expense.\n"
+            f"❌ Couldn't parse that as an expense ({type(e).__name__}: {str(e)[:60]}).\n"
             "Try: 'log [merchant] [amount]' — e.g. 'log Starbucks $5.60'"
         ), False, None
     except Exception as e:
         print(f"handle_expense_text unexpected error: {e}")
-        return "Something went wrong logging that — try again or use 'log [merchant] [amount]'.", False, None
+        return f"❌ Something went wrong logging that ({type(e).__name__}: {str(e)[:80]}). Try again or use 'log [merchant] [amount]'.", False, None
 
 
 
@@ -5064,14 +5112,14 @@ MARKET_FLAGS = {
 }
 
 def fetch_market_rss_headlines(market_name):
-    """Fetch top 2 market headlines from Google News RSS for a given market."""
+    """Fetch top 3 market headlines from Google News RSS for a given market.
+    Tries multiple query variants for better coverage."""
     try:
         queries = {
-            "US": "US stock market",
-            "China": "China stock market",
-            "India": "India stock market Nifty Sensex",
+            "US": ["US stock market", "Wall Street stocks", "S&P 500 Nasdaq Dow"],
+            "China": ["China stock market", "Shanghai Shenzhen stocks", "China economy markets"],
+            "India": ["India stock market Nifty", "Sensex Nifty BSE", "India economy stocks"],
         }
-        # Extract short market key
         key = None
         for k in queries:
             if k in market_name:
@@ -5079,19 +5127,29 @@ def fetch_market_rss_headlines(market_name):
                 break
         if not key:
             return []
-        q = queries[key].replace(" ", "+")
-        url = f"https://news.google.com/rss/search?q={q}&hl=en-SG&gl=SG&ceid=SG:en"
-        resp = requests.get(url, timeout=5)
+
         import xml.etree.ElementTree as ET
-        root = ET.fromstring(resp.content)
         headlines = []
-        for item in root.findall(".//item")[:2]:
-            title = item.findtext("title", "").split(" - ")[0].strip()
-            if title:
-                headlines.append(title)
-        return headlines
+        for q_text in queries[key]:
+            if len(headlines) >= 3:
+                break
+            q = q_text.replace(" ", "+")
+            url = f"https://news.google.com/rss/search?q={q}&hl=en-SG&gl=SG&ceid=SG:en"
+            try:
+                resp = requests.get(url, timeout=5)
+                root = ET.fromstring(resp.content)
+                for item in root.findall(".//item"):
+                    if len(headlines) >= 3:
+                        break
+                    title = item.findtext("title", "").split(" - ")[0].strip()
+                    if title and title not in headlines:
+                        headlines.append(title)
+            except Exception as e:
+                print(f"RSS fetch error for {market_name} query '{q_text}': {e}")
+                continue
+        return headlines[:3]
     except Exception as e:
-        print(f"RSS fetch error for {market_name}: {e}")
+        print(f"fetch_market_rss_headlines error for {market_name}: {e}")
         return []
 
 def get_market_summary_now():
@@ -5144,22 +5202,24 @@ def get_market_summary_now():
         overall = "broadly positive" if sentiments.count("positive") >= 2 else \
                   "broadly negative" if sentiments.count("negative") >= 2 else "mixed"
 
-        # Claude narrative — 2 sentences max, casual tone
+        # Claude narrative — 2-3 sentences, casual, punchy
         try:
             narrative_resp = client.messages.create(
                 model="claude-sonnet-4-5",
-                max_tokens=120,
+                max_tokens=150,
                 messages=[{
                     "role": "user",
                     "content": (
                         f"Here's today's market data:\n{data_summary}\n\n"
-                        "Write a 2-sentence casual market narrative summary for a personal assistant bot. "
-                        "No bullet points, no headers, just plain sentences. Keep it punchy."
+                        "Write a 2-3 sentence casual market narrative for a personal assistant bot. "
+                        "Highlight the most notable move or story. No bullet points, no headers, just plain punchy sentences. "
+                        "Don't start with 'Markets' — vary the opener."
                     )
                 }]
             )
             narrative = narrative_resp.content[0].text.strip()
-        except Exception:
+        except Exception as e:
+            print(f"Market narrative Claude error: {e}")
             narrative = ""
 
         # Format output
@@ -5167,7 +5227,9 @@ def get_market_summary_now():
         for b in market_data_blocks:
             section = f"{b['flag']} *{b['market']}*\n" + "\n".join(b["index_lines"])
             if b["headlines"]:
-                section += "\n_" + b["headlines"][0] + "_"
+                # Show up to 3 headlines
+                for hl in b["headlines"][:3]:
+                    section += f"\n_{hl}_"
             lines.append(section)
         lines.append(f"Overall: {overall.title()}")
         if narrative:
@@ -5176,7 +5238,7 @@ def get_market_summary_now():
         return "\n\n".join(lines)
 
     except Exception as e:
-        return f"Couldn't pull market data right now: {str(e)}"
+        return f"❌ Couldn't pull market data right now ({type(e).__name__}: {str(e)[:80]})"
 
 
 async def handle_statement_upload(file_bytes, fname, user_id, update):
@@ -5453,7 +5515,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != YOUR_CHAT_ID:
         return
 
-    # Handle document/file uploads (Excel import or bank statement)
+    try:
+        await _handle_message_inner(update, context, user_id)
+    except Exception as e:
+        import traceback
+        err_type = type(e).__name__
+        err_msg = str(e)[:120]
+        tb_lines = traceback.format_exc().splitlines()
+        # Find the most relevant line (last line with our code)
+        location = next((l.strip() for l in reversed(tb_lines) if "bot.py" in l), "")
+        detail = f"{err_type}: {err_msg}"
+        if location:
+            detail += f"\n({location})"
+        print(f"UNHANDLED handle_message error: {traceback.format_exc()}")
+        try:
+            await update.message.reply_text(f"❌ Something went wrong: {detail}")
+        except Exception:
+            pass
+
+async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     if update.message.document:
         doc = update.message.document
         fname = doc.file_name or ""
@@ -5589,10 +5669,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             await update.message.reply_text(reply)
                 else:
-                    await update.message.reply_text("I read the receipt but couldn't parse it cleanly. Try adding a caption like '45.50 Ichiran'.")
+                    await update.message.reply_text(f"Read the receipt but got an unexpected format from vision — got: '{vision_text}'\nTry adding a caption like '45.50 Ichiran'.")
             except Exception as e:
                 print(f"Vision parse error: {e}")
-                await update.message.reply_text("Couldn't read the receipt automatically. Add a caption like '45.50 Ichiran' and resend.")
+                await update.message.reply_text(f"❌ Couldn't read the receipt automatically ({type(e).__name__}: {str(e)[:80]}). Add a caption like '45.50 Ichiran' and resend.")
             return
 
         if is_expense_input(caption):
@@ -6399,15 +6479,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Infrastructure / Settings
     elif lower == "em status":
-        folder_status = "✅ Connected" if DRIVE_FOLDERS else "❌ Not connected"
-        profile_version = em_profile.get("version", "unknown")
-        reply = (
-            f"⚙️ *Em Status*\n\n"
-            f"Google Drive: {folder_status}\n"
-            f"em_profile version: {profile_version}\n"
-            f"Sheets: ✅ Connected\n"
-            f"Scheduler: ✅ Running"
-        )
+        issues = []
+        # Google Drive
+        if not DRIVE_FOLDERS:
+            issues.append("• Google Drive: not connected — check GOOGLE_CREDENTIALS in Railway")
+        # Sheets
+        try:
+            spreadsheet.worksheet("Expenses")
+        except Exception as e:
+            issues.append(f"• Sheets: connection error — {str(e)[:60]}")
+        # Scheduler
+        if not _scheduler or not _scheduler.running:
+            issues.append("• Scheduler: not running — reminders and scheduled jobs are down, restart the bot")
+        # Profile
+        if not em_profile or not em_profile.get("version"):
+            issues.append("• Profile: not loaded — reply 'reload profile' to retry")
+        # iCloud
+        try:
+            get_calendar("Personal")
+        except Exception as e:
+            issues.append(f"• iCloud Calendar: unreachable — check ICLOUD_USERNAME / ICLOUD_PASSWORD in Railway")
+        # Anthropic API
+        if _anthropic_failure_count >= ANTHROPIC_FAILURE_THRESHOLD:
+            issues.append("• Anthropic API: repeated failures detected — check API key or Anthropic status page")
+
+        if not issues:
+            reply = "✅ Systems all green"
+        else:
+            lines = ["⚠️ Issues detected:\n"] + issues
+            reply = "\n".join(lines)
 
     # Help
     elif lower == "help":
