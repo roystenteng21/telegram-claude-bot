@@ -194,7 +194,10 @@ def get_or_create_drive_folder(name, parent_id=None):
     query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
     if parent_id:
         query += f" and '{parent_id}' in parents"
-    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+    results = drive_service.files().list(
+        q=query, fields="files(id, name)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True
+    ).execute()
     files = results.get("files", [])
     if files:
         return files[0]["id"]
@@ -205,7 +208,9 @@ def get_or_create_drive_folder(name, parent_id=None):
     }
     if parent_id:
         meta["parents"] = [parent_id]
-    folder = drive_service.files().create(body=meta, fields="id").execute()
+    folder = drive_service.files().create(
+        body=meta, fields="id", supportsAllDrives=True
+    ).execute()
     print(f"Created Drive folder: {name}")
     return folder["id"]
 
@@ -5615,7 +5620,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
                 file_meta = {"name": temp_name, "parents": [month_folder_id]}
                 uploaded = drive_service.files().create(
-                    body=file_meta, media_body=media, fields="id,webViewLink"
+                    body=file_meta, media_body=media, fields="id,webViewLink",
+                    supportsAllDrives=True
                 ).execute()
                 drive_file_id = uploaded.get("id", "")
                 receipt_link = uploaded.get("webViewLink", "")
@@ -5631,7 +5637,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 new_name = f"{today_str}-{safe_merchant}.jpg"
                 drive_service.files().update(
                     fileId=drive_file_id,
-                    body={"name": new_name}
+                    body={"name": new_name},
+                    supportsAllDrives=True
                 ).execute()
             except Exception as e:
                 print(f"Receipt rename error: {e}")
@@ -5657,8 +5664,11 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                                 "type": "text",
                                 "text": (
                                     f"This is a receipt. Extract: merchant name, total amount, and currency (default {curr} if not shown). "
+                                    "For the merchant name, use the full brand or shop name as printed at the top of the receipt (e.g. '108 Matcha Saro', 'Starbucks Coffee', 'Din Tai Fung'). "
+                                    "Do not shorten or summarise it — use the actual name on the receipt. "
+                                    "For amount, use the final total (Net Total, Total, Grand Total — not subtotal). "
                                     "Reply ONLY in this format with no other text: MERCHANT | AMOUNT | CURRENCY\n"
-                                    "Example: Starbucks | 8.50 | SGD"
+                                    "Example: 108 Matcha Saro | 85.70 | MYR"
                                 )
                             }
                         ]
