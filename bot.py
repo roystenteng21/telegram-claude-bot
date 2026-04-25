@@ -5689,8 +5689,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                                 "type": "text",
                                 "text": (
                                     f"This is a receipt. Extract: merchant name, total amount, and currency (default {curr} if not shown). "
-                                    "For the merchant name, use the full brand or shop name as printed at the top of the receipt (e.g. '108 Matcha Saro', 'Starbucks Coffee', 'Din Tai Fung'). "
-                                    "Do not shorten or summarise it — use the actual name on the receipt. "
+                                    "For the merchant name, copy it exactly as printed at the very top of the receipt — including any numbers or prefixes (e.g. '108 Matcha Saro', not 'Matcha Saro'). "
+                                    "Do not shorten, capitalise, or summarise — copy the exact name character by character. "
                                     "For amount, use the final total (Net Total, Total, Grand Total — not subtotal). "
                                     "Reply ONLY in this format with no other text: MERCHANT | AMOUNT | CURRENCY\n"
                                     "Example: 108 Matcha Saro | 85.70 | MYR"
