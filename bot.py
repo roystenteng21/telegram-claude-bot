@@ -698,7 +698,9 @@ async def notify_anthropic_down(app):
             print(f"notify_anthropic_down error: {e}")
 
 def sheets_call_with_retry(fn, *args, max_retries=2, **kwargs):
-    """Wrap a Google Sheets API call with quota retry logic."""
+    """Wrap a Google Sheets API call with quota retry logic.
+    Sleep is kept short (5s) — this is a sync function and cannot use asyncio.sleep.
+    Quota errors are rare; long sleeps block the entire event loop."""
     import time as _time
     for attempt in range(max_retries):
         try:
@@ -706,11 +708,11 @@ def sheets_call_with_retry(fn, *args, max_retries=2, **kwargs):
         except Exception as e:
             err_str = str(e).lower()
             if "quota" in err_str or "rate" in err_str or "429" in err_str:
-                print(f"Sheets quota hit — retrying in 60s (attempt {attempt+1})")
-                _time.sleep(60)
+                print(f"Sheets quota hit — retrying in 5s (attempt {attempt+1})")
+                _time.sleep(5)
             else:
                 raise
-    raise Exception("Google Sheets rate limit — retrying automatically in 60s.")
+    raise Exception("Google Sheets rate limit exceeded after retries.")
 
 
 def get_calendar(name=None):
@@ -740,8 +742,7 @@ def get_calendar(name=None):
     except Exception:
         pass
 
-    # Retry after 3 seconds
-    _time.sleep(3)
+    # Retry immediately (removed blocking sleep — was freezing event loop)
     try:
         result = _attempt()
         _icloud_down = False
@@ -779,7 +780,7 @@ def format_date(date_str):
     try:
         d = datetime.strptime(date_str, "%d/%m/%Y")
         return d.strftime("%d %b %Y")
-    except:
+    except (ValueError, TypeError):
         return date_str
 
 def calculate_age(birthday_str):
@@ -788,7 +789,7 @@ def calculate_age(birthday_str):
         today = date.today()
         age = today.year - bday.year - ((today.month, today.day) < (bday.month, bday.day))
         return str(age)
-    except:
+    except (ValueError, TypeError):
         return ""
 
 def format_contact(r, show_private=False):
@@ -850,56 +851,54 @@ def format_contact(r, show_private=False):
 
     return "\n".join(lines)
 
+# CRM record cache — invalidated on any write
+_crm_cache = None
+
+def _invalidate_crm_cache():
+    global _crm_cache
+    _crm_cache = None
+
+def _get_crm_records():
+    """Return CRM records from cache, fetching from sheet if stale."""
+    global _crm_cache
+    if _crm_cache is None:
+        sheet = crm_sheet()
+        _crm_cache = sheet.get_all_records() if sheet else []
+    return _crm_cache
+
 def find_row(name):
-    """Search Name first, then Alias, then first-name match.
-    Returns (row_num, record) for single match, or ('disambig', message) for multiple."""
-    sheet = crm_sheet()
-    records = sheet.get_all_records()
+    """Single-pass CRM lookup across Name, Alias, and first name.
+    Returns (row_num, record) for single match, or ('disambig', message) for multiple.
+    Uses in-memory cache — invalidated on any CRM write."""
+    records = _get_crm_records()
     name_lower = name.strip().lower()
 
-    # 1. Exact full name match
-    for i, r in enumerate(records):
-        if r.get("Name", "").lower() == name_lower:
-            return i + 2, r
+    exact, alias_exact, sub_name, sub_alias, first = [], [], [], [], []
 
-    # 2. Full alias match
     for i, r in enumerate(records):
-        if r.get("Alias", "").lower() == name_lower:
-            return i + 2, r
-
-    # 3. Substring match on Name
-    matches = []
-    for i, r in enumerate(records):
-        if name_lower in r.get("Name", "").lower():
-            matches.append((i + 2, r))
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        return "disambig", disambiguate_contacts(matches)
-
-    # 4. Substring match on Alias
-    alias_matches = []
-    for i, r in enumerate(records):
-        if name_lower in r.get("Alias", "").lower():
-            alias_matches.append((i + 2, r))
-    if len(alias_matches) == 1:
-        return alias_matches[0]
-    if len(alias_matches) > 1:
-        return "disambig", disambiguate_contacts(alias_matches)
-
-    # 5. First-name match across Name and Alias
-    first_matches = []
-    for i, r in enumerate(records):
-        full_name = r.get("Name", "")
+        full = r.get("Name", "")
         alias = r.get("Alias", "")
-        first_name = full_name.split()[0].lower() if full_name else ""
-        alias_first = alias.split()[0].lower() if alias else ""
-        if name_lower == first_name or name_lower == alias_first:
-            first_matches.append((i + 2, r))
-    if len(first_matches) == 1:
-        return first_matches[0]
-    if len(first_matches) > 1:
-        return "disambig", disambiguate_contacts(first_matches)
+        full_l = full.lower()
+        alias_l = alias.lower()
+        first_name = full_l.split()[0] if full_l else ""
+        alias_first = alias_l.split()[0] if alias_l else ""
+
+        if full_l == name_lower:
+            return i + 2, r                          # exact name — return immediately
+        if alias_l == name_lower:
+            alias_exact.append((i + 2, r))
+        elif name_lower in full_l:
+            sub_name.append((i + 2, r))
+        elif name_lower in alias_l:
+            sub_alias.append((i + 2, r))
+        elif name_lower in (first_name, alias_first):
+            first.append((i + 2, r))
+
+    for tier in (alias_exact, sub_name, sub_alias, first):
+        if len(tier) == 1:
+            return tier[0]
+        if len(tier) > 1:
+            return "disambig", disambiguate_contacts(tier)
 
     return None, None
 
@@ -959,6 +958,7 @@ def save_contact(data, force_new=False):
             name, alias, birthday, relationship, context, notes,
             followup_date, followup_notes, last_updated, "", "", "", "", ""
         ])
+        _invalidate_crm_cache()
         return f"✅ Contact saved!\n\n" + format_contact({
             "Name": name, "Alias": alias, "Birthday": birthday,
             "Relationship": relationship, "Context": context,
@@ -995,6 +995,7 @@ def add_note(data):
         # Col 6 = Notes in new schema
         sheet.update_cell(row_num, 6, new_note)
         sheet.update_cell(row_num, 9, date.today().strftime("%d/%m/%Y"))  # Last Updated
+        _invalidate_crm_cache()
         return f"✅ Note added to *{record.get('Name')}*"
     except Exception as e:
         return f"❌ Error adding note: {str(e)}"
@@ -1042,6 +1043,7 @@ def update_field(data):
             return f"❌ No contact found for '{name}'"
         sheet.update_cell(row_num, col, value)
         sheet.update_cell(row_num, 9, date.today().strftime("%d/%m/%Y"))  # Last Updated
+        _invalidate_crm_cache()
         return f"✅ {field.title()} updated for *{record.get('Name')}*"
     except Exception as e:
         return f"❌ Error updating contact: {str(e)}"
@@ -1605,7 +1607,7 @@ def is_calendar_request(text):
     if any(s in lower for s in AMBIGUOUS_SIGNALS) or AT_PATTERN:
         try:
             response = client.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-haiku-3-5-20241022",
                 max_tokens=10,
                 messages=[{"role": "user", "content":
                     f'Is this asking to add a calendar event? Reply YES or NO only.\n\n"{text}"'}]
@@ -2392,12 +2394,14 @@ async def check_and_fire_reminders(app):
                 contact = r.get("Contact", "")
                 row = i + 2
 
-                # Build reminder message
+                # Build reminder message (contact notes looked up from cache, not a fresh sheet read)
                 reminder_msg = f"🔔 Reminder: {message}"
                 if contact:
-                    _, record = find_row(contact)
-                    if record:
-                        notes = record.get("Notes", "")
+                    crm_records = _get_crm_records()
+                    contact_l = contact.lower()
+                    matched = next((r for r in crm_records if r.get("Name", "").lower() == contact_l), None)
+                    if matched:
+                        notes = matched.get("Notes", "")
                         if notes:
                             reminder_msg += f"\n\n({contact}: {notes.split(';')[0].strip()})"
 
@@ -2658,7 +2662,7 @@ def fuzzy_match_category(text):
     return None, False
 
 # Foreign transaction fee estimates per card (%)
-CARD_FX_FEES = {"Citi": 3.25, "Maybank": 3.0, "Amex": 3.0, "UOB": 3.25}
+# CARD_FX_FEES removed — was defined but never referenced
 
 # Overseas mode state
 overseas_state = {
@@ -2823,6 +2827,55 @@ def save_manual_fx_rate(currency, rate, sgd_per_unit=True):
     # Also update live cache
     cached_fx_rates[f"{currency}_SGD"] = {"rate": rate, "fetched_at": datetime.now(pytz.utc)}
     print(f"Manual FX rate saved: 1 {currency} = {rate} SGD")
+    persist_fx_rates_to_sheet()
+
+def persist_fx_rates_to_sheet():
+    """Save cached manual FX rates to Settings sheet so they survive restarts."""
+    try:
+        sheet = get_sheet("Settings")
+        if not sheet:
+            return
+        records = sheet.get_all_records()
+        fx_data = json.dumps({
+            k: {"rate": v["rate"], "fetched_at": v["fetched_at"].isoformat()}
+            for k, v in cached_fx_rates.items()
+            if isinstance(v.get("fetched_at"), datetime)
+        })
+        for i, r in enumerate(records):
+            if r.get("Key") == "cached_fx_rates":
+                sheet.update_cell(i + 2, 2, fx_data)
+                return
+        sheet.append_row(["cached_fx_rates", fx_data])
+    except Exception as e:
+        print(f"persist_fx_rates_to_sheet error: {e}")
+
+def load_fx_rates_from_sheet():
+    """Load cached FX rates from Settings sheet on startup."""
+    try:
+        sheet = get_sheet("Settings")
+        if not sheet:
+            return
+        records = sheet.get_all_records()
+        for r in records:
+            if r.get("Key") == "cached_fx_rates":
+                raw = r.get("Value", "")
+                if not raw:
+                    return
+                data = json.loads(raw)
+                cutoff = datetime.now(pytz.utc) - timedelta(hours=12)
+                for k, v in data.items():
+                    try:
+                        fetched_at = datetime.fromisoformat(v["fetched_at"])
+                        if fetched_at.tzinfo is None:
+                            fetched_at = pytz.utc.localize(fetched_at)
+                        if fetched_at > cutoff:
+                            cached_fx_rates[k] = {"rate": v["rate"], "fetched_at": fetched_at}
+                            print(f"Restored FX rate: {k} = {v['rate']}")
+                    except Exception as e:
+                        print(f"load_fx_rates_from_sheet: bad entry {k}: {e}")
+                return
+    except Exception as e:
+        print(f"load_fx_rates_from_sheet error: {e}")
 
 def parse_manual_fx_input(text, currency):
     """Parse manual FX rate input. Supports multiple formats:
@@ -3038,13 +3091,15 @@ def get_merchant_memory(merchant):
     return None, None, None
 
 def save_merchant_memory(merchant, category, card):
-    """Save new merchant to Merchant Map."""
+    """Save new merchant to Merchant Map. Returns True on success, False on failure."""
     try:
         sheet = merchant_map_sheet()
         sheet.append_row([merchant, category, card])
         _invalidate_merchant_cache()
+        return True
     except Exception as e:
-        print(f"Error saving merchant: {e}")
+        print(f"save_merchant_memory failed for '{merchant}': {e}")
+        return False
 
 def delete_merchant(merchant_name):
     """Delete a merchant from the Merchant Map by name (fuzzy match)."""
@@ -3092,24 +3147,36 @@ def parse_expense_text_v2(text):
     )
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-haiku-3-5-20241022",
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}]
         )
         raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        # Validate amount before returning — prevents unhandled float() cast downstream
+        if "amount" in parsed:
+            try:
+                parsed["amount"] = float(parsed["amount"])
+            except (ValueError, TypeError):
+                parsed["amount"] = None
+        return parsed
     except Exception as e:
         print(f"parse_expense_text Claude error: {e}")
         raise
 
 def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link="", reconciled="No", notes=""):
-    """Append expense row to Expenses sheet."""
-    today = date.today().strftime("%d/%m/%Y")
-    sheet = expenses_sheet()
-    sheet.append_row([
-        today, merchant, amount, currency, sgd_amount,
-        category, card, receipt_link, reconciled, notes
-    ])
+    """Append expense row to Expenses sheet. Returns True on success, False on failure."""
+    try:
+        today = date.today().strftime("%d/%m/%Y")
+        sheet = expenses_sheet()
+        sheet.append_row([
+            today, merchant, amount, currency, sgd_amount,
+            category, card, receipt_link, reconciled, notes
+        ])
+        return True
+    except Exception as e:
+        print(f"log_expense failed: {e}")
+        return False
 
 def format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount=None,
                                 receipt_saved=False, last4=None, high_amount=False,
@@ -3297,6 +3364,9 @@ def get_merchant_list():
 
 def is_expense_input(text):
     """Detect if message looks like an expense entry or expense question."""
+    # Flight numbers are never expenses — guard before anything else
+    if extract_flight_number(text):
+        return False
     lower = text.lower()
     # Exclude command-style messages that contain expense-related words but aren't entries
     exclusions = [
@@ -4032,12 +4102,17 @@ async def _finalise_receipt_confirm(user_id, session, update):
     last4 = session.get("last4")
     is_new_merchant = session.get("is_new_merchant", False)
 
-    log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
-    if is_new_merchant and category and card:
-        save_merchant_memory(merchant, category, card)
+    success = log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
+    if not success:
+        await update.message.reply_text("⚠️ Failed to save expense to sheet — please try again or log manually.")
+        return
 
+    # Only delete session and save merchant memory after confirmed write
     del receipt_confirm_sessions[user_id]
     session_timestamps.pop(user_id, None)
+
+    if is_new_merchant and category and card:
+        save_merchant_memory(merchant, category, card)
 
     reply = format_expense_logged(merchant, amount, currency, category, card, sgd_amount, last4)
     try:
@@ -4105,13 +4180,7 @@ async def handle_expense_session(user_id, text, update):
             await update.message.reply_text("Skipped.")
         return
 
-async def _finalise_expense_session(user_id, update):
-    """Legacy finalise — redirects to receipt confirm flow."""
-    session = expense_sessions.get(user_id)
-    if not session:
-        return
-    del expense_sessions[user_id]
-    await _finalise_receipt_confirm(user_id, session, update)
+# _finalise_expense_session removed — was legacy dead code, use _finalise_receipt_confirm directly
 
 
 
@@ -4755,9 +4824,12 @@ async def send_bill_reminders(app):
 def is_bill_request(text):
     """Detect bill setup intent."""
     lower = text.lower()
+    # "due on the" only counts if followed by a day number (e.g. "due on the 15th")
+    # prevents misfires like "flight is due to depart on the 24th"
+    has_due_on_the = bool(re.search(r"due on the \d{1,2}", lower))
     triggers = ["bill is due", "bill due", "set up a bill", "add a bill", "my bill",
-                "credit card bill", "due on the", "due every", "remind me about my"]
-    return any(t in lower for t in triggers)
+                "credit card bill", "due every", "remind me about my"]
+    return has_due_on_the or any(t in lower for t in triggers)
 
 def handle_new_bill(text):
     """Parse and save a new bill."""
@@ -5148,27 +5220,50 @@ def get_active_trip():
     return None
 
 def restore_overseas_from_trips():
-    """On startup — if there's an active trip in the sheet, restore overseas_state."""
+    """On startup — if there's an active trip in the sheet, restore overseas_state.
+    Per-field try/except: one bad value won't block the whole restore."""
     try:
         trip = get_active_trip()
         if not trip:
             return False
-        dest = trip.get("Destination", "")
-        curr = trip.get("Currency", "SGD")
-        dep_flight = trip.get("Dep Flight", "")
-        return_flight = trip.get("Return Flight", "")
-        if dest and curr and curr != "SGD":
-            overseas_state["active"] = True
-            overseas_state["destination"] = dest
-            overseas_state["currency"] = curr
-            overseas_state["currencies"] = [curr]
-            overseas_state["trip_destinations"] = [dest]
+
+        try:
+            dest = trip.get("Destination", "") or ""
+        except Exception:
+            dest = ""
+            print("restore_overseas_from_trips: bad Destination field, skipping")
+
+        try:
+            curr = trip.get("Currency", "SGD") or "SGD"
+        except Exception:
+            curr = "SGD"
+            print("restore_overseas_from_trips: bad Currency field, defaulting to SGD")
+
+        if not dest or not curr or curr == "SGD":
+            return False
+
+        overseas_state["active"] = True
+        overseas_state["destination"] = dest
+        overseas_state["currency"] = curr
+        overseas_state["currencies"] = [curr]
+        overseas_state["trip_destinations"] = [dest]
+
+        try:
+            dep_flight = trip.get("Dep Flight", "") or ""
             if dep_flight:
                 overseas_state["dep_flight"] = dep_flight
+        except Exception:
+            print("restore_overseas_from_trips: bad Dep Flight field, skipping")
+
+        try:
+            return_flight = trip.get("Return Flight", "") or ""
             if return_flight:
                 overseas_state["return_flight"] = {"flight": return_flight}
-            print(f"✅ Restored overseas mode: {dest} ({curr})")
-            return True
+        except Exception:
+            print("restore_overseas_from_trips: bad Return Flight field, skipping")
+
+        print(f"✅ Restored overseas mode: {dest} ({curr})")
+        return True
     except Exception as e:
         print(f"restore_overseas_from_trips error: {e}")
     return False
@@ -6891,24 +6986,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = f"Return flight added: {ret_num} {ret_dep} → {ret_arr} (SIN) ✅"
         else:
             reply = f"Couldn't find {ret_num} on AviationStack. Try again closer to the flight date."
-    elif is_overseas_mode_request(text) or extract_flight_number(text):
-        if not extract_flight_number(text) and user_id in conversation_histories:
-            history_text = " ".join(
-                m["content"] for m in conversation_histories[user_id][-10:]
-                if m["role"] == "user"
-            )
-            found_flights = extract_all_flight_numbers(history_text)
-            if found_flights:
-                reply = handle_overseas_request(" ".join(found_flights) + " " + text)
-            else:
-                reply = handle_overseas_request(text)
-        else:
-            reply = handle_overseas_request(text)
-    elif is_expense_input(text):
-        reply, needs_session, session_data = handle_expense_text(text, user_id)
-        if needs_session and session_data:
-            expense_sessions[user_id] = session_data
-
     # Bill Commands
     elif lower in ["bills", "my bills", "list bills"]:
         reply = list_bills()
@@ -7073,85 +7150,110 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             "Or just chat — I'll figure it out 👍"
         )
 
-    # Claude Chat fallback — with natural language CRM detection
-    else:
-        # Check for natural language CRM updates first
+    # Natural language CRM — before fuzzy detectors (phrases like "John referred Sarah")
+    elif detect_crm_natural_update(text):
         crm_action = detect_crm_natural_update(text)
-        if crm_action:
-            action, name, field_or_referred, value = crm_action
-            if action == "referral":
-                reply = set_referral(name, field_or_referred)
-            elif action == "update":
-                reply = update_contact_field_natural(name, field_or_referred, value)
-            elif action == "show_private":
-                reply = find_contact(name, show_private=True)
-        elif is_reschedule_request(text) and user_id in last_fired_reminder:
-            reply = handle_reschedule(text, user_id)
-        elif is_reminder_request(text):
-            reply = handle_new_reminder(text)
-        elif is_expense_input(text):
-            reply, needs_session, session_data = handle_expense_text(text, user_id)
-            if needs_session and session_data:
-                expense_sessions[user_id] = session_data
-        elif is_bare_merchant_input(text):
-            reply, needs_session, session_data = handle_expense_text(text, user_id)
-            if needs_session and session_data:
-                expense_sessions[user_id] = session_data
-        elif is_overseas_mode_request(text) or extract_flight_number(text):
-            reply = handle_overseas_request(text)
-        elif is_restaurant_save(text):
-            result = handle_save_restaurant(text)
-            if result and result.startswith("_NEEDS_LOCATION_:"):
-                parts = result.split(":", 2)
-                name = parts[1] if len(parts) > 1 else ""
-                country = parts[2] if len(parts) > 2 else "Singapore"
-                pending_restaurant_saves[user_id] = {"name": name, "country": country, "step": "awaiting_location"}
-                reply = f"⚠️ Couldn't read that Maps link — what's the location for {name}?\n(e.g. 313 Orchard Road, Singapore)"
-            elif result and result.startswith("_DUPLICATE_RESTAURANT_:"):
-                parts = result.split(":", 5)
-                pending_restaurant_saves[user_id] = {
-                    "step": "duplicate", "existing": parts[1], "name": parts[2],
-                    "location": parts[3], "country": parts[4],
-                    "tags": parts[5] if len(parts) > 5 else "", "notes": ""
-                }
-                reply = f"*{parts[1]}* is already in your list.\nUpdate existing or save as new? (update / new)"
+        action, name, field_or_referred, value = crm_action
+        if action == "referral":
+            reply = set_referral(name, field_or_referred)
+        elif action == "update":
+            reply = update_contact_field_natural(name, field_or_referred, value)
+        elif action == "show_private":
+            reply = find_contact(name, show_private=True)
+
+    # Flight — always before expense (bare flight number must never hit expense parser)
+    elif is_overseas_mode_request(text) or extract_flight_number(text):
+        if not extract_flight_number(text) and user_id in conversation_histories:
+            history_text = " ".join(
+                m["content"] for m in conversation_histories[user_id][-10:]
+                if m["role"] == "user"
+            )
+            found_flights = extract_all_flight_numbers(history_text)
+            if found_flights:
+                reply = handle_overseas_request(" ".join(found_flights) + " " + text)
             else:
-                reply = result
-        elif is_restaurant_search(text):
-            reply = handle_search_restaurants(text)
-        elif is_bill_request(text):
-            reply = handle_new_bill(text)
-        elif is_stock_request(text):
-            reply = handle_stock_request(text)
-        elif is_reminder_request(text):
-            reply = handle_new_reminder(text)
-        elif is_calendar_request(text):
-            reply = smart_add_event(text, user_id)
+                reply = handle_overseas_request(text)
         else:
-            if user_id not in conversation_histories:
-                conversation_histories[user_id] = []
-            conversation_histories[user_id].append({"role": "user", "content": text})
-            # Cap history at 10 turns (20 messages) to prevent prompt bloat slowing responses
-            if len(conversation_histories[user_id]) > 20:
-                conversation_histories[user_id] = conversation_histories[user_id][-20:]
-            # Use cached system prompt — only rebuilds when overseas state changes
-            global _system_prompt_cache, _system_prompt_overseas_key
-            overseas_key = (
-                overseas_state.get("active"),
-                overseas_state.get("destination"),
-                overseas_state.get("currency"),
-            )
-            if _system_prompt_cache is None or _system_prompt_overseas_key != overseas_key:
-                _system_prompt_cache = build_system_prompt()
-                _system_prompt_overseas_key = overseas_key
-            response = client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=1024,
-                system=_system_prompt_cache,
-                messages=conversation_histories[user_id]
-            )
-            reply = response.content[0].text
-            conversation_histories[user_id].append({"role": "assistant", "content": reply})
+            reply = handle_overseas_request(text)
+
+    # Expense — flight guard already in is_expense_input, but extract_flight_number above catches first
+    elif is_expense_input(text):
+        reply, needs_session, session_data = handle_expense_text(text, user_id)
+        if needs_session and session_data:
+            expense_sessions[user_id] = session_data
+    elif is_bare_merchant_input(text):
+        reply, needs_session, session_data = handle_expense_text(text, user_id)
+        if needs_session and session_data:
+            expense_sessions[user_id] = session_data
+
+    # Reschedule — only fires if a reminder was recently sent
+    elif is_reschedule_request(text) and user_id in last_fired_reminder:
+        reply = handle_reschedule(text, user_id)
+
+    # Reminders
+    elif is_cancel_reminder_request(text):
+        reply = handle_cancel_reminder(text)
+    elif is_reminder_request(text):
+        reply = handle_new_reminder(text)
+
+    # Restaurants
+    elif is_restaurant_save(text):
+        result = handle_save_restaurant(text)
+        if result and result.startswith("_NEEDS_LOCATION_:"):
+            parts = result.split(":", 2)
+            name = parts[1] if len(parts) > 1 else ""
+            country = parts[2] if len(parts) > 2 else "Singapore"
+            pending_restaurant_saves[user_id] = {"name": name, "country": country, "step": "awaiting_location"}
+            reply = f"⚠️ Couldn't read that Maps link — what's the location for {name}?\n(e.g. 313 Orchard Road, Singapore)"
+        elif result and result.startswith("_DUPLICATE_RESTAURANT_:"):
+            parts = result.split(":", 5)
+            pending_restaurant_saves[user_id] = {
+                "step": "duplicate", "existing": parts[1], "name": parts[2],
+                "location": parts[3], "country": parts[4],
+                "tags": parts[5] if len(parts) > 5 else "", "notes": ""
+            }
+            reply = f"*{parts[1]}* is already in your list.\nUpdate existing or save as new? (update / new)"
+        else:
+            reply = result
+    elif is_restaurant_search(text):
+        reply = handle_search_restaurants(text)
+
+    # Bills
+    elif is_bill_request(text):
+        reply = handle_new_bill(text)
+
+    # Stocks
+    elif is_stock_request(text):
+        reply = handle_stock_request(text)
+
+    # Calendar
+    elif is_calendar_request(text):
+        reply = smart_add_event(text, user_id)
+
+    # Claude conversation fallback — genuine unknowns only, single path
+    else:
+        if user_id not in conversation_histories:
+            conversation_histories[user_id] = []
+        conversation_histories[user_id].append({"role": "user", "content": text})
+        if len(conversation_histories[user_id]) > 20:
+            conversation_histories[user_id] = conversation_histories[user_id][-20:]
+        global _system_prompt_cache, _system_prompt_overseas_key
+        overseas_key = (
+            overseas_state.get("active"),
+            overseas_state.get("destination"),
+            overseas_state.get("currency"),
+        )
+        if _system_prompt_cache is None or _system_prompt_overseas_key != overseas_key:
+            _system_prompt_cache = build_system_prompt()
+            _system_prompt_overseas_key = overseas_key
+        response = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            system=_system_prompt_cache,
+            messages=conversation_histories[user_id]
+        )
+        reply = response.content[0].text
+        conversation_histories[user_id].append({"role": "assistant", "content": reply})
 
     if not reply:
         try:
@@ -7306,6 +7408,9 @@ async def post_init(app):
     # Restore overseas mode if there was an active trip before restart
     restore_overseas_from_trips()
 
+    # Restore cached FX rates from Settings sheet
+    load_fx_rates_from_sheet()
+
     timezone = pytz.timezone("Asia/Kuala_Lumpur")
     scheduler = AsyncIOScheduler(timezone=timezone, misfire_grace_time=30)
     _scheduler = scheduler
@@ -7348,6 +7453,13 @@ async def post_init(app):
     await check_missed_items_on_startup(app)
 
 def main():
+    # Guard: fail clearly if critical env vars are missing
+    missing = [v for v in ("TELEGRAM_TOKEN", "ANTHROPIC_API_KEY", "SHEET_ID") if not os.getenv(v)]
+    if missing:
+        print(f"❌ Missing required environment variables: {', '.join(missing)}")
+        print("Set these in Railway → Variables before deploying.")
+        raise SystemExit(1)
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
