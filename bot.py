@@ -2436,13 +2436,17 @@ async def check_and_fire_reminders(app):
         print(f"Error in check_and_fire_reminders: {e}")
 
 def is_reminder_request(text):
-    """Detect if a message is asking to set a reminder."""
+    """Detect if a message is asking to set a reminder.
+    Bare 'alert me', 'notify me', 'ping me' removed — too broad, collide with stock.
+    'alert me if' is stock. 'alert me when/to' is reminder."""
     lower = text.lower()
     triggers = [
         "remind me", "remind", "set a reminder", "set me a reminder",
         "reminder for", "reminder at", "reminder to",
         "don't let me forget", "dont let me forget",
-        "alert me", "notify me", "ping me",
+        "alert me when", "alert me to",
+        "notify me when", "notify me about", "notify me to",
+        "ping me at", "ping me when", "ping me to",
         "drop me a reminder", "drop a reminder", "send me a reminder"
     ]
     return any(t in lower for t in triggers)
@@ -3368,6 +3372,9 @@ def is_expense_input(text):
     if extract_flight_number(text):
         return False
     lower = text.lower()
+    # Share purchases are stock, not expenses
+    if re.search(r"\d+ shares|shares of |shares @|shares at \$", lower):
+        return False
     # Exclude command-style messages that contain expense-related words but aren't entries
     exclusions = [
         "delete expense", "remove expense", "undo expense",
@@ -4822,13 +4829,15 @@ async def send_bill_reminders(app):
         print(f"Error in send_bill_reminders: {e}")
 
 def is_bill_request(text):
-    """Detect bill setup intent."""
+    """Detect bill setup intent.
+    'remind me about my' removed — collides with is_reminder_request.
+    Bill intent always has 'bill', 'due', or 'credit card' explicitly."""
     lower = text.lower()
     # "due on the" only counts if followed by a day number (e.g. "due on the 15th")
-    # prevents misfires like "flight is due to depart on the 24th"
     has_due_on_the = bool(re.search(r"due on the \d{1,2}", lower))
-    triggers = ["bill is due", "bill due", "set up a bill", "add a bill", "my bill",
-                "credit card bill", "due every", "remind me about my"]
+    triggers = ["bill is due", "bill due", "set up a bill", "add a bill",
+                "credit card bill", "due every", "my citi bill", "my maybank bill",
+                "my amex bill", "my uob bill", "my credit card bill"]
     return has_due_on_the or any(t in lower for t in triggers)
 
 def handle_new_bill(text):
@@ -4997,11 +5006,17 @@ def delete_restaurant(name):
         return f"Error: {str(e)}"
 
 def is_restaurant_save(text):
-    """Detect restaurant save intent."""
+    """Detect restaurant save intent.
+    Added: 'save this restaurant', 'try this restaurant', 'this place' + save verb."""
     lower = text.lower()
-    triggers = ["save restaurant", "add restaurant", "save this place", "add this place",
-                "want to try", "add to my list", "save to my list", "maps.google",
-                "goo.gl/maps", "restaurant to try", "place to try", "log this restaurant"]
+    triggers = [
+        "save restaurant", "add restaurant", "save this place", "add this place",
+        "save this restaurant", "try this restaurant", "this restaurant to try",
+        "want to try", "add to my list", "save to my list", "maps.google",
+        "goo.gl/maps", "maps.app.goo", "restaurant to try", "place to try",
+        "log this restaurant", "note this restaurant", "remember this place",
+        "remember this restaurant"
+    ]
     return any(t in lower for t in triggers)
 
 def is_restaurant_search(text):
@@ -5529,18 +5544,51 @@ async def send_weekly_market_summary(app):
         print(f"Error sending weekly market summary: {e}")
 
 def is_stock_request(text):
-    """Detect stock market related requests using explicit trigger phrases only."""
+    """Detect stock market related requests using explicit trigger phrases only.
+    Exclusions guard against collisions with reminder ('check my reminders') and expense ('bought coffee').
+    Share-purchase patterns ('bought 10 shares of X') beat expense routing."""
     lower = text.lower()
+
+    # Hard exclusions — these are never stock requests
+    exclusions = ["reminders", "reminder", "my bill", "credit card bill"]
+    if any(e in lower for e in exclusions):
+        return False
+
+    # Share purchase/sale — always stock, even if 'bought'/'sold' triggers expense
+    share_patterns = [
+        r"bought \d+ shares", r"sold \d+ shares", r"shares of [a-z]",
+        r"shares @ ", r"shares at \$", r"\d+ shares"
+    ]
+    if any(re.search(p, lower) for p in share_patterns):
+        return True
+
     explicit_triggers = [
-        "pull up ", "look into ", "price of ", "check ",
+        "pull up ", "look into ", "price of ",
         "alert me if", "alert if ", "add to portfolio",
-        "bought ", "sold ", "suggest stocks", "stock ideas",
+        "suggest stocks", "stock ideas",
         "stock ", "ticker ", "p&l", "holdings",
-        "market summary", "how is the market", "market today",
+        "how is the market", "market today",
         "weekly market", "how are markets", "portfolio performance"
     ]
     if any(t in lower for t in explicit_triggers):
         return True
+    # "market summary" only fires if not a reminder request (e.g. "notify me about market summary")
+    reminder_prefixes = ["remind me", "notify me", "ping me", "alert me when", "alert me to", "send me"]
+    if "market summary" in lower and not any(lower.startswith(p) or lower[:25].startswith(p) for p in reminder_prefixes):
+        return True
+
+    # "check" only fires if not about reminders/bills AND not a reminder-style request
+    reminder_prefix = any(lower.startswith(p) or p + " " in lower[:20]
+                          for p in ["ping me", "notify me", "remind me", "alert me when", "alert me to"])
+    if "check " in lower and not any(e in lower for e in ["reminders", "reminder", "bill"]) and not reminder_prefix:
+        return True
+
+    # "bought"/"sold" only fire when combined with known stock context words
+    if ("bought " in lower or "sold " in lower) and any(
+        w in lower for w in ["shares", "stock", "equity", "position", "portfolio", "aapl", "tsla"]
+    ):
+        return True
+
     ticker_match = re.search(r'\b[A-Z]{2,5}\b', text)
     if ticker_match and any(w in lower for w in ["doing", "worth", "performing", "price", "target", "outlook"]):
         return True
@@ -7186,6 +7234,14 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if needs_session and session_data:
             expense_sessions[user_id] = session_data
 
+    # Bills — before reminder (bill triggers are more specific; reminder has "remind me about my" removed)
+    elif is_bill_request(text):
+        reply = handle_new_bill(text)
+
+    # Stocks — before reminder ("alert me if", "check" patterns need to win)
+    elif is_stock_request(text):
+        reply = handle_stock_request(text)
+
     # Reschedule — only fires if a reminder was recently sent
     elif is_reschedule_request(text) and user_id in last_fired_reminder:
         reply = handle_reschedule(text, user_id)
@@ -7217,14 +7273,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = result
     elif is_restaurant_search(text):
         reply = handle_search_restaurants(text)
-
-    # Bills
-    elif is_bill_request(text):
-        reply = handle_new_bill(text)
-
-    # Stocks
-    elif is_stock_request(text):
-        reply = handle_stock_request(text)
 
     # Calendar
     elif is_calendar_request(text):
