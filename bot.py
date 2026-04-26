@@ -6891,7 +6891,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = f"Return flight added: {ret_num} {ret_dep} → {ret_arr} (SIN) ✅"
         else:
             reply = f"Couldn't find {ret_num} on AviationStack. Try again closer to the flight date."
-    elif is_overseas_mode_request(text):
+    elif is_overseas_mode_request(text) or extract_flight_number(text):
         if not extract_flight_number(text) and user_id in conversation_histories:
             history_text = " ".join(
                 m["content"] for m in conversation_histories[user_id][-10:]
@@ -7097,7 +7097,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply, needs_session, session_data = handle_expense_text(text, user_id)
             if needs_session and session_data:
                 expense_sessions[user_id] = session_data
-        elif is_overseas_mode_request(text):
+        elif is_overseas_mode_request(text) or extract_flight_number(text):
             reply = handle_overseas_request(text)
         elif is_restaurant_save(text):
             result = handle_save_restaurant(text)
