@@ -65,29 +65,30 @@ em_profile = {}
 
 # --- Infrastructure Setup ---
 def setup_sheets():
-    """Rename Sheet1 to CRM if needed, create all required tabs."""
+    """Rename Sheet1 to CRM if needed, create all required tabs.
+    Single worksheets() call at start — no repeated API reads."""
+    # One API call — reused throughout
     existing = [ws.title for ws in spreadsheet.worksheets()]
 
-    # New CRM column headers
     CRM_HEADERS = [
         "Name", "Alias", "Birthday", "Relationship", "Context", "Notes",
         "Follow Up Date", "Follow Up Notes", "Last Updated", "Birthday Greeted",
         "Referred By", "Referral Date", "Email", "Address"
     ]
 
-    # Rename sheet1 -> CRM if CRM doesn't exist yet
     if "CRM" not in existing:
         try:
             sheet1 = spreadsheet.worksheet("Sheet1")
             sheet1.update_title("CRM")
+            existing.append("CRM")
             print("Renamed Sheet1 -> CRM")
         except Exception:
-            if "CRM" not in [ws.title for ws in spreadsheet.worksheets()]:
+            if "CRM" not in existing:
                 ws = spreadsheet.add_worksheet(title="CRM", rows=1000, cols=20)
                 ws.append_row(CRM_HEADERS)
+                existing.append("CRM")
                 print("Created CRM tab")
 
-    # Migrate existing CRM headers if needed
     try:
         crm_ws = spreadsheet.worksheet("CRM")
         current_headers = crm_ws.row_values(1)
@@ -96,13 +97,12 @@ def setup_sheets():
     except Exception as e:
         print(f"CRM header check error: {e}")
 
-    # Todos tab
     if "Todos" not in existing:
         ws = spreadsheet.add_worksheet(title="Todos", rows=500, cols=3)
         ws.append_row(["Task", "Status", "Added"])
+        existing.append("Todos")
         print("Created Todos tab")
 
-    # All other required tabs
     required_tabs = {
         "Meeting Notes": ["Event Name", "Topic", "Summary", "Action Items", "Date"],
         "Expenses": ["Date", "Merchant", "Amount", "Currency", "SGD Amount", "Category",
@@ -111,34 +111,274 @@ def setup_sheets():
         "Merchant Map": ["Merchant", "Category", "Card"],
         "Restaurants": ["Name", "Location", "Country", "Tags", "Notes"],
         "Portfolio": ["Stock", "Quantity", "Buy Price", "Buy Date", "Notes"],
-        "Trips": ["Trip ID", "Destination", "Currency", "Dep Flight", "Dep Time", "Return Flight", "Return Time", "Status", "Started", "Ended"],
+        "Trips": ["Trip ID", "Destination", "Currency", "Dep Flight", "Dep Time",
+                  "Return Flight", "Return Time", "Status", "Started", "Ended"],
         "Reminders": ["ID", "Message", "Scheduled Time", "Recurrence", "Status", "Attempts", "Contact"],
-        "Settings": ["Key", "Value"]
+        "Settings": ["Key", "Value"],
     }
 
-    existing_now = [ws.title for ws in spreadsheet.worksheets()]
     for tab_name, headers in required_tabs.items():
-        if tab_name not in existing_now:
+        if tab_name not in existing:
             ws = spreadsheet.add_worksheet(title=tab_name, rows=500, cols=len(headers))
             ws.append_row(headers)
+            existing.append(tab_name)
             print(f"Created tab: {tab_name}")
 
-    # Cards sheet — always overwrite with new schema and initial cards
     try:
-        existing_tabs = [ws.title for ws in spreadsheet.worksheets()]
-        if "Cards" not in existing_tabs:
+        if "Cards" not in existing:
             cards_ws = spreadsheet.add_worksheet(title="Cards", rows=100, cols=4)
+            existing.append("Cards")
         else:
             cards_ws = spreadsheet.worksheet("Cards")
         cards_ws.clear()
         cards_ws.append_row(CARDS_SCHEMA)
         for card_row in INITIAL_CARDS:
             cards_ws.append_row(card_row)
-        print("✅ Cards sheet initialised with new schema")
+        print("\u2705 Cards sheet initialised with new schema")
     except Exception as e:
         print(f"Cards sheet setup error: {e}")
 
-    print("✅ Sheets setup complete")
+    _setup_dev_notes(existing)
+    _setup_em_log(existing)
+
+    print("\u2705 Sheets setup complete")
+# ── Dev Notes & Em Log ────────────────────────────────────────────────────────
+
+DEV_NOTES_CONTENT = [
+    ["Section", "Content", "Last Updated"],
+    ["Coding Standard — R1", "Route by cost: exact match → regex → keyword → cached lookup → live data → Claude. Never call Claude for routing decisions.", "2026-04-26"],
+    ["Coding Standard — R2", "Single pass, immediate exit. Once a handler matches, execution stops. No fallback re-runs detectors. Loops exit on first match.", "2026-04-26"],
+    ["Coding Standard — R3", "One sheet read per request, at the latest possible moment. Cached in memory, invalidated only on write. No sheet read during routing.", "2026-04-26"],
+    ["Coding Standard — R4", "Haiku for classification/extraction/JSON under 200 tokens. Sonnet for reasoning/conversation/multi-step only. Set min max_tokens.", "2026-04-26"],
+    ["Coding Standard — R5", "Typing indicator before every external API call. Parallel calls use asyncio.gather(). Nothing blocks the event loop.", "2026-04-26"],
+    ["Coding Standard — R6", "Session messages never reach main routing chain. Session data is flat dict with explicit fields. Sessions time out cleanly.", "2026-04-26"],
+    ["Coding Standard — R7", "Cache hierarchy: in-memory → cached sheet read → live sheet read → external API. Each layer reached only if above misses.", "2026-04-26"],
+    ["Coding Standard — R8", "Every branch sets reply or returns. Empty reply is a bug. Claude fallback for genuine unknown intent only.", "2026-04-26"],
+    ["Architecture — Routing", "Primary elif chain runs once. No else block re-runs detectors. Session handlers exit before reaching main router.", "2026-04-26"],
+    ["Architecture — Caches", "_merchant_cache, _card_names_cache, _system_prompt_cache. Invalidate at write site only. Warm card cache on startup.", "2026-04-26"],
+    ["Architecture — Models", "Haiku: is_calendar_request, parse_expense_text_v2, classification. Sonnet: conversation fallback, reasoning, market narrative.", "2026-04-26"],
+    ["Architecture — Sheets", "setup_sheets() uses single worksheets() call. No repeated API reads in setup. Em Log and Dev Notes never read in routing.", "2026-04-26"],
+    ["Deploy Flow", "git add bot.py → git commit -m '[msg]' → git push origin main → watch Railway build → em status in Telegram → test changed features.", "2026-04-26"],
+    ["Handoff Rule", "4 lines max: (1) last deployed commit, (2) bot.py status, (3) mid-session context if hanging, (4) Read Dev Notes + Em Log before starting.", "2026-04-26"],
+]
+
+EM_LOG_HEADERS_BACKLOG = ["Priority", "Item", "Stage", "Notes", "Added"]
+EM_LOG_HEADERS_SESSION = ["Date", "Session", "Built", "Fixed", "Pending", "Commit"]
+
+INITIAL_BACKLOG = [
+    ["🔴", "log_expense: add error handling — financial data silently lost on sheet failure", "Step 3", "Wrap append_row in try/except, notify user if write fails, do not delete session until write confirmed", "2026-04-26"],
+    ["🔴", "Session deleted before write confirmed — expense unrecoverable on failure", "Step 3", "Move del receipt_confirm_sessions[user_id] to after log_expense succeeds", "2026-04-26"],
+    ["🔴", "save_merchant_memory silent fail — merchant never learned if sheet write fails", "Step 3", "Add error handling, log failure, do not silently swallow", "2026-04-26"],
+    ["🟠", "sheets_call_with_retry uses time.sleep(60) — blocks entire event loop", "Step 3", "Replace with asyncio.sleep(60) inside async context", "2026-04-26"],
+    ["🟠", "get_calendar uses time.sleep(3) on retry — blocks event loop on every calendar request", "Step 3", "Replace with asyncio.sleep or remove retry sleep", "2026-04-26"],
+    ["🟠", "find_row: 5 full passes over CRM records, no cache — 1000 iterations per lookup", "Step 3", "Single-pass with match tiers, add CRM cache invalidated on write", "2026-04-26"],
+    ["🟠", "check_and_fire_reminders: full sheet read every minute + find_row inside loop", "Step 3", "Cache pending reminders in memory, only re-read on write. Remove find_row from loop.", "2026-04-26"],
+    ["🟠", "Duplicate routing: is_reminder_request 3x, is_stock_request 2x, others twice", "Step 3", "Eliminate else block, merge missing handlers into primary elif chain", "2026-04-26"],
+    ["🟡", "Missing env var guard at startup — cryptic crash if TELEGRAM_TOKEN or ANTHROPIC_API_KEY unset", "Step 3", "Add explicit check and clear error message before app starts", "2026-04-26"],
+    ["🟡", "float() cast on unvalidated Claude output in parse_expense_text_v2 — unhandled exception", "Step 3", "Validate amount field before cast, return user-friendly error if invalid", "2026-04-26"],
+    ["🟡", "restore_overseas_from_trips: no fallback on corrupt data — silent bad state", "Step 3", "Wrap in try/except per field, skip row if malformed, log warning", "2026-04-26"],
+    ["🟡", "FX rates lost on Railway restart — user must re-enter manually after every redeploy", "Step 3", "Persist cached_fx_rates to Settings sheet, load on startup", "2026-04-26"],
+    ["🟡", "No timeout on RSS fetch in fetch_market_rss_headlines — indefinite hang possible", "Step 3", "Add timeout=10 to requests.get call", "2026-04-26"],
+    ["🟢", "_finalise_expense_session labelled legacy but still wired — dead code", "Step 3", "Remove function, update any callers", "2026-04-26"],
+    ["🟢", "CARD_FX_FEES dict defined but never referenced anywhere", "Step 3", "Remove or wire up to FX fee display", "2026-04-26"],
+    ["🟢", "bare except: in format_date and calculate_age swallows all exceptions", "Step 3", "Replace with except ValueError", "2026-04-26"],
+    ["🟢", "Haiku for parse_expense_text_v2 and is_calendar_request — Sonnet overkill", "Step 3", "Switch model to claude-haiku-3, verify output quality unchanged", "2026-04-26"],
+]
+
+INITIAL_SESSION = [
+    ["2026-04-26", "Session 6",
+     "Flight date fix (extract_flight_dates + AviationStack date param); Perf fixes (merchant cache, card cache, system prompt cache, history cap 20); AviationStack fallback; Dev Notes + Em Log tabs; em whats pending; setup_sheets single API call",
+     "Flight dates ignored (now passed to AviationStack); Merchant map re-read every expense; Card names re-read every parse; System prompt rebuilt every Claude call; setup_sheets called worksheets() 4x",
+     "All 19 issues (Step 3); Stage 3 trip features",
+     "TBD"],
+]
+
+
+def _setup_dev_notes(existing):
+    """Create or overwrite Dev Notes tab with current coding standard and architecture rules.
+    Always overwrites — rules are versioned by Last Updated column, not by appending."""
+    try:
+        if "Dev Notes" not in existing:
+            ws = spreadsheet.add_worksheet(title="Dev Notes", rows=50, cols=3)
+            existing.append("Dev Notes")
+            print("Created Dev Notes tab")
+        else:
+            ws = spreadsheet.worksheet("Dev Notes")
+        ws.clear()
+        ws.update(range_name='A1', values=DEV_NOTES_CONTENT)
+        # Format header row bold
+        try:
+            ws.format('A1:C1', {'textFormat': {'bold': True}})
+        except Exception:
+            pass
+        print("✅ Dev Notes populated")
+    except Exception as e:
+        print(f"Dev Notes setup error: {e}")
+
+
+def _setup_em_log(existing):
+    """Create Em Log tab with Backlog and Session History sections.
+    Backlog: max 10 items — enforced on every write.
+    Session History: max 10 rows — oldest deleted when 11th added.
+    No archive — hard delete keeps sheet lean permanently."""
+    try:
+        if "Em Log" not in existing:
+            ws = spreadsheet.add_worksheet(title="Em Log", rows=200, cols=6)
+            existing.append("Em Log")
+            print("Created Em Log tab")
+        else:
+            ws = spreadsheet.worksheet("Em Log")
+            # Only populate if empty — don't overwrite live session data
+            if ws.row_values(1):
+                print("Em Log already populated — skipping init")
+                return
+
+        # Section 1: Backlog
+        ws.append_row(["── BACKLOG (max 10) ──", "", "", "", "", ""])
+        ws.append_row(EM_LOG_HEADERS_BACKLOG)
+        for row in INITIAL_BACKLOG[:10]:  # enforce cap at init
+            ws.append_row(row)
+
+        # Section divider
+        ws.append_row(["", "", "", "", "", ""])
+        ws.append_row(["── SESSION HISTORY (max 10) ──", "", "", "", "", ""])
+        ws.append_row(EM_LOG_HEADERS_SESSION)
+        for row in INITIAL_SESSION:
+            ws.append_row(row)
+
+        # Format section headers
+        try:
+            ws.format('A1:F1', {'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}})
+        except Exception:
+            pass
+        print("✅ Em Log populated")
+    except Exception as e:
+        print(f"Em Log setup error: {e}")
+
+
+def em_log_sheet():
+    return get_sheet("Em Log")
+
+
+def add_session_to_em_log(date_str, session_name, built, fixed, pending, commit):
+    """Append a session row to Em Log. Enforces 10-row cap on session history — deletes oldest if exceeded."""
+    try:
+        ws = em_log_sheet()
+        if not ws:
+            return
+        all_values = ws.get_all_values()
+
+        # Find session history section header row
+        session_header_row = None
+        for i, row in enumerate(all_values):
+            if row and "SESSION HISTORY" in str(row[0]):
+                session_header_row = i + 1  # 1-indexed
+                break
+        if not session_header_row:
+            return
+
+        # Find all session data rows (after the column headers row)
+        data_start = session_header_row + 2  # skip section header + column headers
+        session_rows = [i + 1 for i, row in enumerate(all_values)
+                        if i >= data_start and any(row)]
+
+        # Enforce 10-row cap — delete oldest first
+        while len(session_rows) >= 10:
+            ws.delete_rows(session_rows[0])
+            session_rows.pop(0)
+
+        ws.append_row([date_str, session_name, built, fixed, pending, commit])
+        print(f"Session logged to Em Log: {session_name}")
+    except Exception as e:
+        print(f"add_session_to_em_log error: {e}")
+
+
+def add_backlog_item(priority, item, stage="", notes=""):
+    """Add item to Em Log backlog. Enforces 10-item cap — lowest priority item deleted if exceeded."""
+    try:
+        ws = em_log_sheet()
+        if not ws:
+            return "Em Log sheet not found"
+        all_values = ws.get_all_values()
+
+        # Find backlog section
+        backlog_header_row = None
+        backlog_col_header_row = None
+        for i, row in enumerate(all_values):
+            if row and "BACKLOG" in str(row[0]):
+                backlog_header_row = i + 1
+            if backlog_header_row and row and row[0] == "Priority":
+                backlog_col_header_row = i + 1
+                break
+        if not backlog_col_header_row:
+            return "Backlog section not found in Em Log"
+
+        # Find backlog data rows
+        backlog_rows = []
+        for i, row in enumerate(all_values):
+            if i >= backlog_col_header_row and any(row) and "SESSION" not in str(row[0]) and row[0] != "Priority":
+                backlog_rows.append(i + 1)
+            if row and "SESSION HISTORY" in str(row[0]):
+                break
+
+        # Enforce 10-item cap
+        if len(backlog_rows) >= 10:
+            ws.delete_rows(backlog_rows[-1])  # delete lowest priority (last row)
+
+        today = date.today().strftime("%Y-%m-%d")
+        # Insert before session divider — find the blank divider row
+        divider_row = None
+        for i, row in enumerate(all_values):
+            if i >= backlog_col_header_row and not any(row):
+                divider_row = i + 1
+                break
+
+        if divider_row:
+            ws.insert_row([priority, item, stage, notes, today], divider_row)
+        else:
+            ws.append_row([priority, item, stage, notes, today])
+
+        return f"Added to backlog ✅"
+    except Exception as e:
+        return f"add_backlog_item error: {e}"
+
+
+def get_pending_backlog():
+    """Return formatted backlog from Em Log for em whats pending command."""
+    try:
+        ws = em_log_sheet()
+        if not ws:
+            return "Em Log not found"
+        all_values = ws.get_all_values()
+
+        backlog_items = []
+        in_backlog = False
+        for row in all_values:
+            if not row:
+                continue
+            if "BACKLOG" in str(row[0]):
+                in_backlog = True
+                continue
+            if "SESSION HISTORY" in str(row[0]):
+                break
+            if in_backlog and row[0] not in ("Priority", "── BACKLOG (max 10) ──", ""):
+                priority = row[0] if len(row) > 0 else ""
+                item = row[1] if len(row) > 1 else ""
+                stage = row[2] if len(row) > 2 else ""
+                if item:
+                    backlog_items.append((priority, item, stage))
+
+        if not backlog_items:
+            return "Backlog is empty ✅"
+
+        lines = ["*Backlog*\n"]
+        for priority, item, stage in backlog_items:
+            stage_str = f" _[{stage}]_" if stage else ""
+            lines.append(f"{priority} {item}{stage_str}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Couldn't read backlog: {e}"
+
 
 def _migrate_crm_headers(ws, old_headers, new_headers):
     """Migrate CRM sheet from old column layout to new layout."""
@@ -3491,10 +3731,25 @@ def handle_overseas_request(text):
             return reply
 
         else:
+            # AviationStack returned no data — store flight numbers and dates, ask for manual details
+            overseas_state["_pending_flight"] = {
+                "flight_number": outbound,
+                "return_flight_num": return_flight_num,
+                "dep_date": dep_date.strftime("%Y-%m-%d") if dep_date else "",
+                "ret_date": ret_date.strftime("%Y-%m-%d") if ret_date else "",
+            }
+            overseas_state["_awaiting_manual_trip"] = True
+
+            dep_hint = f" (departing {dep_date.strftime('%d %b')})" if dep_date else ""
+            ret_hint = f", returning {ret_date.strftime('%d %b')}" if ret_date else ""
             return (
-                f"Looked up {outbound} on AviationStack but got no data back — "
-                f"the flight may not be in their system yet (free tier only covers flights within ~24hrs). "
-                f"Where are you headed and when are you departing and returning?"
+                f"Couldn't find {outbound}{dep_hint} in AviationStack — "
+                f"that's usually because the free tier only covers flights within 24hrs.\n\n"
+                f"Tell me:\n"
+                f"• Where are you flying to? (city or airport code)\n"
+                f"• What time does {outbound} depart? (e.g. 09:20)\n"
+                f"• What currency will you need? (e.g. MYR, JPY)\n"
+                f"• When are you back in SG?{ret_hint}"
             )
 
     # No flight number — ask for details
@@ -6198,6 +6453,66 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 await update.message.reply_text(reply)
                 return
 
+        # Handle manual trip details response (AviationStack fallback)
+        if overseas_state.get("_awaiting_manual_trip"):
+            overseas_state.pop("_awaiting_manual_trip", None)
+            # Parse destination, time, currency, return date from free-text reply
+            # Extract currency (3-letter uppercase code)
+            currency_match = re.search(r'([A-Z]{3})', text.upper())
+            currency = currency_match.group(1) if currency_match else "SGD"
+            if currency in ("THE", "AND", "FOR", "BUT", "ARE", "YOU", "SIN", "SGD"):
+                currency = "SGD"
+
+            # Extract time HH:MM
+            time_match = re.search(r'(\d{1,2}:\d{2})', text)
+            dep_time_str = time_match.group(1) if time_match else None
+
+            # Extract return date
+            ret_dates = extract_flight_dates(text)
+            ret_date_obj = ret_dates[-1] if ret_dates else None
+
+            # Extract destination — first capitalised word/phrase that isn't a time or currency
+            dest_match = re.search(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', text)
+            destination = dest_match.group(1) if dest_match else "Unknown"
+
+            # Build dep_time from dep_date in pending + user-provided time
+            dep_date_str = pf.get("dep_date", "")
+            dep_time_full = None
+            if dep_date_str and dep_time_str:
+                try:
+                    dep_dt = datetime.strptime(f"{dep_date_str} {dep_time_str}", "%Y-%m-%d %H:%M")
+                    dep_dt = TIMEZONE.localize(dep_dt)
+                    dep_time_full = dep_dt.isoformat()
+                except Exception as e:
+                    print(f"Manual trip dep_time parse error: {e}")
+
+            # Update pending with manual details
+            pf["arr_city"] = destination
+            pf["arr_iata"] = ""
+            pf["dep_time"] = dep_time_full or dep_date_str
+            pf["arr_time"] = ""
+            overseas_state["_pending_flight"] = pf
+
+            ret_str = ret_date_obj.strftime("%d %b") if ret_date_obj else "not set"
+            dep_display = f"{dep_date_str} {dep_time_str}" if dep_time_str else dep_date_str
+            reply = (
+                f"Got it ✈️\n"
+                f"{pf['flight_number']} → {destination} on {dep_display}\n"
+                f"Currency: {currency}\n"
+                f"Return: {ret_str}\n\n"
+                f"Reply Y to confirm — overseas mode will activate at departure time."
+            )
+            # Store currency in pending for Y handler
+            pf["manual_currency"] = currency
+            if ret_date_obj:
+                pf["manual_return_date"] = ret_date_obj.strftime("%d/%m/%Y")
+            overseas_state["_pending_flight"] = pf
+            try:
+                await update.message.reply_text(reply)
+            except Exception:
+                await update.message.reply_text(reply)
+            return
+
         if text.strip().upper() == "Y":
             overseas_state.pop("_pending_flight")
             info = get_dest_info_from_iata(pf.get("arr_iata", ""), pf.get("arr_city", pf.get("arr_airport", "")))
@@ -6706,6 +7021,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = f"Delete event *{event_name}*? (yes / no)"
 
     # Infrastructure / Settings
+    elif lower in ("em whats pending", "em what's pending", "em pending", "whats pending"):
+        reply = get_pending_backlog()
+
     elif lower == "em status":
         issues = []
         # Google Drive
