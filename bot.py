@@ -2293,6 +2293,12 @@ def handle_reschedule(text, user_id):
 EXPENSE_CATEGORIES = ["FnB", "Entertainment", "Personal", "Family", "Work", "Transport", "Shopping", "Travel"]
 EXPENSE_CARDS = ["Citi", "Maybank", "Amex", "UOB"]  # fallback only — live list read from Cards sheet
 
+# In-memory caches to avoid repeated Sheets API calls
+_merchant_cache = None          # list of dicts from Merchant Map sheet
+_card_names_cache = None        # list of card name strings
+_system_prompt_cache = None     # cached system prompt string
+_system_prompt_overseas_key = None  # tracks when to invalidate system prompt cache
+
 # Cards sheet new schema: Card Name | Last 4 | Default Category | Notes
 CARDS_SCHEMA = ["Card Name", "Last 4", "Default Category", "Notes"]
 INITIAL_CARDS = [
@@ -2306,11 +2312,14 @@ def cards_sheet():
     return spreadsheet.worksheet("Cards")
 
 def get_cards_live():
-    """Read card list live from Cards sheet. Returns list of dicts."""
+    """Read card list from Cards sheet, cached in memory."""
+    global _card_names_cache
+    if _card_names_cache is not None:
+        return _card_names_cache
     try:
         ws = cards_sheet()
-        records = ws.get_all_records()
-        return records
+        _card_names_cache = ws.get_all_records()
+        return _card_names_cache
     except Exception as e:
         print(f"get_cards_live error: {e}")
         return []
@@ -2748,11 +2757,25 @@ def expenses_sheet():
 def merchant_map_sheet():
     return spreadsheet.worksheet("Merchant Map")
 
+def _get_merchant_records():
+    """Return merchant map records from cache, loading from sheet if needed."""
+    global _merchant_cache
+    if _merchant_cache is None:
+        try:
+            _merchant_cache = merchant_map_sheet().get_all_records()
+        except Exception as e:
+            print(f"_get_merchant_records error: {e}")
+            return []
+    return _merchant_cache
+
+def _invalidate_merchant_cache():
+    global _merchant_cache
+    _merchant_cache = None
+
 def get_merchant_memory(merchant):
     """Look up known merchant in Merchant Map. Returns (category, card, canonical_name) or (None, None, None)."""
     try:
-        sheet = merchant_map_sheet()
-        records = sheet.get_all_records()
+        records = _get_merchant_records()
         merchant_lower = merchant.lower().strip()
         # Exact match first
         for r in records:
@@ -2779,6 +2802,7 @@ def save_merchant_memory(merchant, category, card):
     try:
         sheet = merchant_map_sheet()
         sheet.append_row([merchant, category, card])
+        _invalidate_merchant_cache()
     except Exception as e:
         print(f"Error saving merchant: {e}")
 
@@ -2798,6 +2822,7 @@ def delete_merchant(merchant_name):
         if len(matches) == 1:
             row_idx, found_name = matches[0]
             sheet.delete_rows(row_idx)
+            _invalidate_merchant_cache()
             return f"Deleted \'{found_name}\' from merchant memory ✅\nNext time you log there, I\'ll ask for category and card again."
         lines = [f"Found {len(matches)} merchants matching \'{merchant_name}\' — which one?"]
         for i, (_, name) in enumerate(matches, 1):
@@ -3098,8 +3123,9 @@ def is_overseas_mode_request(text):
 
     return False
 
-def lookup_flight(flight_number):
-    """Look up flight details via AviationStack API. Returns dict or None."""
+def lookup_flight(flight_number, flight_date=None):
+    """Look up flight details via AviationStack API. Returns dict or None.
+    flight_date: date object or YYYY-MM-DD string. If provided, filters by that date."""
     if not AVIATIONSTACK_API_KEY:
         print("Flight lookup: no AVIATIONSTACK_API_KEY set")
         return None
@@ -3109,6 +3135,11 @@ def lookup_flight(flight_number):
             "access_key": AVIATIONSTACK_API_KEY,
             "flight_iata": flight_number.upper()
         }
+        if flight_date:
+            if hasattr(flight_date, "strftime"):
+                params["flight_date"] = flight_date.strftime("%Y-%m-%d")
+            else:
+                params["flight_date"] = str(flight_date)
         resp = requests.get(url, params=params, timeout=10)
         data = resp.json()
         print(f"AviationStack {flight_number}: {json.dumps(data)[:400]}")
@@ -3148,6 +3179,77 @@ def extract_flight_number(text):
 def extract_all_flight_numbers(text):
     """Extract all flight numbers from text."""
     return re.findall(r'\b([A-Z]{1,3}\d{2,4}[A-Z]?)\b', text.upper())
+
+def extract_flight_dates(text):
+    """Extract dates mentioned near flight numbers in text.
+    Returns list of date objects in order of mention, or [] if none found.
+    Handles: '24th Apr', '24 Apr', 'Apr 24', '24/4', '2026-04-24', 'tomorrow', 'today'.
+    """
+    today = date.today()
+    found = []
+    # Patterns to try (order matters — most specific first)
+    patterns = [
+        # ISO: 2026-04-24
+        (r'\b(\d{4}-\d{2}-\d{2})\b', "%Y-%m-%d"),
+        # 24th/24 Apr [2026]
+        (r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:\s+\d{4})?\b', None),
+        # Apr 24 [2026]
+        (r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+\d{4})?\b', None),
+        # 24/4 or 24/04
+        (r'\b(\d{1,2})[/\-](\d{1,2})\b', None),
+    ]
+    seen_dates = set()
+
+    # Handle relative dates first
+    for word, delta in [("today", 0), ("tomorrow", 1), ("tmr", 1), ("tmrw", 1)]:
+        if word in text.lower():
+            d = today + timedelta(days=delta)
+            if d not in seen_dates:
+                seen_dates.add(d)
+                found.append(d)
+
+    # Regex-based extraction
+    month_map = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                 "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+    current_year = today.year
+
+    # Try "24 Apr" / "24th Apr"
+    for m in re.finditer(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:\s+(\d{4}))?\b', text, re.IGNORECASE):
+        day = int(m.group(1))
+        mon = month_map[m.group(2).lower()]
+        yr = int(m.group(3)) if m.group(3) else current_year
+        try:
+            d = date(yr, mon, day)
+            if d not in seen_dates:
+                seen_dates.add(d)
+                found.append(d)
+        except ValueError:
+            pass
+
+    # Try "Apr 24"
+    for m in re.finditer(r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?\b', text, re.IGNORECASE):
+        mon = month_map[m.group(1).lower()]
+        day = int(m.group(2))
+        yr = int(m.group(3)) if m.group(3) else current_year
+        try:
+            d = date(yr, mon, day)
+            if d not in seen_dates:
+                seen_dates.add(d)
+                found.append(d)
+        except ValueError:
+            pass
+
+    # Try ISO format
+    for m in re.finditer(r'\b(\d{4}-\d{2}-\d{2})\b', text):
+        try:
+            d = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+            if d not in seen_dates:
+                seen_dates.add(d)
+                found.append(d)
+        except ValueError:
+            pass
+
+    return found
 
 def format_flight_time(iso_str):
     """Format ISO datetime string to readable local time."""
@@ -3322,7 +3424,12 @@ def handle_overseas_request(text):
         outbound = all_flights[0]
         return_flight_num = all_flights[1] if len(all_flights) > 1 else None
 
-        flight_data = lookup_flight(outbound)
+        # Extract dates from message — first date = departure, second = return
+        flight_dates = extract_flight_dates(text)
+        dep_date = flight_dates[0] if len(flight_dates) > 0 else None
+        ret_date = flight_dates[1] if len(flight_dates) > 1 else None
+
+        flight_data = lookup_flight(outbound, flight_date=dep_date)
         if flight_data:
             dep_fmt = format_flight_time(flight_data["dep_time"])
             arr_fmt = format_flight_time(flight_data["arr_time"])
@@ -3345,7 +3452,7 @@ def handle_overseas_request(text):
             reply = f"Found {outbound} ✈️\nDeparts: {dep_fmt}\nArrives: {arr_fmt} → {arr_label}\n"
 
             if return_flight_num:
-                ret_data = lookup_flight(return_flight_num)
+                ret_data = lookup_flight(return_flight_num, flight_date=ret_date)
                 if ret_data:
                     ret_dep = format_flight_time(ret_data["dep_time"])
                     ret_arr = format_flight_time(ret_data["arr_time"])
@@ -6706,10 +6813,23 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if user_id not in conversation_histories:
                 conversation_histories[user_id] = []
             conversation_histories[user_id].append({"role": "user", "content": text})
+            # Cap history at 10 turns (20 messages) to prevent prompt bloat slowing responses
+            if len(conversation_histories[user_id]) > 20:
+                conversation_histories[user_id] = conversation_histories[user_id][-20:]
+            # Use cached system prompt — only rebuilds when overseas state changes
+            global _system_prompt_cache, _system_prompt_overseas_key
+            overseas_key = (
+                overseas_state.get("active"),
+                overseas_state.get("destination"),
+                overseas_state.get("currency"),
+            )
+            if _system_prompt_cache is None or _system_prompt_overseas_key != overseas_key:
+                _system_prompt_cache = build_system_prompt()
+                _system_prompt_overseas_key = overseas_key
             response = client.messages.create(
                 model="claude-sonnet-4-5",
                 max_tokens=1024,
-                system=build_system_prompt(),
+                system=_system_prompt_cache,
                 messages=conversation_histories[user_id]
             )
             reply = response.content[0].text
