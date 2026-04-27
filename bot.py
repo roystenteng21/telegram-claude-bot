@@ -754,24 +754,27 @@ def get_calendar(name=None):
 
 async def check_icloud_daily(app):
     """Daily check — notify if iCloud Calendar still down."""
-    global _icloud_down, _icloud_last_notified
-    today = date.today()
-    if _icloud_down:
-        if _icloud_last_notified != today:
-            _icloud_last_notified = today
-            await app.bot.send_message(
-                chat_id=YOUR_CHAT_ID,
-                text="⚠️ iCloud Calendar still unavailable — calendar features won't work.\nCheck your credentials in Railway."
-            )
-    else:
-        # Test connection
-        cal = get_calendar()
-        if cal is None and _icloud_last_notified != today:
-            _icloud_last_notified = today
-            await app.bot.send_message(
-                chat_id=YOUR_CHAT_ID,
-                text="⚠️ iCloud Calendar unavailable — calendar features won't work.\nCheck your credentials in Railway."
-            )
+    try:
+        global _icloud_down, _icloud_last_notified
+        today = date.today()
+        if _icloud_down:
+            if _icloud_last_notified != today:
+                _icloud_last_notified = today
+                await app.bot.send_message(
+                    chat_id=YOUR_CHAT_ID,
+                    text="⚠️ iCloud Calendar still unavailable — calendar features won't work.\nCheck your credentials in Railway."
+                )
+        else:
+            # Test connection
+            cal = get_calendar()
+            if cal is None and _icloud_last_notified != today:
+                _icloud_last_notified = today
+                await app.bot.send_message(
+                    chat_id=YOUR_CHAT_ID,
+                    text="⚠️ iCloud Calendar unavailable — calendar features won't work.\nCheck your credentials in Railway."
+                )
+    except Exception as e:
+        print(f"check_icloud_daily error: {e}")
 
 
 
@@ -904,8 +907,7 @@ def find_row(name):
 
 def find_all_rows(name):
     """Like find_row but returns all matches for disambiguation."""
-    sheet = crm_sheet()
-    records = sheet.get_all_records()
+    records = _get_crm_records()
     name_lower = name.strip().lower()
     results = []
 
@@ -1065,8 +1067,7 @@ def delete_contact(name):
 
 def search_contacts(keyword):
     try:
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         results = []
         for r in records:
             if any(keyword.lower() in str(v).lower() for v in r.values()):
@@ -1079,8 +1080,7 @@ def search_contacts(keyword):
 
 def list_contacts():
     try:
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         if not records:
             return "❌ No contacts found"
         response = f"📋 *{len(records)} contact(s):*\n\n"
@@ -1093,8 +1093,7 @@ def list_contacts():
 
 def get_stats():
     try:
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         today = date.today()
         total = len(records)
         followups_due = 0
@@ -1130,8 +1129,7 @@ def get_stats():
 
 def upcoming_followups():
     try:
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         today = date.today()
         upcoming = []
         for r in records:
@@ -1158,8 +1156,7 @@ def upcoming_followups():
 
 def overdue_followups():
     try:
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         today = date.today()
         overdue = []
         for r in records:
@@ -1187,8 +1184,7 @@ def overdue_followups():
 
 def upcoming_birthdays(days=30):
     try:
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         today = date.today()
         upcoming = []
         for r in records:
@@ -1249,8 +1245,7 @@ def set_referral(referrer_name, referred_name):
 def get_referrals_by(referrer_name):
     """List all contacts referred by a given person."""
     try:
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         results = [r for r in records if r.get("Referred By", "").lower() == referrer_name.lower()]
         if not results:
             return f"No referrals found from {referrer_name}."
@@ -1265,8 +1260,7 @@ def get_referrals_by(referrer_name):
 def get_all_referrals():
     """List all contacts with a referral, grouped by referrer."""
     try:
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         referrals = [r for r in records if r.get("Referred By", "")]
         if not referrals:
             return "No referrals recorded yet."
@@ -1286,8 +1280,7 @@ def get_all_referrals():
 def get_top_referrers():
     """Rank contacts by number of referrals made."""
     try:
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         counts = {}
         for r in records:
             ref_by = r.get("Referred By", "")
@@ -1366,14 +1359,14 @@ async def handle_excel_import(file_bytes, column_order, update):
                         "%d %b %Y", "%d %B %Y", "%Y-%m-%d %H:%M:%S"]:
                 try:
                     return datetime.strptime(s, fmt).strftime("%d/%m/%Y")
-                except:
+                except (ValueError, TypeError):
                     pass
             # Try Excel serial
             try:
                 serial = int(float(s))
                 epoch = datetime(1899, 12, 30)
                 return (epoch + timedelta(days=serial)).strftime("%d/%m/%Y")
-            except:
+            except (ValueError, TypeError):
                 pass
             return s  # return raw if nothing parsed
 
@@ -1748,8 +1741,7 @@ def parse_date_flexible(date_str):
 
 async def send_followup_reminders(app):
     try:
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         today = date.today()
         for i, r in enumerate(records, start=2):
             fu_date_str = r.get("Follow Up Date", "")
@@ -1824,8 +1816,7 @@ async def send_birthday_reminders(app):
     global birthday_pending
     try:
         ensure_birthday_greeted_column()
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         today = date.today()
 
         for i, r in enumerate(records):
@@ -1976,8 +1967,7 @@ def extract_event_name(text):
 def tag_crm_contacts(text):
     """Find any CRM contacts mentioned in the text."""
     try:
-        sheet = crm_sheet()
-        records = sheet.get_all_records()
+        records = _get_crm_records()
         tagged = []
         for r in records:
             name = r.get("Name", "")
@@ -2695,6 +2685,7 @@ confirm_sessions = {}  # { user_id: { "action": str, "args": list, "target": str
 receipt_confirm_sessions = {}  # { user_id: { "merchant": str, "amount": float, ... } }
 todo_disambig_sessions = {}  # { user_id: { "tasks": list, "action": str } }
 market_summary_pending = {}  # { user_id: True }
+interrupted_sessions = {}  # { user_id: { "label": str, "pending_text": str } }
 
 # Reconciliation sessions — { user_id: { "step": str, "unmatched": [...], "index": int } }
 recon_sessions = {}
@@ -2968,22 +2959,25 @@ def parse_manual_fx_input(text, currency):
 
 async def refresh_fx_rates(app=None):
     """Refresh cached FX rates for all active overseas currencies. Called twice daily."""
-    currencies = [c for c in overseas_state.get("currencies", []) if c != "SGD"]
-    if not currencies:
-        return
-    for currency in currencies:
-        cache_key = f"{currency}_SGD"
-        if EXCHANGE_RATE_API_KEY:
-            try:
-                url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_RATE_API_KEY}/pair/{currency}/SGD"
-                resp = requests.get(url, timeout=8)
-                data = resp.json()
-                if data.get("result") == "success":
-                    rate = float(data["conversion_rate"])
-                    cached_fx_rates[cache_key] = {"rate": rate, "fetched_at": datetime.now(pytz.utc)}
-                    print(f"FX refresh: 1 {currency} = {rate} SGD")
-            except Exception as e:
-                print(f"FX refresh error for {currency}: {e}")
+    try:
+        currencies = [c for c in overseas_state.get("currencies", []) if c != "SGD"]
+        if not currencies:
+            return
+        for currency in currencies:
+            cache_key = f"{currency}_SGD"
+            if EXCHANGE_RATE_API_KEY:
+                try:
+                    url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_RATE_API_KEY}/pair/{currency}/SGD"
+                    resp = requests.get(url, timeout=8)
+                    data = resp.json()
+                    if data.get("result") == "success":
+                        rate = float(data["conversion_rate"])
+                        cached_fx_rates[cache_key] = {"rate": rate, "fetched_at": datetime.now(pytz.utc)}
+                        print(f"FX refresh: 1 {currency} = {rate} SGD")
+                except Exception as e:
+                    print(f"FX refresh error for {currency}: {e}")
+    except Exception as e:
+        print(f"refresh_fx_rates error: {e}")
 
 EXPENSE_CATEGORY_EMOJI = {
     "FnB": "🍽️",
@@ -3625,6 +3619,10 @@ def deactivate_overseas_mode():
 async def activate_overseas_mode_scheduled(dest, curr, return_flight_data=None):
     """Called by scheduler at departure time to activate overseas mode."""
     global overseas_state, _app_ref
+    # Clear any open expense sessions for the user to prevent orphans
+    for d in [expense_sessions, receipt_confirm_sessions]:
+        d.pop(YOUR_CHAT_ID, None)
+    session_timestamps.pop(YOUR_CHAT_ID, None)
     overseas_state["active"] = True
     overseas_state["destination"] = dest
     overseas_state["currency"] = curr
@@ -5005,6 +5003,119 @@ def delete_restaurant(name):
     except Exception as e:
         return f"Error: {str(e)}"
 
+def is_restaurant_review_request(text):
+    """Detect restaurant review request intent."""
+    lower = text.lower()
+    triggers = ["reviews for", "review of", "what's", "what is", "is it good",
+                "is it worth", "heard of", "good place", "how is", "how's",
+                "tell me about", "any good", "worth going", "worth visiting"]
+    restaurant_context = ["restaurant", "place", "cafe", "bar", "eatery"]
+    if any(t in lower for t in ["reviews for", "review of", "tell me about"]):
+        return True
+    if any(t in lower for t in triggers) and any(c in lower for c in restaurant_context):
+        return True
+    return False
+
+def get_restaurant_review(name):
+    """Fetch RSS headlines for a restaurant and generate a casual Claude summary."""
+    try:
+        import xml.etree.ElementTree as ET
+        headlines = []
+        queries = [f"{name} restaurant review Singapore", f"{name} Singapore food review"]
+        for q_text in queries:
+            if len(headlines) >= 3:
+                break
+            q = q_text.replace(" ", "+")
+            url = f"https://news.google.com/rss/search?q={q}&hl=en-SG&gl=SG&ceid=SG:en"
+            try:
+                resp = requests.get(url, timeout=5)
+                root = ET.fromstring(resp.content)
+                for item in root.findall(".//item"):
+                    if len(headlines) >= 3:
+                        break
+                    title = item.findtext("title", "").split(" - ")[0].strip()
+                    if title and title not in headlines:
+                        headlines.append(title)
+            except Exception as e:
+                print(f"Restaurant review RSS error for {name}: {e}")
+                continue
+
+        if not headlines:
+            return f"Couldn't find recent reviews for {name} — try searching online for the latest."
+
+        headline_text = "\n".join(f"- {h}" for h in headlines)
+        try:
+            resp = client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=200,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Here are some headlines about the restaurant '{name}':\n{headline_text}\n\n"
+                        "Write a casual 2-3 sentence summary of what people are saying. "
+                        "Warm and conversational, no bullet points, no headers. "
+                        "If headlines aren't specifically about this restaurant, say you couldn't find solid reviews."
+                    )
+                }]
+            )
+            return resp.content[0].text.strip()
+        except Exception as e:
+            print(f"Restaurant review Claude error: {e}")
+            return f"Found some mentions of {name} but couldn't summarise them right now."
+    except Exception as e:
+        return f"Couldn't fetch reviews for {name} right now."
+
+def is_restaurant_suggestion_request(text):
+    """Detect similar restaurant suggestion request."""
+    lower = text.lower()
+    triggers = ["similar to", "like ", "anything like", "places like",
+                "restaurants like", "something like", "alternatives to", "similar places"]
+    return any(t in lower for t in triggers)
+
+def get_similar_restaurants(text):
+    """Suggest similar restaurants based on tags of a known restaurant or cuisine description."""
+    try:
+        lower = text.lower()
+        # Extract reference restaurant name
+        ref_name = None
+        for trigger in ["similar to", "like ", "anything like", "places like",
+                        "restaurants like", "something like", "alternatives to", "similar places to"]:
+            if trigger in lower:
+                idx = lower.index(trigger) + len(trigger)
+                ref_name = text[idx:].strip().rstrip("?").strip()
+                break
+
+        # Look up in saved restaurants for tags
+        context = ""
+        if ref_name:
+            try:
+                ws = restaurants_sheet()
+                records = ws.get_all_records()
+                for r in records:
+                    if ref_name.lower() in r.get("Name", "").lower():
+                        tags = r.get("Tags", "")
+                        location = r.get("Location", "")
+                        context = f"The restaurant '{r['Name']}' is tagged as: {tags}. Located at {location}."
+                        break
+            except Exception as e:
+                print(f"Similar restaurant sheet lookup error: {e}")
+
+        prompt = (
+            f"Suggest 3 restaurants similar to '{ref_name or text}' in Singapore. "
+            f"{context} "
+            "For each: name, area, and one casual sentence on why it's similar. "
+            "Format each as: 🍽 [Name] — [Area] — [Why similar]. "
+            "Divider line between each. Be specific and useful, not generic."
+        )
+        resp = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        return f"Couldn't generate suggestions right now — try again in a moment."
+
 def is_restaurant_save(text):
     """Detect restaurant save intent.
     Added: 'save this restaurant', 'try this restaurant', 'this place' + save verb."""
@@ -5112,8 +5223,74 @@ MARKET_INDICES = {
     "India": {"^BSESN": "Sensex", "^NSEI": "Nifty 50"},
 }
 
+
+# SGX and HK ticker normalisation — common names/codes mapped to Yahoo Finance format
+SGX_TICKER_MAP = {
+    # DBS
+    "dbs": "D05.SI", "d05": "D05.SI",
+    # OCBC
+    "ocbc": "O39.SI", "o39": "O39.SI",
+    # UOB
+    "uob": "U11.SI", "u11": "U11.SI",
+    # Singtel
+    "singtel": "Z74.SI", "z74": "Z74.SI",
+    # CapitaLand
+    "capitaland": "9CI.SI", "cli": "9CI.SI",
+    # Keppel
+    "keppel": "BN4.SI", "bn4": "BN4.SI",
+    # Wilmar
+    "wilmar": "F34.SI", "f34": "F34.SI",
+    # Singapore Airlines
+    "sia": "C6L.SI", "singapore airlines": "C6L.SI", "c6l": "C6L.SI",
+    # Jardine Matheson
+    "jardine": "J36.SI",
+    # Thai Bev
+    "thai bev": "Y92.SI", "thaibev": "Y92.SI",
+}
+
+HK_TICKER_MAP = {
+    # Tencent
+    "tencent": "0700.HK", "0700": "0700.HK",
+    # Alibaba HK
+    "alibaba": "9988.HK", "9988": "9988.HK",
+    # Meituan
+    "meituan": "3690.HK", "3690": "3690.HK",
+    # HSBC
+    "hsbc": "0005.HK", "0005": "0005.HK",
+    # AIA
+    "aia": "1299.HK", "1299": "1299.HK",
+    # BYD
+    "byd": "1211.HK", "1211": "1211.HK",
+    # Xiaomi
+    "xiaomi": "1810.HK", "1810": "1810.HK",
+    # JD
+    "jd": "9618.HK", "9618": "9618.HK",
+    # NetEase
+    "netease": "9999.HK", "9999": "9999.HK",
+    # CNOOC
+    "cnooc": "0883.HK", "0883": "0883.HK",
+}
+
+def normalise_ticker(ticker):
+    """Normalise a ticker string to Yahoo Finance format.
+    Handles SGX (.SI), HK (.HK), and common name lookups."""
+    t = ticker.strip().lower()
+    if t in SGX_TICKER_MAP:
+        return SGX_TICKER_MAP[t]
+    if t in HK_TICKER_MAP:
+        return HK_TICKER_MAP[t]
+    upper = ticker.strip().upper()
+    # Already has exchange suffix
+    if "." in upper:
+        return upper
+    # Looks like an HK ticker (4-digit number)
+    if re.match(r"^\d{4}$", upper):
+        return f"{upper}.HK"
+    return upper
+
 def fetch_price(ticker):
     """Fetch current price — Alpha Vantage primary, Yahoo Finance fallback."""
+    ticker = normalise_ticker(ticker)
     # --- Alpha Vantage ---
     if ALPHA_VANTAGE_API_KEY:
         try:
@@ -5461,7 +5638,10 @@ def parse_stock_request(text):
         messages=[{"role": "user", "content": prompt}]
     )
     raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
-    return json.loads(raw)
+    parsed = json.loads(raw)
+    if parsed.get("ticker"):
+        parsed["ticker"] = normalise_ticker(parsed["ticker"])
+    return parsed
 
 def suggest_stocks(criteria):
     """Suggest 3 stocks based on described criteria."""
@@ -5508,38 +5688,10 @@ async def check_price_alerts(app):
         print(f"Error checking price alerts: {e}")
 
 async def send_weekly_market_summary(app):
-    """Monday 8am — send US, China, India market summary."""
+    """Monday 8am — send US, China, India market summary using agreed qualitative format."""
     try:
-        lines = []
-        sentiments = []
-
-        for market, indices in MARKET_INDICES.items():
-            market_lines = [f"{market}"]
-            market_changes = []
-
-            for ticker, name in indices.items():
-                data = fetch_price(ticker)
-                if data:
-                    arrow = "▲" if data["change_pct"] >= 0 else "▼"
-                    market_lines.append(f"• {name}: {arrow} {abs(data['change_pct']):.1f}%")
-                    market_changes.append(data["change_pct"])
-
-            if market_changes:
-                avg = sum(market_changes) / len(market_changes)
-                sentiment = "positive" if avg > 0.3 else "negative" if avg < -0.3 else "mixed"
-                sentiments.append(sentiment)
-                market_lines.append(f"Sentiment: {sentiment.title()}")
-
-            lines.append("\n".join(market_lines))
-
-        # Overall flag
-        if sentiments:
-            overall = "broadly positive" if sentiments.count("positive") >= 2 else                       "broadly negative" if sentiments.count("negative") >= 2 else "mixed"
-            lines.append(f"Overall: {overall}")
-
-        msg = "Weekly Market Summary\n\n" + "\n\n---\n\n".join(lines)
-        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
-
+        msg = get_market_summary_now()
+        await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
     except Exception as e:
         print(f"Error sending weekly market summary: {e}")
 
@@ -6109,6 +6261,113 @@ def build_system_prompt():
         "- Get repetitive with phrases or greetings"
     ) + _build_overseas_flight_context() + overseas_context + expense_context
 
+# --- Safe message sender — chunks at 4096 char Telegram limit ---
+async def send_safe(target, text, parse_mode=None):
+    """Send a message, splitting into chunks if over Telegram's 4096 char limit."""
+    MAX = 4096
+    if len(text) <= MAX:
+        try:
+            await target.reply_text(text, parse_mode=parse_mode)
+        except Exception:
+            await target.reply_text(text)
+        return
+    # Split at newlines to avoid breaking mid-sentence
+    chunks = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > MAX:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = current + "\n" + line if current else line
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        try:
+            await target.reply_text(chunk, parse_mode=parse_mode)
+        except Exception:
+            await target.reply_text(chunk)
+
+# --- Session Interrupt Guard ---
+
+def get_active_session_label(user_id):
+    """Return a human-readable label if user is mid-session, else None."""
+    if user_id in receipt_confirm_sessions:
+        return "expense confirmation"
+    if user_id in expense_sessions:
+        return "expense entry"
+    if user_id in meeting_sessions:
+        return "meeting recap"
+    if user_id in edit_sessions:
+        return "contact edit"
+    if user_id in confirm_sessions:
+        action = confirm_sessions[user_id].get("action", "")
+        labels = {
+            "delete_contact": "contact deletion",
+            "delete_bill": "bill deletion",
+            "delete_restaurant": "restaurant deletion",
+            "delete_event": "event deletion",
+            "rename_category": "category rename",
+        }
+        return labels.get(action, "confirmation")
+    if user_id in delete_sessions:
+        return "expense deletion"
+    if user_id in portfolio_delete_sessions:
+        return "portfolio deletion"
+    if user_id in excel_import_sessions:
+        return "contact import"
+    if user_id in pending_restaurant_saves:
+        return "restaurant save"
+    if user_id in pending_contact_saves:
+        return "contact save"
+    if user_id in todo_disambig_sessions:
+        return "todo action"
+    if overseas_state.get("_pending_flight"):
+        return "flight setup"
+    return None
+
+# Words that are always session replies, never new intents
+_SESSION_REPLY_TOKENS = {
+    "yes", "y", "no", "n", "cancel", "skip", "done", "update", "new",
+    "confirm", "ok", "okay", "sure", "nope", "yep", "yup"
+}
+
+def looks_like_new_intent(text):
+    """Return True if the message looks like a fresh command, not a session reply."""
+    lower = text.strip().lower()
+
+    # Single-word session replies — never a new intent
+    if lower in _SESSION_REPLY_TOKENS:
+        return False
+
+    # Bare digit(s) — session pick reply
+    if re.match(r"^\d+$", lower.strip()):
+        return False
+
+    # Short single-word or two-word inputs are likely session replies
+    words = lower.split()
+    if len(words) <= 2:
+        return False
+
+    # Known intent signals — starts with a strong command verb or pattern
+    new_intent_triggers = [
+        "remind me", "set a reminder", "add reminder",
+        "spent ", "paid ", "bought ", "expense ",
+        "save ", "add contact", "find ", "pull up ",
+        "meeting recap", "start a recap",
+        "overseas", "i'm in ", "flying to",
+        "what's ", "how is ", "market summary",
+        "alert me", "price of ", "check ",
+        "bill ", "my ", "schedule ", "book ",
+        "todo ", "add to my list", "remind",
+        "cancel reminder", "delete ",
+    ]
+    if any(lower.startswith(t) for t in new_intent_triggers):
+        return True
+
+    return False
+
 # --- Message Handler ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -6334,6 +6593,44 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                                     confirm_sessions, receipt_confirm_sessions, edit_sessions, meeting_sessions]):
         if is_session_expired(user_id):
             await check_session_timeouts(user_id, update)
+            return
+
+    # Session interrupt guard — if mid-session and message looks like a new intent, pause and confirm
+    active_label = get_active_session_label(user_id)
+    if active_label and looks_like_new_intent(text):
+        # If already waiting for interrupt confirmation, handle it
+        if user_id in interrupted_sessions:
+            pending = interrupted_sessions[user_id]
+            if text.strip().lower() in ["yes", "y"]:
+                # Clear all active sessions and replay the pending message
+                for d in [receipt_confirm_sessions, expense_sessions, meeting_sessions,
+                          edit_sessions, confirm_sessions, delete_sessions,
+                          portfolio_delete_sessions, excel_import_sessions,
+                          pending_restaurant_saves, pending_contact_saves,
+                          todo_disambig_sessions]:
+                    d.pop(user_id, None)
+                overseas_state.pop("_pending_flight", None)
+                session_timestamps.pop(user_id, None)
+                del interrupted_sessions[user_id]
+                # Replay by substituting the pending text and continuing
+                update.message.text = pending["pending_text"]
+                text = pending["pending_text"]
+                lower = text.lower()
+                # Fall through to normal routing with the replayed message
+            elif text.strip().lower() in ["no", "n"]:
+                del interrupted_sessions[user_id]
+                await update.message.reply_text(f"Got it — continuing with your {pending['label']}.")
+                return
+            else:
+                await update.message.reply_text(f"Reply yes to switch, or no to continue with your {pending['label']}.")
+                return
+        else:
+            # First interrupt — store and ask
+            interrupted_sessions[user_id] = {"label": active_label, "pending_text": text}
+            await update.message.reply_text(
+                f"You're mid-{active_label} — did you mean to do something else?\n"
+                f"Reply yes to switch, or no to continue."
+            )
             return
 
     # Handle pending restaurant saves (location needed or duplicate)
@@ -6703,6 +7000,10 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 )
             else:
                 # Departure already passed or no dep time — activate now
+                # Clear any open expense sessions to prevent orphans
+                for d in [expense_sessions, receipt_confirm_sessions]:
+                    d.pop(user_id, None)
+                session_timestamps.pop(user_id, None)
                 overseas_state["active"] = True
                 overseas_state["destination"] = dest
                 overseas_state["currency"] = curr
@@ -7071,6 +7372,12 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = result
     elif lower.startswith("search restaurants "):
         reply = search_restaurants(text[19:].strip())
+    elif is_restaurant_suggestion_request(text):
+        reply = get_similar_restaurants(text)
+    elif is_restaurant_review_request(text):
+        # Extract restaurant name — strip review trigger words
+        name = re.sub(r"reviews? for|review of|tell me about|how is|how's|what's|what is", "", lower).strip().rstrip("?").strip()
+        reply = get_restaurant_review(name) if name else "Which restaurant are you asking about?"
 
     # Stock Commands
     elif lower in ["portfolio", "my portfolio", "holdings", "portfolio performance"]:
@@ -7324,10 +7631,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = "Not sure how to handle that one — might be worth adding a handler for it in the bot code."
 
     if reply:
-        try:
-            await update.message.reply_text(reply, parse_mode="Markdown")
-        except Exception:
-            await update.message.reply_text(reply)
+        await send_safe(update.message, reply, parse_mode="Markdown")
 
 # --- Main ---
 
