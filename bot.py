@@ -3901,7 +3901,7 @@ async def handle_receipt_confirm_session(user_id, text, update):
     lower = text.strip().lower()
 
     # Cancel / skip
-    if lower in ["skip", "cancel", "no"]:
+    if lower in ["skip", "cancel", "no", "n", "nope", "nah"]:
         del receipt_confirm_sessions[user_id]
         session_timestamps.pop(user_id, None)
         receipt_link = session.get("receipt_link", "")
@@ -3944,8 +3944,7 @@ async def handle_receipt_confirm_session(user_id, text, update):
 
     # Duplicate confirm
     if session.get("step") == "duplicate_confirm":
-        if lower in ["yes", "y"]:
-            session["step"] = "receipt_confirm"
+        if lower in ["yes", "y", "yep", "yeah", "yup"]:
             receipt_confirm_sessions[user_id] = session
             await update.message.reply_text(
                 format_expense_confirmation(
@@ -3962,8 +3961,7 @@ async def handle_receipt_confirm_session(user_id, text, update):
             await update.message.reply_text("Skipped duplicate.")
         return True
 
-    # Yes — log it
-    if lower in ["yes", "y"]:
+    if lower in ["yes", "y", "yep", "yeah", "yup"]:
         await _finalise_receipt_confirm(user_id, session, update)
         return True
 
@@ -4195,9 +4193,7 @@ async def handle_expense_session(user_id, text, update):
 
     if step == "duplicate_confirm":
         lower = text.strip().lower()
-        if lower in ["yes", "y"]:
-            # Move to confirm screen
-            del expense_sessions[user_id]
+        if lower in ["yes", "y", "yep", "yeah", "yup"]:
             receipt_confirm_sessions[user_id] = {**session, "step": "receipt_confirm"}
             touch_session(user_id)
             confirmation = format_expense_confirmation(
@@ -7228,8 +7224,11 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             elif lower in ["update", "update existing"]:
                 del pending_restaurant_saves[user_id]
                 await update.message.reply_text(f"Use 'edit restaurant {prs['existing']}' to update it.")
+            elif lower in ["skip", "s", "cancel", "no", "n", "nope", "nah"]:
+                del pending_restaurant_saves[user_id]
+                await update.message.reply_text("Skipped.")
             else:
-                await update.message.reply_text("Reply 'update' or 'new'.")
+                await update.message.reply_text("Reply 'update', 'new', or 'skip'.")
             return
 
     # Handle pending duplicate contact save
@@ -7243,8 +7242,11 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             del pending_contact_saves[user_id]
             reply = f"Opening {pcs['existing_name']} for editing — use 'edit {pcs['existing_name']}' to update fields."
             await update.message.reply_text(reply)
+        elif lower in ["skip", "s", "cancel", "no", "n", "nope", "nah"]:
+            del pending_contact_saves[user_id]
+            await update.message.reply_text("Skipped.")
         else:
-            await update.message.reply_text(f"*{pcs['existing_name']}* already exists. Reply 'update' or 'new'.")
+            await update.message.reply_text(f"*{pcs['existing_name']}* already exists. Reply 'update', 'new', or 'skip'.")
         return
 
     # Handle todo disambiguation
@@ -7722,7 +7724,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = "Missed bill reminders dismissed ✅"
 
     # Missed market summary response
-    elif lower in ["yes", "y"] and market_summary_pending.get(user_id):
+    elif lower in ["yes", "y", "yep", "yeah", "yup"] and market_summary_pending.get(user_id):
         market_summary_pending.pop(user_id, None)
         reply = get_market_summary_now()
 
