@@ -1600,7 +1600,7 @@ def is_calendar_request(text):
     if any(s in lower for s in AMBIGUOUS_SIGNALS) or AT_PATTERN:
         try:
             response = client.messages.create(
-                model="claude-haiku-3-5-20241022",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=10,
                 messages=[{"role": "user", "content":
                     f'Is this asking to add a calendar event? Reply YES or NO only.\n\n"{text}"'}]
@@ -1645,7 +1645,7 @@ Rules:
 - If no calendar specified, use Personal"""
 
         response = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-6",
             max_tokens=300,
             messages=[{"role": "user", "content": parse_prompt}]
         )
@@ -1802,7 +1802,7 @@ def generate_birthday_greeting(name, age, relationship, context, notes):
     )
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-6",
             max_tokens=200,
             messages=[{"role": "user", "content": greeting_prompt}]
         )
@@ -1994,7 +1994,7 @@ def process_meeting_notes(event_name, notes_list):
         f"Return ONLY the JSON object, no markdown, no preamble."
     )
     resp = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=800,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -2052,7 +2052,7 @@ def process_meeting_notes(event_name, notes_list):
     )
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-6",
             max_tokens=800,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -2257,7 +2257,7 @@ def parse_reminder_request(text):
     )
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-6",
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -2280,7 +2280,7 @@ def parse_reschedule_request(text, original_message):
         f"Return ONLY the JSON."
     )
     resp = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=100,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -3031,7 +3031,7 @@ def get_merchant_emoji(category, merchant):
             return _category_emoji_cache[category]
         try:
             resp = client.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-4-6",
                 max_tokens=5,
                 messages=[{"role": "user", "content": f"Return a single emoji that best represents the expense category '{category}'. Return ONLY the emoji, nothing else."}]
             )
@@ -3145,7 +3145,7 @@ def parse_expense_text_v2(text):
     )
     try:
         resp = client.messages.create(
-            model="claude-haiku-3-5-20241022",
+            model="claude-haiku-4-5-20251001",
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -3580,7 +3580,7 @@ def get_dest_info_from_iata(iata_code, airport_name):
         f"Return ONLY JSON: {{\"destination\": \"city name\", \"currency\": \"3-letter ISO code\"}}"
     )
     resp = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=60,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -4710,7 +4710,7 @@ def parse_bill_request(text):
         f"Return ONLY the JSON."
     )
     resp = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -4878,7 +4878,7 @@ def parse_restaurant_save(text):
         f"Return ONLY the JSON."
     )
     resp = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -4898,7 +4898,7 @@ def lookup_restaurant_from_maps(url):
     )
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-6",
             max_tokens=150,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -5046,7 +5046,7 @@ def get_restaurant_review(name):
         headline_text = "\n".join(f"- {h}" for h in headlines)
         try:
             resp = client.messages.create(
-                model="claude-haiku-4-5",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=200,
                 messages=[{
                     "role": "user",
@@ -5108,7 +5108,7 @@ def get_similar_restaurants(text):
             "Divider line between each. Be specific and useful, not generic."
         )
         resp = client.messages.create(
-            model="claude-haiku-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -5633,7 +5633,7 @@ def parse_stock_request(text):
         f"Return ONLY the JSON."
     )
     resp = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -5655,7 +5655,7 @@ def suggest_stocks(criteria):
         f"Keep it concise and honest. Flag anything concerning."
     )
     resp = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -5957,7 +5957,7 @@ def get_market_summary_now():
         # Claude narrative — 2-3 sentences, casual, punchy
         try:
             narrative_resp = client.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-4-6",
                 max_tokens=150,
                 messages=[{
                     "role": "user",
@@ -6026,7 +6026,7 @@ async def handle_statement_upload(file_bytes, fname, user_id, update):
             f"If a column doesn't exist, use null."
         )
         norm_resp = client.messages.create(
-            model="claude-sonnet-4-5", max_tokens=100,
+            model="claude-sonnet-4-6", max_tokens=100,
             messages=[{"role": "user", "content": norm_prompt}]
         )
         col_map = json.loads(norm_resp.content[0].text.strip().replace("```json","").replace("```","").strip())
@@ -6495,7 +6495,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 img_b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
                 curr = overseas_state.get("currency", "SGD") if overseas_state.get("active") else "SGD"
                 vision_resp = client.messages.create(
-                    model="claude-sonnet-4-5",
+                    model="claude-sonnet-4-6",
                     max_tokens=300,
                     messages=[{
                         "role": "user",
@@ -7602,7 +7602,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _system_prompt_cache = build_system_prompt()
             _system_prompt_overseas_key = overseas_key
         response = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-6",
             max_tokens=1024,
             system=_system_prompt_cache,
             messages=conversation_histories[user_id]
@@ -7613,7 +7613,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     if not reply:
         try:
             fallback_response = client.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-4-6",
                 max_tokens=300,
                 system=(
                     "You are Em, a personal assistant bot built in Python using python-telegram-bot and the Anthropic API. "
@@ -7778,14 +7778,14 @@ async def post_init(app):
     scheduler.add_job(send_birthday_followups, "cron", hour=14, minute=0, args=[app])
 
     # Custom reminders — check every minute
-    scheduler.add_job(check_and_fire_reminders, "interval", minutes=1, args=[app])
+    scheduler.add_job(check_and_fire_reminders, "interval", minutes=1, args=[app], misfire_grace_time=30)
 
     # Bill reminders — daily at 9am
     scheduler.add_job(send_bill_reminders, "cron", hour=9, minute=0, args=[app])
     scheduler.add_job(check_icloud_daily, "cron", hour=9, minute=5, args=[app])
 
     # Price alerts — check every 15 minutes
-    scheduler.add_job(check_price_alerts, "interval", minutes=15, args=[app])
+    scheduler.add_job(check_price_alerts, "interval", minutes=15, args=[app], misfire_grace_time=30)
 
     # Weekly market summary — Monday 8am
     scheduler.add_job(send_weekly_market_summary, "cron", day_of_week="mon", hour=8, minute=0, args=[app])
