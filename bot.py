@@ -5009,16 +5009,34 @@ def delete_restaurant(name):
         return f"Error: {str(e)}"
 
 def is_restaurant_review_request(text):
-    """Detect restaurant review request intent."""
+    """Detect restaurant review request intent. Avoids colliding with CRM contact lookup."""
     lower = text.lower()
-    triggers = ["reviews for", "review of", "what's", "what is", "is it good",
-                "is it worth", "heard of", "good place", "how is", "how's",
-                "tell me about", "any good", "worth going", "worth visiting"]
+    # Explicit review triggers — always match
+    if any(t in lower for t in ["reviews for", "review of", "reviews of"]):
+        return True
+    # "how is X" / "how's X" — only match if X looks like a place, not a person
+    # Person names are typically 1-2 words with capitals; place names often have
+    # food/place context words or are followed by nothing (just the name)
+    how_match = re.search(r"how(?:'s| is)\s+(.+?)(?:\?|$)", lower)
+    if how_match:
+        subject = how_match.group(1).strip()
+        # Reject if it looks like a person (single capitalised name, common person triggers)
+        person_signals = ["he", "she", "they", "him", "her", "doing", "feeling", "been"]
+        if any(p in subject.split() for p in person_signals):
+            return False
+        # Accept if food/place words present
+        food_signals = ["restaurant", "place", "cafe", "ramen", "sushi", "bbq", "bar",
+                        "bistro", "hawker", "eatery", "kitchen", "grill"]
+        if any(f in subject for f in food_signals):
+            return True
+        # Accept if followed by nothing (just "how is Ichiran" — short subject, no person context)
+        if len(subject.split()) <= 3 and not any(p in subject for p in person_signals):
+            return True
+    # "is it good" / "worth going" with restaurant context
     restaurant_context = ["restaurant", "place", "cafe", "bar", "eatery"]
-    if any(t in lower for t in ["reviews for", "review of", "tell me about"]):
-        return True
-    if any(t in lower for t in triggers) and any(c in lower for c in restaurant_context):
-        return True
+    if any(t in lower for t in ["is it good", "is it worth", "worth going", "worth visiting", "any good"]):
+        if any(c in lower for c in restaurant_context):
+            return True
     return False
 
 def get_restaurant_emoji(name, cuisine_hint=""):
@@ -5068,32 +5086,36 @@ def get_restaurant_review(name):
         if not headlines:
             return f"Couldn't find recent reviews for {name} — try searching online for the latest."
 
-        # Look up area from saved restaurants sheet
+        # Look up area from saved restaurants sheet, then normalise to neighbourhood
         area = ""
         try:
             ws = restaurants_sheet()
             records = ws.get_all_records()
             for r in records:
                 if name.lower() in r.get("Name", "").lower():
-                    area = r.get("Location", "")
+                    area = r.get("Location", "").strip()
                     break
         except Exception as e:
             print(f"Restaurant area lookup error: {e}")
 
-        # If not in saved list, infer area via Claude
-        if not area:
-            try:
-                area_resp = client.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=30,
-                    messages=[{
-                        "role": "user",
-                        "content": f"What area/neighbourhood is the restaurant '{name}' in Singapore located? Reply with just the area name, nothing else. If unknown, reply 'Singapore'."
-                    }]
-                )
-                area = area_resp.content[0].text.strip()
-            except Exception:
-                area = ""
+        # Always normalise raw location to neighbourhood via Claude
+        try:
+            location_hint = f"The restaurant's saved address is: {area}. " if area else ""
+            area_resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=20,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"{location_hint}What neighbourhood or area is '{name}' in Singapore known to be in? "
+                        "Reply with just the neighbourhood name (e.g. Dempsey Hill, Tanjong Pagar, Orchard). "
+                        "If unknown, reply 'Singapore'."
+                    )
+                }]
+            )
+            area = area_resp.content[0].text.strip()
+        except Exception:
+            area = area or ""
 
         headline_text = "\n".join(f"- {h}" for h in headlines)
         try:
@@ -5134,7 +5156,7 @@ def get_restaurant_review(name):
             if bullet1:
                 result += f"\n• {bullet1}\n"
             if bullet2:
-                result += f"\n• {bullet2}\n"
+                result += f"\n• {bullet2}"
             if summary:
                 result += f"\n\n{summary}"
 
@@ -5153,10 +5175,10 @@ def is_restaurant_suggestion_request(text):
     return any(t in lower for t in triggers)
 
 def get_similar_restaurants(text):
-    """Suggest similar restaurants based on tags of a known restaurant or cuisine description."""
+    """Suggest similar restaurants based on cuisine/vibe — grounded in RSS results for real places."""
     try:
+        import xml.etree.ElementTree as ET
         lower = text.lower()
-        # Extract reference restaurant name
         ref_name = None
         for trigger in ["similar to", "like ", "anything like", "places like",
                         "restaurants like", "something like", "alternatives to", "similar places to"]:
@@ -5165,7 +5187,7 @@ def get_similar_restaurants(text):
                 ref_name = text[idx:].strip().rstrip("?").strip()
                 break
 
-        # Look up in saved restaurants for tags
+        # Look up tags from saved sheet
         context = ""
         if ref_name:
             try:
@@ -5175,26 +5197,43 @@ def get_similar_restaurants(text):
                     if ref_name.lower() in r.get("Name", "").lower():
                         tags = r.get("Tags", "")
                         location = r.get("Location", "")
-                        context = f"The restaurant '{r['Name']}' is tagged as: {tags}. Located at {location}."
+                        context = f"'{r['Name']}' is tagged as: {tags}." if tags else ""
                         break
             except Exception as e:
                 print(f"Similar restaurant sheet lookup error: {e}")
 
+        # Fetch real restaurant names from Google News RSS to ground suggestions
+        real_names = []
+        try:
+            query = f"best restaurants similar to {ref_name or text} Singapore".replace(" ", "+")
+            url = f"https://news.google.com/rss/search?q={query}&hl=en-SG&gl=SG&ceid=SG:en"
+            resp = requests.get(url, timeout=3)
+            root = ET.fromstring(resp.content)
+            for item in root.findall(".//item")[:5]:
+                title = item.findtext("title", "").split(" - ")[0].strip()
+                if title:
+                    real_names.append(title)
+        except Exception as e:
+            print(f"Similar restaurants RSS error: {e}")
+
+        real_context = f"These headlines may help identify real options: {'; '.join(real_names[:3])}" if real_names else ""
+
         prompt = (
-            f"Suggest 3 restaurants similar to '{ref_name or text}' in Singapore. "
-            f"{context} "
-            "For each: name, area, and one casual sentence on why it's similar. "
-            "Format each as: 🍽 [Name] — [Area] — [Why similar]. "
-            "Divider line between each. Be specific and useful, not generic."
+            f"Suggest 3 restaurants in Singapore similar to '{ref_name or text}'. "
+            f"{context} {real_context} "
+            "IMPORTANT: Only suggest real restaurants that actually exist and can be found on Google. "
+            "Do not invent or hallucinate restaurant names. "
+            "For each: name, area, and one sentence on why it's similar. "
+            "Format: 🍽 [Name] — [Area] — [Why similar]\n---"
         )
         resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-6",
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}]
         )
         return resp.content[0].text.strip()
     except Exception as e:
-        return f"Couldn't generate suggestions right now — try again in a moment."
+        return "Couldn't generate suggestions right now — try again in a moment."
 
 def is_restaurant_save(text):
     """Detect restaurant save intent.
@@ -5353,8 +5392,8 @@ SGX_TICKER_MAP = {
     "uob": "U11.SI", "u11": "U11.SI",
     # Singtel
     "singtel": "Z74.SI", "z74": "Z74.SI",
-    # CapitaLand
-    "capitaland": "9CI.SI", "cli": "9CI.SI",
+    # CapitaLand Investment
+    "capitaland": "9CI.SI", "capitaland investment": "9CI.SI", "9ci": "9CI.SI", "cli": "9CI.SI",
     # Keppel
     "keppel": "BN4.SI", "bn4": "BN4.SI",
     # Wilmar
@@ -5503,80 +5542,157 @@ def fetch_price(ticker):
         print(f"Yahoo Finance fallback error for {ticker}: {e}")
         return None
 
-SOURCE_TAGS = {
-    "reuters": "RT", "bloomberg": "BB", "financial times": "FT", "ft.com": "FT",
-    "cnbc": "CNBC", "straits times": "ST", "business times": "BT",
-    "nikkei": "NKK", "wall street journal": "WSJ", "wsj": "WSJ",
-    "yahoo finance": "YF", "marketwatch": "MW", "seeking alpha": "SA",
-    "channel news asia": "CNA", "cna": "CNA",
+# Readable source name lookup — maps domain/name fragments to display labels
+SOURCE_LABELS = {
+    "reuters": "Reuters", "bloomberg": "Bloomberg",
+    "financial times": "FT", "ft.com": "FT",
+    "cnbc": "CNBC", "straits times": "Straits Times",
+    "business times": "Business Times", "nikkei": "Nikkei",
+    "wall street journal": "WSJ", "wsj": "WSJ",
+    "yahoo finance": "Yahoo Finance", "marketwatch": "MarketWatch",
+    "seeking alpha": "Seeking Alpha", "channel news asia": "CNA",
+    "cna": "CNA", "barrons": "Barron's", "fortune": "Fortune",
+    "investopedia": "Investopedia", "motley fool": "Motley Fool",
+    "benzinga": "Benzinga", "zacks": "Zacks",
 }
 
-def get_source_tag(source_name):
-    """Return a short source tag from a source name."""
+# Sources too obscure to show — omit tag entirely
+_OBSCURE_SOURCES = {"guruFocus", "forex.com", "indmoney", "gotrade", "traders union",
+                    "cliftonlarsonallen", "simply wall st", "stockanalysis"}
+
+def get_source_label(source_name):
+    """Return a readable source label, or None if source is obscure/unknown."""
     lower = source_name.lower()
-    for key, tag in SOURCE_TAGS.items():
+    for key, label in SOURCE_LABELS.items():
         if key in lower:
-            return tag
-    # Fallback — first 3 chars of domain
-    return source_name[:3].upper()
+            return label
+    # Check if obscure
+    for obs in _OBSCURE_SOURCES:
+        if obs in lower:
+            return None
+    return None  # Unknown — omit rather than show garbage
 
-def fetch_stock_summary(ticker, name):
-    """Fetch RSS headlines for a stock and generate a 2-sentence sourced summary."""
-    try:
-        import xml.etree.ElementTree as ET
-        headlines = []
-        sources = []
-        queries = [f"{name} stock", f"{ticker} shares"]
-        for q_text in queries:
-            if len(headlines) >= 3:
-                break
-            q = q_text.replace(" ", "+")
-            url = f"https://news.google.com/rss/search?q={q}&hl=en&gl=US&ceid=US:en"
-            try:
-                resp = requests.get(url, timeout=5)
-                root = ET.fromstring(resp.content)
-                for item in root.findall(".//item"):
-                    if len(headlines) >= 3:
-                        break
-                    title = item.findtext("title", "")
-                    source = item.findtext("source", "") or title.split(" - ")[-1].strip()
-                    title = title.split(" - ")[0].strip()
-                    if title and title not in headlines:
-                        headlines.append(title)
-                        sources.append(source)
-            except Exception as e:
-                print(f"Stock RSS error for {ticker}: {e}")
-                continue
+def _fetch_rss_headlines_for_stock(ticker, name):
+    """Fetch up to 3 headlines from Google News + Yahoo Finance RSS in parallel."""
+    import xml.etree.ElementTree as ET
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        if not headlines:
-            return None, []
+    # Best single query per source
+    gn_query = f"{name} stock".replace(" ", "+")
+    yf_query = f"{ticker} stock".replace(" ", "+")
 
-        headline_text = "\n".join(f"- {h}" for h in headlines)
+    rss_sources = [
+        f"https://news.google.com/rss/search?q={gn_query}&hl=en&gl=US&ceid=US:en",
+        f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",
+    ]
+
+    headlines = []
+    sources = []
+    seen = set()
+
+    def fetch_one(url):
         try:
-            resp = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=120,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Here are recent headlines about {name} ({ticker}):\n{headline_text}\n\n"
-                        "Write exactly 2 short sentences summarising the stock situation. "
-                        "Be factual and unbiased. No fluff. "
-                        "End each sentence with the source tag in square brackets like [RT] or [BB]. "
-                        "Use these sources in order: " + ", ".join(f"{s} = [{get_source_tag(s)}]" for s in sources[:2])
-                    )
-                }]
-            )
-            return resp.content[0].text.strip(), sources
+            resp = requests.get(url, timeout=3)
+            root = ET.fromstring(resp.content)
+            results = []
+            for item in root.findall(".//item"):
+                title = item.findtext("title", "")
+                source = item.findtext("source", "") or title.split(" - ")[-1].strip()
+                title = title.split(" - ")[0].strip()
+                if title:
+                    results.append((title, source))
+            return results
         except Exception as e:
-            print(f"Stock summary Claude error: {e}")
-            return None, []
+            print(f"RSS fetch error {url}: {e}")
+            return []
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futures = [ex.submit(fetch_one, url) for url in rss_sources]
+        for f in as_completed(futures):
+            for title, source in f.result():
+                if title not in seen and len(headlines) < 4:
+                    seen.add(title)
+                    headlines.append(title)
+                    sources.append(source)
+
+    return headlines[:3], sources[:3]
+
+def _generate_price_movement_summary(data):
+    """Generate a factual price movement summary from price data alone — no Claude needed."""
+    price = data.get("price", 0)
+    change_pct = data.get("change_pct", 0)
+    week52_low = data.get("week52_low")
+    week52_high = data.get("week52_high")
+    currency = data.get("currency", "")
+    name = data.get("name", data.get("ticker", ""))
+
+    direction = "up" if change_pct >= 0 else "down"
+    sentences = []
+    sentences.append(
+        f"{name} is {direction} {abs(change_pct):.2f}% today, currently at {currency} {price:.2f}."
+    )
+    if week52_low and week52_high:
+        position = (price - week52_low) / (week52_high - week52_low) * 100 if week52_high != week52_low else 50
+        if position >= 75:
+            range_desc = "trading near its 52-week high"
+        elif position <= 25:
+            range_desc = "trading near its 52-week low"
+        else:
+            range_desc = "trading in the middle of its 52-week range"
+        sentences.append(
+            f"It is {range_desc} ({currency} {week52_low:.2f} – {currency} {week52_high:.2f})."
+        )
+    return " ".join(sentences)
+
+def fetch_stock_summary(ticker, name, price_data=None):
+    """Fetch RSS headlines in parallel and generate a grounded summary. Falls back to price movement analysis."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    headlines, sources = _fetch_rss_headlines_for_stock(ticker, name)
+
+    # Build readable source labels — skip obscure ones
+    labelled = []
+    for h, s in zip(headlines, sources):
+        label = get_source_label(s)
+        labelled.append((h, label))  # label may be None
+
+    usable = [(h, l) for h, l in labelled if l]  # only headlines with known sources
+
+    if not usable and price_data:
+        # No usable headlines — return pure price movement summary
+        return _generate_price_movement_summary(price_data), []
+
+    if not usable:
+        return None, []
+
+    headline_text = "\n".join(f"- {h}" for h, _ in usable[:3])
+    source_context = "; ".join(f"{h[:60]} [{l}]" for h, l in usable[:3])
+
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Headlines about {name} ({ticker}):\n{source_context}\n\n"
+                    "Write 2 short factual sentences about this stock's situation based strictly on these headlines. "
+                    "End each sentence with [SourceName] from the headline it references. "
+                    "Never refuse — if headlines are thin, write about price direction and range instead. "
+                    "No fluff, no caveats about missing data."
+                )
+            }]
+        )
+        summary = resp.content[0].text.strip()
+        return summary, [l for _, l in usable[:2]]
     except Exception as e:
-        print(f"fetch_stock_summary error: {e}")
+        print(f"Stock summary Claude error: {e}")
+        if price_data:
+            return _generate_price_movement_summary(price_data), []
         return None, []
 
 def format_price(data):
-    """Format stock price in agreed display format with exchange flag, market state, 52-week range, sourced summary."""
+    """Format stock price — flag, name, price, state, 52-week range, sourced summary."""
     if not data:
         return None
     flag = data.get("flag", "🌐")
@@ -5591,18 +5707,15 @@ def format_price(data):
 
     week52_low = data.get("week52_low")
     week52_high = data.get("week52_high")
-    range_line = f"52-week range: {week52_low:.2f} – {week52_high:.2f}" if week52_low and week52_high else ""
+    range_line = f"52-week range: {currency} {week52_low:.2f} – {currency} {week52_high:.2f}" if week52_low and week52_high else ""
 
-    summary, _ = fetch_stock_summary(ticker, name)
+    summary, _ = fetch_stock_summary(ticker, name, price_data=data)
 
     lines = [f"{flag} {name} ({ticker})"]
     lines.append(f"{currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
     if range_line:
         lines.append(range_line)
-    if summary:
-        lines.append(f"\n\n{summary}")
-    else:
-        lines.append(f"\n\nNo recent news found for {ticker}.")
+    lines.append(f"\n{summary if summary else _generate_price_movement_summary(data)}")
 
     return "\n".join(lines)
 
@@ -6026,9 +6139,60 @@ def handle_stock_request(text):
         ticker = parsed.get("ticker", "").upper()
 
         if intent == "price_check" and ticker:
-            data = fetch_price(ticker)
+            from concurrent.futures import ThreadPoolExecutor
+            # Run price fetch and RSS fetch in parallel
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                price_future = ex.submit(fetch_price, ticker)
+                rss_future = ex.submit(_fetch_rss_headlines_for_stock, ticker, ticker)
+                data = price_future.result()
+                rss_headlines, rss_sources = rss_future.result()
+
             if data:
-                return format_price(data)
+                # Pass pre-fetched headlines into summary to avoid second RSS call
+                name = data.get("name", ticker)
+                labelled = [(h, get_source_label(s)) for h, s in zip(rss_headlines, rss_sources)]
+                usable = [(h, l) for h, l in labelled if l]
+                if usable:
+                    source_context = "; ".join(f"{h[:60]} [{l}]" for h, l in usable[:3])
+                    try:
+                        resp = client.messages.create(
+                            model="claude-haiku-4-5-20251001",
+                            max_tokens=100,
+                            messages=[{
+                                "role": "user",
+                                "content": (
+                                    f"Headlines about {name} ({ticker}):\n{source_context}\n\n"
+                                    "Write 2 short factual sentences about this stock's situation based strictly on these headlines. "
+                                    "End each sentence with [SourceName] from the headline it references. "
+                                    "Never refuse — if headlines are thin, write about price direction and range instead. "
+                                    "No fluff, no caveats about missing data."
+                                )
+                            }]
+                        )
+                        summary = resp.content[0].text.strip()
+                    except Exception:
+                        summary = _generate_price_movement_summary(data)
+                else:
+                    summary = _generate_price_movement_summary(data)
+
+                # Build formatted output directly
+                flag = data.get("flag", "🌐")
+                currency = data.get("currency", "")
+                price = data.get("price", 0)
+                change_pct = data.get("change_pct", 0)
+                arrow = "▲" if change_pct >= 0 else "▼"
+                market_state = data.get("market_state", "REGULAR")
+                state_label = {"PRE": " (pre)", "POST": " (post)", "CLOSED": " (closed)", "REGULAR": ""}.get(market_state, "")
+                week52_low = data.get("week52_low")
+                week52_high = data.get("week52_high")
+                range_line = f"52-week range: {currency} {week52_low:.2f} – {currency} {week52_high:.2f}" if week52_low and week52_high else ""
+                lines = [f"{flag} {name} ({ticker})"]
+                lines.append(f"{currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
+                if range_line:
+                    lines.append(range_line)
+                lines.append(f"\n{summary}")
+                return "\n".join(lines)
+
             if ALPHA_VANTAGE_API_KEY:
                 return f"Couldn't fetch {ticker} — Alpha Vantage and Yahoo Finance both failed. The ticker may be wrong, or try again in a moment."
             return f"Couldn't fetch {ticker}. Check the ticker and try again."
@@ -6200,8 +6364,11 @@ def get_market_summary_now():
                 # Fallback to daily
                 price_data = fetch_price(ticker)
                 weekly_pct = price_data["change_pct"] if price_data else 0
-            arrow = "▲" if weekly_pct >= 0 else "▼"
-            pct_str = f"{arrow} {abs(weekly_pct):.1f}%"
+                arrow = "▲" if weekly_pct >= 0 else "▼"
+                pct_str = f"Day {arrow} {abs(weekly_pct):.1f}%"
+            else:
+                arrow = "▲" if weekly_pct >= 0 else "▼"
+                pct_str = f"Week {arrow} {abs(weekly_pct):.1f}%"
 
             headlines = fetch_market_rss_headlines(market)
             all_headlines.extend(headlines)
