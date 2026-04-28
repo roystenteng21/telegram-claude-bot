@@ -5016,14 +5016,34 @@ def is_restaurant_review_request(text):
         return True
     return False
 
+def get_restaurant_emoji(name, cuisine_hint=""):
+    """Pick a contextual emoji for a restaurant based on name/cuisine."""
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Pick ONE emoji that best represents this restaurant: {name}. "
+                    f"Context: {cuisine_hint or 'Singapore restaurant'}. "
+                    "Consider cuisine, vibe, occasion. Reply with just the emoji, nothing else."
+                )
+            }]
+        )
+        emoji = resp.content[0].text.strip()
+        return emoji if emoji else "🍽"
+    except Exception:
+        return "🍽"
+
 def get_restaurant_review(name):
-    """Fetch RSS headlines for a restaurant and generate a casual Claude summary."""
+    """Fetch RSS headlines and generate formatted review with emoji, 2 bullets, and plain text summary."""
     try:
         import xml.etree.ElementTree as ET
         headlines = []
-        queries = [f"{name} restaurant review Singapore", f"{name} Singapore food review"]
+        queries = [f"{name} restaurant review Singapore", f"{name} Singapore food"]
         for q_text in queries:
-            if len(headlines) >= 3:
+            if len(headlines) >= 4:
                 break
             q = q_text.replace(" ", "+")
             url = f"https://news.google.com/rss/search?q={q}&hl=en-SG&gl=SG&ceid=SG:en"
@@ -5031,7 +5051,7 @@ def get_restaurant_review(name):
                 resp = requests.get(url, timeout=5)
                 root = ET.fromstring(resp.content)
                 for item in root.findall(".//item"):
-                    if len(headlines) >= 3:
+                    if len(headlines) >= 4:
                         break
                     title = item.findtext("title", "").split(" - ")[0].strip()
                     if title and title not in headlines:
@@ -5047,18 +5067,46 @@ def get_restaurant_review(name):
         try:
             resp = client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=200,
+                max_tokens=250,
                 messages=[{
                     "role": "user",
                     "content": (
-                        f"Here are some headlines about the restaurant '{name}':\n{headline_text}\n\n"
-                        "Write a casual 2-3 sentence summary of what people are saying. "
-                        "Warm and conversational, no bullet points, no headers. "
-                        "If headlines aren't specifically about this restaurant, say you couldn't find solid reviews."
+                        f"Here are headlines about the restaurant '{name}':\n{headline_text}\n\n"
+                        "Write a review in this exact format:\n"
+                        "EMOJI: [one contextual emoji for the restaurant vibe/cuisine — varied, not always 🍽]\n"
+                        "BULLET1: [one sentence — a highlight or strength]\n"
+                        "BULLET2: [one sentence — a caveat, limitation, or note]\n"
+                        "SUMMARY: [one short paragraph — overall impression, good and bad, plain and honest. 2 sentences max.]\n"
+                        "If headlines aren't specifically about this restaurant, say so in the summary."
                     )
                 }]
             )
-            return resp.content[0].text.strip()
+            raw = resp.content[0].text.strip()
+
+            # Parse sections
+            def get_field(text, key):
+                if key not in text:
+                    return ""
+                line = text.split(key)[-1].split("\n")[0].strip().lstrip(":").strip()
+                return line
+
+            emoji = get_field(raw, "EMOJI:")
+            bullet1 = get_field(raw, "BULLET1:")
+            bullet2 = get_field(raw, "BULLET2:")
+            summary = get_field(raw, "SUMMARY:")
+
+            if not emoji:
+                emoji = "🍽"
+
+            result = f"{emoji} *{name}*\n"
+            if bullet1:
+                result += f"\n• {bullet1}\n"
+            if bullet2:
+                result += f"\n• {bullet2}\n"
+            if summary:
+                result += f"\n\n{summary}"
+
+            return result
         except Exception as e:
             print(f"Restaurant review Claude error: {e}")
             return f"Found some mentions of {name} but couldn't summarise them right now."
@@ -5218,9 +5266,15 @@ price_alerts = {}
 
 # Indices to track for weekly summary
 MARKET_INDICES = {
-    "US": {"^GSPC": "S&P 500", "^DJI": "Dow Jones", "^IXIC": "Nasdaq"},
-    "China": {"000001.SS": "Shanghai", "^HSI": "Hang Seng"},
-    "India": {"^BSESN": "Sensex", "^NSEI": "Nifty 50"},
+    "US": {"^GSPC": "S&P 500"},
+    "China": {"000001.SS": "Shanghai"},
+    "India": {"^NSEI": "Nifty 50"},
+}
+
+MARKET_FLAGS_MAP = {
+    "US": "🇺🇸",
+    "China": "🇨🇳",
+    "India": "🇮🇳",
 }
 
 
@@ -5288,6 +5342,29 @@ def normalise_ticker(ticker):
         return f"{upper}.HK"
     return upper
 
+def fetch_weekly_change(ticker):
+    """Fetch weekly % change — last Monday open to latest close via Yahoo Finance."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1wk&range=1mo"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        result = data["chart"]["result"][0]
+        closes = result["indicators"]["quote"][0].get("close", [])
+        opens = result["indicators"]["quote"][0].get("open", [])
+        # Filter out None values
+        closes = [c for c in closes if c is not None]
+        opens = [o for o in opens if o is not None]
+        if len(closes) >= 1 and len(opens) >= 1:
+            week_open = opens[-1]
+            week_close = closes[-1]
+            if week_open:
+                pct = (week_close - week_open) / week_open * 100
+                return pct
+    except Exception as e:
+        print(f"fetch_weekly_change error for {ticker}: {e}")
+    return None
+
 def fetch_price(ticker):
     """Fetch current price — Alpha Vantage primary, Yahoo Finance fallback."""
     ticker = normalise_ticker(ticker)
@@ -5320,7 +5397,7 @@ def fetch_price(ticker):
 
     # --- Yahoo Finance fallback ---
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2d"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1y"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
@@ -5332,6 +5409,18 @@ def fetch_price(ticker):
         name = meta.get("longName") or meta.get("shortName") or ticker
         change = price - prev_close
         change_pct = (change / prev_close * 100) if prev_close else 0
+        market_state = meta.get("marketState", "")  # REGULAR, PRE, POST, CLOSED
+        # 52-week range from historical closes
+        closes = [c for c in result["indicators"]["quote"][0].get("close", []) if c is not None]
+        week52_low = min(closes) if closes else None
+        week52_high = max(closes) if closes else None
+        # Exchange flag by ticker suffix
+        suffix = ticker.split(".")[-1] if "." in ticker else ""
+        exchange_flags = {
+            "SI": "🇸🇬", "HK": "🇭🇰", "L": "🇬🇧", "AX": "🇦🇺",
+            "T": "🇯🇵", "NS": "🇮🇳", "BO": "🇮🇳", "SS": "🇨🇳", "SZ": "🇨🇳",
+        }
+        flag = exchange_flags.get(suffix, "🇺🇸")
         return {
             "ticker": ticker,
             "name": name,
@@ -5339,22 +5428,116 @@ def fetch_price(ticker):
             "prev_close": prev_close,
             "change": change,
             "change_pct": change_pct,
-            "currency": currency
+            "currency": currency,
+            "market_state": market_state,
+            "week52_low": week52_low,
+            "week52_high": week52_high,
+            "flag": flag,
         }
     except Exception as e:
         print(f"Yahoo Finance fallback error for {ticker}: {e}")
         return None
 
+SOURCE_TAGS = {
+    "reuters": "RT", "bloomberg": "BB", "financial times": "FT", "ft.com": "FT",
+    "cnbc": "CNBC", "straits times": "ST", "business times": "BT",
+    "nikkei": "NKK", "wall street journal": "WSJ", "wsj": "WSJ",
+    "yahoo finance": "YF", "marketwatch": "MW", "seeking alpha": "SA",
+    "channel news asia": "CNA", "cna": "CNA",
+}
+
+def get_source_tag(source_name):
+    """Return a short source tag from a source name."""
+    lower = source_name.lower()
+    for key, tag in SOURCE_TAGS.items():
+        if key in lower:
+            return tag
+    # Fallback — first 3 chars of domain
+    return source_name[:3].upper()
+
+def fetch_stock_summary(ticker, name):
+    """Fetch RSS headlines for a stock and generate a 2-sentence sourced summary."""
+    try:
+        import xml.etree.ElementTree as ET
+        headlines = []
+        sources = []
+        queries = [f"{name} stock", f"{ticker} shares"]
+        for q_text in queries:
+            if len(headlines) >= 3:
+                break
+            q = q_text.replace(" ", "+")
+            url = f"https://news.google.com/rss/search?q={q}&hl=en&gl=US&ceid=US:en"
+            try:
+                resp = requests.get(url, timeout=5)
+                root = ET.fromstring(resp.content)
+                for item in root.findall(".//item"):
+                    if len(headlines) >= 3:
+                        break
+                    title = item.findtext("title", "")
+                    source = item.findtext("source", "") or title.split(" - ")[-1].strip()
+                    title = title.split(" - ")[0].strip()
+                    if title and title not in headlines:
+                        headlines.append(title)
+                        sources.append(source)
+            except Exception as e:
+                print(f"Stock RSS error for {ticker}: {e}")
+                continue
+
+        if not headlines:
+            return None, []
+
+        headline_text = "\n".join(f"- {h}" for h in headlines)
+        try:
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=120,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Here are recent headlines about {name} ({ticker}):\n{headline_text}\n\n"
+                        "Write exactly 2 short sentences summarising the stock situation. "
+                        "Be factual and unbiased. No fluff. "
+                        "End each sentence with the source tag in square brackets like [RT] or [BB]. "
+                        "Use these sources in order: " + ", ".join(f"{s} = [{get_source_tag(s)}]" for s in sources[:2])
+                    )
+                }]
+            )
+            return resp.content[0].text.strip(), sources
+        except Exception as e:
+            print(f"Stock summary Claude error: {e}")
+            return None, []
+    except Exception as e:
+        print(f"fetch_stock_summary error: {e}")
+        return None, []
+
 def format_price(data):
-    """Format a price response naturally."""
+    """Format stock price in agreed display format with exchange flag, market state, 52-week range, sourced summary."""
     if not data:
         return None
-    arrow = "▲" if data["change"] >= 0 else "▼"
-    sign = "+" if data["change"] >= 0 else ""
-    return (
-        f"{data['name']} ({data['ticker']}): {data['currency']} {data['price']:.2f} "
-        f"{arrow} {sign}{data['change_pct']:.2f}%"
-    )
+    flag = data.get("flag", "🌐")
+    name = data.get("name", data["ticker"])
+    ticker = data["ticker"]
+    currency = data.get("currency", "")
+    price = data.get("price", 0)
+    change_pct = data.get("change_pct", 0)
+    arrow = "▲" if change_pct >= 0 else "▼"
+    market_state = data.get("market_state", "REGULAR")
+    state_label = {"PRE": " (pre)", "POST": " (post)", "CLOSED": " (closed)", "REGULAR": ""}.get(market_state, "")
+
+    week52_low = data.get("week52_low")
+    week52_high = data.get("week52_high")
+    range_line = f"52-week range: {week52_low:.2f} – {week52_high:.2f}" if week52_low and week52_high else ""
+
+    summary, _ = fetch_stock_summary(ticker, name)
+
+    lines = [f"{flag} {name} ({ticker})"]
+    lines.append(f"{currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
+    if range_line:
+        lines.append(range_line)
+    if summary:
+        lines.append(f"\n\n{summary}")
+
+    return "\n".join(lines)
 
 def portfolio_sheet():
     return spreadsheet.worksheet("Portfolio")
@@ -5692,6 +5875,20 @@ async def send_weekly_market_summary(app):
     try:
         msg = get_market_summary_now()
         await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
+        # Persist sent date to Settings so restart doesn't re-prompt
+        try:
+            sheet = get_sheet("Settings")
+            if sheet:
+                records = sheet.get_all_records()
+                today_str = date.today().isoformat()
+                for i, r in enumerate(records):
+                    if r.get("Key") == "market_summary_last_sent":
+                        sheet.update_cell(i + 2, 2, today_str)
+                        break
+                else:
+                    sheet.append_row(["market_summary_last_sent", today_str])
+        except Exception as e:
+            print(f"market_summary_last_sent persist error: {e}")
     except Exception as e:
         print(f"Error sending weekly market summary: {e}")
 
@@ -5857,20 +6054,21 @@ def detect_crm_natural_update(text):
     return None
 
 
-MARKET_FLAGS = {
-    "🇺🇸 US": "🇺🇸",
-    "🇨🇳 China": "🇨🇳",
-    "🇮🇳 India": "🇮🇳",
-}
+# Clickbait/speculative headline patterns to filter out
+_HEADLINE_REJECT = [
+    "will it", "will they", "should you", "best stocks", "stocks to watch",
+    "to buy and watch", "to watch:", "opening:", "opening bell", "preview:",
+    "what to expect", "top picks", "analyst picks", "should i", "is it time",
+    "here's what", "what you need", "everything you need",
+]
 
 def fetch_market_rss_headlines(market_name):
-    """Fetch top 3 market headlines from Google News RSS for a given market.
-    Tries multiple query variants for better coverage."""
+    """Fetch top 3 informative market headlines from Google News RSS. Filters clickbait/speculative titles."""
     try:
         queries = {
-            "US": ["US stock market", "Wall Street stocks", "S&P 500 Nasdaq Dow"],
-            "China": ["China stock market", "Shanghai Shenzhen stocks", "China economy markets"],
-            "India": ["India stock market Nifty", "Sensex Nifty BSE", "India economy stocks"],
+            "US": ["US stock market today", "Wall Street S&P 500", "Federal Reserve economy"],
+            "China": ["China stock market", "Shanghai economy", "China trade economy"],
+            "India": ["India Nifty stock market", "RBI India economy", "BSE Sensex"],
         }
         key = None
         for k in queries:
@@ -5894,8 +6092,13 @@ def fetch_market_rss_headlines(market_name):
                     if len(headlines) >= 3:
                         break
                     title = item.findtext("title", "").split(" - ")[0].strip()
-                    if title and title not in headlines:
-                        headlines.append(title)
+                    if not title or title in headlines:
+                        continue
+                    # Filter clickbait/speculative headlines
+                    lower_title = title.lower()
+                    if any(pattern in lower_title for pattern in _HEADLINE_REJECT):
+                        continue
+                    headlines.append(title)
             except Exception as e:
                 print(f"RSS fetch error for {market_name} query '{q_text}': {e}")
                 continue
@@ -5905,93 +6108,110 @@ def fetch_market_rss_headlines(market_name):
         return []
 
 def get_market_summary_now():
-    """Generate on-demand market summary with flag emoji, index data, RSS headlines, and Claude narrative."""
+    """Generate market summary — one index per market, weekly %, filtered bullets, 2-3 sentence overall."""
     try:
         market_data_blocks = []
-        sentiments = []
+        all_headlines = []
 
         for market, indices in MARKET_INDICES.items():
-            # Determine flag
-            flag = ""
-            for k, f in MARKET_FLAGS.items():
-                if any(word in market for word in k.replace("🇺🇸 ", "").replace("🇨🇳 ", "").replace("🇮🇳 ", "").split()):
-                    flag = f
-                    break
+            flag = MARKET_FLAGS_MAP.get(market, "🌐")
+            ticker, index_name = list(indices.items())[0]
 
-            index_lines = []
-            market_changes = []
-            for ticker, name in indices.items():
-                data = fetch_price(ticker)
-                if data:
-                    arrow = "▲" if data["change_pct"] >= 0 else "▼"
-                    index_lines.append(f"  {name}: {arrow} {abs(data['change_pct']):.1f}%")
-                    market_changes.append(data["change_pct"])
-
-            avg = sum(market_changes) / len(market_changes) if market_changes else 0
-            sentiment = "positive" if avg > 0.3 else "negative" if avg < -0.3 else "mixed"
-            sentiments.append(sentiment)
+            # Weekly % change
+            weekly_pct = fetch_weekly_change(ticker)
+            if weekly_pct is None:
+                # Fallback to daily
+                price_data = fetch_price(ticker)
+                weekly_pct = price_data["change_pct"] if price_data else 0
+            arrow = "▲" if weekly_pct >= 0 else "▼"
+            pct_str = f"{arrow} {abs(weekly_pct):.1f}%"
 
             headlines = fetch_market_rss_headlines(market)
+            all_headlines.extend(headlines)
 
             block = {
                 "market": market,
                 "flag": flag,
-                "index_lines": index_lines,
-                "sentiment": sentiment,
-                "avg_change": avg,
+                "index_name": index_name,
+                "pct_str": pct_str,
+                "weekly_pct": weekly_pct,
                 "headlines": headlines,
             }
             market_data_blocks.append(block)
 
-        # Build plain data summary for Claude
+        # Build data context for Claude — bullet points + overall summary
         data_summary = ""
         for b in market_data_blocks:
-            data_summary += f"\n{b['flag']} {b['market']} — sentiment: {b['sentiment']}\n"
-            data_summary += "\n".join(b["index_lines"]) + "\n"
+            data_summary += f"\n{b['flag']} {b['market']} — {b['index_name']} {b['pct_str']}\n"
             if b["headlines"]:
                 data_summary += "Headlines: " + "; ".join(b["headlines"]) + "\n"
 
-        overall = "broadly positive" if sentiments.count("positive") >= 2 else \
-                  "broadly negative" if sentiments.count("negative") >= 2 else "mixed"
-
-        # Claude narrative — 2-3 sentences, casual, punchy
+        # Claude — generate bullet points (1 sentence each) + 2-3 sentence overall summary
         try:
-            narrative_resp = client.messages.create(
+            claude_resp = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=150,
+                max_tokens=500,
                 messages=[{
                     "role": "user",
                     "content": (
-                        f"Here's today's market data:\n{data_summary}\n\n"
-                        "Write a 2-3 sentence casual market narrative for a personal assistant bot. "
-                        "Highlight the most notable move or story. No bullet points, no headers, just plain punchy sentences. "
-                        "Don't start with 'Markets' — vary the opener."
+                        f"Here is this week's market data:\n{data_summary}\n\n"
+                        "For each market (US, China, India), write exactly 3 bullet points. "
+                        "Each bullet = 1 short informative sentence grounded in the headlines. "
+                        "No speculation, no price predictions, no clickbait. "
+                        "Then write a 2-3 sentence overall summary of the week across all three markets. "
+                        "Format exactly as:\n"
+                        "US_BULLETS:\n• ...\n• ...\n• ...\n"
+                        "CHINA_BULLETS:\n• ...\n• ...\n• ...\n"
+                        "INDIA_BULLETS:\n• ...\n• ...\n• ...\n"
+                        "OVERALL:\n[2-3 sentences]"
                     )
                 }]
             )
-            narrative = narrative_resp.content[0].text.strip()
+            raw = claude_resp.content[0].text.strip()
         except Exception as e:
-            print(f"Market narrative Claude error: {e}")
-            narrative = ""
+            print(f"Market summary Claude error: {e}")
+            raw = ""
 
-        # Format output
-        lines = [f"*Market Summary* — {date.today().strftime('%d %b %Y')}\n"]
+        # Parse Claude response
+        def extract_section(text, key):
+            if key not in text:
+                return []
+            start = text.index(key) + len(key)
+            end = text.index("\n", start + 1) if "\n" in text[start:] else len(text)
+            # Get all bullet lines following the key
+            chunk = text[start:].split("\n")
+            bullets = [l.strip() for l in chunk if l.strip().startswith("•")][:3]
+            return bullets
+
+        def extract_overall(text):
+            if "OVERALL:" not in text:
+                return ""
+            return text.split("OVERALL:")[-1].strip()
+
+        us_bullets = extract_section(raw, "US_BULLETS:")
+        china_bullets = extract_section(raw, "CHINA_BULLETS:")
+        india_bullets = extract_section(raw, "INDIA_BULLETS:")
+        overall = extract_overall(raw)
+
+        bullet_map = {"US": us_bullets, "China": china_bullets, "India": india_bullets}
+
+        # Build final message
+        lines = [f"📊 *Market Summary* — {date.today().strftime('%d %b %Y')}\n"]
         for b in market_data_blocks:
-            section = f"{b['flag']} *{b['market']}*\n" + "\n".join(b["index_lines"])
-            if b["headlines"]:
-                # Show up to 3 headlines
-                for hl in b["headlines"][:3]:
-                    section += f"\n_{hl}_"
+            header = f"{b['flag']} *{b['market']} — {b['index_name']} ({b['pct_str']})*"
+            bullets = bullet_map.get(b["market"], [])
+            section = header
+            for bullet in bullets:
+                section += f"\n{bullet}"
             lines.append(section)
-        lines.append(f"Overall: {overall.title()}")
-        if narrative:
-            lines.append(f"\n{narrative}")
+
+        if overall:
+            lines.append(f"\n{overall}")
 
         return "\n\n".join(lines)
 
     except Exception as e:
         return f"❌ Couldn't pull market data right now ({type(e).__name__}: {str(e)[:80]})"
-
 
 async def handle_statement_upload(file_bytes, fname, user_id, update):
     """Parse a bank statement CSV/XLSX and reconcile against logged expenses."""
@@ -7738,14 +7958,27 @@ async def check_missed_items_on_startup(app):
             except Exception as e:
                 print(f"Missed reminder fire error: {e}")
 
-        # Check missed Monday market summary
+        # Check missed Monday market summary — only ask if not already sent today
         try:
             if today.weekday() == 0:  # Monday
-                await app.bot.send_message(
-                    chat_id=YOUR_CHAT_ID,
-                    text="Missed the Monday market summary while offline — want me to send it now? (yes / no)"
-                )
-                market_summary_pending[YOUR_CHAT_ID] = True
+                already_sent = False
+                try:
+                    sheet = get_sheet("Settings")
+                    if sheet:
+                        records = sheet.get_all_records()
+                        for r in records:
+                            if r.get("Key") == "market_summary_last_sent":
+                                already_sent = r.get("Value", "") == today.isoformat()
+                                break
+                except Exception as e:
+                    print(f"market_summary_last_sent check error: {e}")
+
+                if not already_sent:
+                    await app.bot.send_message(
+                        chat_id=YOUR_CHAT_ID,
+                        text="Missed the Monday market summary while offline — want me to send it now? (yes / no)"
+                    )
+                    market_summary_pending[YOUR_CHAT_ID] = True
         except Exception as e:
             print(f"Missed market summary check error: {e}")
 
