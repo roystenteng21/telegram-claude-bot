@@ -4914,24 +4914,29 @@ def lookup_restaurant_from_maps(url):
 
 def save_restaurant(name, location, country="Singapore", tags="", notes="", force_new=False):
     """Save a restaurant to the Restaurants sheet. Checks for duplicates unless force_new."""
-    if not force_new:
-        try:
-            sheet = restaurants_sheet()
-            records = sheet.get_all_records()
-            for r in records:
-                if r.get("Name", "").lower() == name.lower():
-                    return "_DUPLICATE_:" + name
-        except Exception:
-            pass
-    sheet = restaurants_sheet()
-    sheet.append_row([name, location, country, tags, notes])
-    return None  # Success
+    try:
+        if not force_new:
+            try:
+                sheet = restaurants_sheet()
+                records = sheet.get_all_records()
+                for r in records:
+                    if r.get("Name", "").lower() == name.lower():
+                        return "_DUPLICATE_:" + name
+            except Exception as e:
+                print(f"save_restaurant duplicate check error: {e}")
+        sheet = restaurants_sheet()
+        sheet.append_row([name, location, country, tags, notes])
+        return None  # Success
+    except Exception as e:
+        print(f"save_restaurant error: {e}")
+        return f"_ERROR_:{str(e)}"
 
-def format_restaurant_saved(name, location, tags="", notes=""):
+def format_restaurant_saved(name, location, tags="", notes="", country="Singapore"):
     """Format the restaurant saved confirmation."""
     lines = ["Saved!"]
     lines.append(f"🏪 {name}")
-    lines.append(f"📍 {location}")
+    loc_str = f"{location}, {country}" if country and country != "Singapore" else location
+    lines.append(f"📍 {loc_str}")
     if tags:
         lines.append(f"🏷 {tags}")
     if notes:
@@ -5063,6 +5068,33 @@ def get_restaurant_review(name):
         if not headlines:
             return f"Couldn't find recent reviews for {name} — try searching online for the latest."
 
+        # Look up area from saved restaurants sheet
+        area = ""
+        try:
+            ws = restaurants_sheet()
+            records = ws.get_all_records()
+            for r in records:
+                if name.lower() in r.get("Name", "").lower():
+                    area = r.get("Location", "")
+                    break
+        except Exception as e:
+            print(f"Restaurant area lookup error: {e}")
+
+        # If not in saved list, infer area via Claude
+        if not area:
+            try:
+                area_resp = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=30,
+                    messages=[{
+                        "role": "user",
+                        "content": f"What area/neighbourhood is the restaurant '{name}' in Singapore located? Reply with just the area name, nothing else. If unknown, reply 'Singapore'."
+                    }]
+                )
+                area = area_resp.content[0].text.strip()
+            except Exception:
+                area = ""
+
         headline_text = "\n".join(f"- {h}" for h in headlines)
         try:
             resp = client.messages.create(
@@ -5073,11 +5105,10 @@ def get_restaurant_review(name):
                     "content": (
                         f"Here are headlines about the restaurant '{name}':\n{headline_text}\n\n"
                         "Write a review in this exact format:\n"
-                        "EMOJI: [one contextual emoji for the restaurant vibe/cuisine — varied, not always 🍽]\n"
-                        "BULLET1: [one sentence — a highlight or strength]\n"
-                        "BULLET2: [one sentence — a caveat, limitation, or note]\n"
-                        "SUMMARY: [one short paragraph — overall impression, good and bad, plain and honest. 2 sentences max.]\n"
-                        "If headlines aren't specifically about this restaurant, say so in the summary."
+                        "EMOJI: [one contextual emoji for the restaurant vibe/cuisine — varied, creative, not always 🍽]\n"
+                        "BULLET1: [one sentence — a highlight or strength, grounded in the headlines]\n"
+                        "BULLET2: [one sentence — a caveat, limitation, or honest note]\n"
+                        "SUMMARY: [exactly 2 short sentences — overall impression. Plain, honest, no hedging about sources.]\n"
                     )
                 }]
             )
@@ -5098,7 +5129,8 @@ def get_restaurant_review(name):
             if not emoji:
                 emoji = "🍽"
 
-            result = f"{emoji} *{name}*\n"
+            area_str = f" ({area})" if area else ""
+            result = f"{emoji} *{name}*{area_str}\n"
             if bullet1:
                 result += f"\n• {bullet1}\n"
             if bullet2:
@@ -5186,6 +5218,32 @@ def is_restaurant_search(text):
                 "show my restaurants", "my restaurant list", "saved restaurants"]
     return any(t in lower for t in triggers)
 
+def infer_restaurant_location(name, country="Singapore"):
+    """Use Claude to infer location and outlets for a restaurant name."""
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"For the restaurant '{name}' in {country}, do the following:\n"
+                    "1. Does it have multiple outlets? (yes/no)\n"
+                    "2. If yes, list up to 4 outlets as area names only (e.g. Dempsey Hill, Jewel Changi).\n"
+                    "3. If no, give the single area/neighbourhood (e.g. Dempsey Hill, Tanjong Pagar).\n\n"
+                    "Return ONLY a JSON object with:\n"
+                    "- multiple_outlets: boolean\n"
+                    "- outlets: list of area strings (1 item if single, up to 4 if multiple)\n"
+                    "Return ONLY the JSON."
+                )
+            }]
+        )
+        raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
+        return json.loads(raw)
+    except Exception as e:
+        print(f"infer_restaurant_location error: {e}")
+        return {"multiple_outlets": False, "outlets": []}
+
 def handle_save_restaurant(text, force_new=False):
     """Handle saving a restaurant from text or maps link."""
     try:
@@ -5215,14 +5273,21 @@ def handle_save_restaurant(text, force_new=False):
             notes = parsed.get("notes", "")
 
         if not name:
-            return "What's the restaurant name? Try: 'save Burnt Ends, Teck Lim Road'"
+            return "What's the restaurant name? Try: 'save Burnt Ends'"
 
-        result = save_restaurant(name, location, country, tags, notes, force_new=force_new)
-        if result and result.startswith("_DUPLICATE_:"):
-            existing = result.split(":", 1)[1]
-            return f"_DUPLICATE_RESTAURANT_:{existing}:{name}:{location}:{country}:{tags}:{notes}"
+        # If location already provided in the message, skip inference
+        if location:
+            result = save_restaurant(name, location, country, tags, notes, force_new=force_new)
+            if result and result.startswith("_DUPLICATE_:"):
+                existing = result.split(":", 1)[1]
+                return f"_DUPLICATE_RESTAURANT_:{existing}:{name}:{location}:{country}:{tags}:{notes}"
+            return format_restaurant_saved(name, location, tags, notes)
 
-        return format_restaurant_saved(name, location, tags, notes)
+        # Infer location — signal back to handler to start confirm flow
+        location_data = infer_restaurant_location(name, country)
+        outlets = location_data.get("outlets", [])
+        multiple = location_data.get("multiple_outlets", False)
+        return f"_INFER_LOCATION_:{name}:{country}:{tags}:{int(multiple)}:" + "|".join(outlets)
 
     except Exception as e:
         return f"Couldn't save that restaurant: {str(e)}"
@@ -5536,6 +5601,8 @@ def format_price(data):
         lines.append(range_line)
     if summary:
         lines.append(f"\n\n{summary}")
+    else:
+        lines.append(f"\n\nNo recent news found for {ticker}.")
 
     return "\n".join(lines)
 
@@ -5938,6 +6005,14 @@ def is_stock_request(text):
     ):
         return True
 
+    # "what's X at" / "what is X at" — natural price queries
+    if re.search(r"what'?s\s+\S+\s+at\b", lower):
+        return True
+    if re.search(r"what is\s+\S+\s+at\b", lower):
+        return True
+    if re.search(r"how much is\s+\S+\s+(trading|at|worth)\b", lower):
+        return True
+
     ticker_match = re.search(r'\b[A-Z]{2,5}\b', text)
     if ticker_match and any(w in lower for w in ["doing", "worth", "performing", "price", "target", "outlook"]):
         return True
@@ -5991,10 +6066,12 @@ def handle_stock_request(text):
                 data = fetch_price(ticker)
                 if data:
                     return format_price(data)
-            return None  # Fall through to Claude chat
+                return f"Couldn't find data for {ticker} — check the ticker and try again."
+            return "Couldn't work out what stock you're asking about. Try 'price of AAPL' or 'what's DBS at'."
 
     except Exception as e:
-        return f"Something went wrong: {str(e)}"
+        print(f"handle_stock_request error: {e}")
+        return f"Something went wrong with that stock request — try again in a moment."
 
 
 # --- Natural Language CRM Update Detection ---
@@ -6174,19 +6251,21 @@ def get_market_summary_now():
 
         # Parse Claude response
         def extract_section(text, key):
-            if key not in text:
+            """Extract bullet points after a section key — robust to minor Claude formatting variations."""
+            pattern = re.compile(re.escape(key) + r"(.*?)(?=\n[A-Z_]+:|$)", re.DOTALL | re.IGNORECASE)
+            m = pattern.search(text)
+            if not m:
                 return []
-            start = text.index(key) + len(key)
-            end = text.index("\n", start + 1) if "\n" in text[start:] else len(text)
-            # Get all bullet lines following the key
-            chunk = text[start:].split("\n")
-            bullets = [l.strip() for l in chunk if l.strip().startswith("•")][:3]
+            chunk = m.group(1)
+            bullets = [l.strip() for l in chunk.split("\n") if l.strip().startswith("•")][:3]
             return bullets
 
         def extract_overall(text):
-            if "OVERALL:" not in text:
+            pattern = re.compile(r"OVERALL:(.*?)$", re.DOTALL | re.IGNORECASE)
+            m = pattern.search(text)
+            if not m:
                 return ""
-            return text.split("OVERALL:")[-1].strip()
+            return m.group(1).strip()
 
         us_bullets = extract_section(raw, "US_BULLETS:")
         china_bullets = extract_section(raw, "CHINA_BULLETS:")
@@ -6201,8 +6280,11 @@ def get_market_summary_now():
             header = f"{b['flag']} *{b['market']} — {b['index_name']} ({b['pct_str']})*"
             bullets = bullet_map.get(b["market"], [])
             section = header
-            for bullet in bullets:
-                section += f"\n{bullet}"
+            if bullets:
+                for bullet in bullets:
+                    section += f"\n{bullet}"
+            else:
+                section += "\n• Market data unavailable"
             lines.append(section)
 
         if overall:
@@ -6748,10 +6830,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     if needs_session and session_data:
                         expense_sessions[user_id] = session_data
                     if reply:
-                        try:
-                            await update.message.reply_text(reply, parse_mode="Markdown")
-                        except Exception:
-                            await update.message.reply_text(reply)
+                        await send_safe(update.message, reply, parse_mode="Markdown")
                 else:
                     await update.message.reply_text(f"Read the receipt but got an unexpected format from vision — got: '{vision_text}'\nTry adding a caption like '45.50 Ichiran'.")
             except Exception as e:
@@ -6768,10 +6847,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if needs_session and session_data:
                 expense_sessions[user_id] = session_data
             if reply:
-                try:
-                    await update.message.reply_text(reply, parse_mode="Markdown")
-                except Exception:
-                    await update.message.reply_text(reply)
+                await send_safe(update.message, reply, parse_mode="Markdown")
         else:
             await update.message.reply_text("Got the receipt but couldn't read that as an expense. Try a caption like '1400 Ichiran' or 'spent 45 at Uniqlo'.")
         return
@@ -6810,7 +6886,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Check session timeouts before processing any session
     if any(user_id in s for s in [expense_sessions, delete_sessions, portfolio_delete_sessions,
-                                    confirm_sessions, receipt_confirm_sessions, edit_sessions, meeting_sessions]):
+                                    confirm_sessions, receipt_confirm_sessions, edit_sessions,
+                                    meeting_sessions, pending_restaurant_saves]):
         if is_session_expired(user_id):
             await check_session_timeouts(user_id, update)
             return
@@ -6845,8 +6922,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 await update.message.reply_text(f"Reply yes to switch, or no to continue with your {pending['label']}.")
                 return
         else:
-            # First interrupt — store and ask
-            interrupted_sessions[user_id] = {"label": active_label, "pending_text": text}
+            # First interrupt — store and ask (don't overwrite if already waiting)
+            if user_id not in interrupted_sessions:
+                interrupted_sessions[user_id] = {"label": active_label, "pending_text": text}
             await update.message.reply_text(
                 f"You're mid-{active_label} — did you mean to do something else?\n"
                 f"Reply yes to switch, or no to continue."
@@ -6857,6 +6935,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     if user_id in pending_restaurant_saves:
         prs = pending_restaurant_saves[user_id]
         step = prs.get("step")
+
         if step == "awaiting_location":
             location = text.strip()
             del pending_restaurant_saves[user_id]
@@ -6871,12 +6950,71 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             else:
                 await update.message.reply_text(format_restaurant_saved(prs["name"], location))
             return
+
+        elif step == "awaiting_confirm":
+            # Parse yes/no and optional tags from reply
+            extra_tags = ""
+            words = lower.split(None, 1)
+            first_word = words[0] if words else ""
+            rest = words[1] if len(words) > 1 else ""
+
+            if first_word in ["yes", "y"]:
+                extra_tags = rest.strip()
+                merged_tags = ", ".join(filter(None, [prs.get("tags", ""), extra_tags]))
+                location = prs.get("location", "")
+                del pending_restaurant_saves[user_id]
+                result = save_restaurant(prs["name"], location, prs.get("country", "Singapore"), merged_tags)
+                if result and result.startswith("_DUPLICATE_:"):
+                    pending_restaurant_saves[user_id] = {
+                        "step": "duplicate", "existing": prs["name"],
+                        "name": prs["name"], "location": location,
+                        "country": prs.get("country", "Singapore"), "tags": merged_tags, "notes": ""
+                    }
+                    await update.message.reply_text(f"*{prs['name']}* is already in your list. Update or save as new? (update / new)")
+                else:
+                    await update.message.reply_text(format_restaurant_saved(prs["name"], location, merged_tags))
+            elif first_word in ["no", "n"]:
+                del pending_restaurant_saves[user_id]
+                await update.message.reply_text(f"Got it — what's the correct location for {prs['name']}?")
+                pending_restaurant_saves[user_id] = {"name": prs["name"], "country": prs.get("country", "Singapore"), "step": "awaiting_location"}
+            else:
+                await update.message.reply_text("Reply yes to confirm or no to correct the location.")
+            return
+
+        elif step == "awaiting_outlet":
+            # Parse outlet number and optional tags
+            outlets = prs.get("outlets", [])
+            words = lower.split(None, 1)
+            first_word = words[0].strip().rstrip(",")
+            rest = words[1].strip() if len(words) > 1 else ""
+            try:
+                idx = int(first_word) - 1
+                if 0 <= idx < len(outlets):
+                    location = outlets[idx]
+                    merged_tags = ", ".join(filter(None, [prs.get("tags", ""), rest]))
+                    del pending_restaurant_saves[user_id]
+                    result = save_restaurant(prs["name"], location, prs.get("country", "Singapore"), merged_tags)
+                    if result and result.startswith("_DUPLICATE_:"):
+                        pending_restaurant_saves[user_id] = {
+                            "step": "duplicate", "existing": prs["name"],
+                            "name": prs["name"], "location": location,
+                            "country": prs.get("country", "Singapore"), "tags": merged_tags, "notes": ""
+                        }
+                        await update.message.reply_text(f"*{prs['name']}* is already in your list. Update or save as new? (update / new)")
+                    else:
+                        await update.message.reply_text(format_restaurant_saved(prs["name"], location, merged_tags))
+                else:
+                    await update.message.reply_text(f"Pick a number between 1 and {len(outlets)}.")
+            except ValueError:
+                await update.message.reply_text(f"Reply with the number of the outlet (1–{len(outlets)}).")
+            return
+
         elif step == "duplicate":
             if lower in ["new", "save new"]:
                 del pending_restaurant_saves[user_id]
                 save_restaurant(prs["name"], prs["location"], prs.get("country", "Singapore"),
                                 prs.get("tags", ""), prs.get("notes", ""), force_new=True)
-                await update.message.reply_text(format_restaurant_saved(prs["name"], prs["location"]))
+                await update.message.reply_text(format_restaurant_saved(prs["name"], prs["location"], prs.get("tags", "")))
             elif lower in ["update", "update existing"]:
                 del pending_restaurant_saves[user_id]
                 await update.message.reply_text(f"Use 'edit restaurant {prs['existing']}' to update it.")
@@ -7262,7 +7400,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     reply = None
 
     # CRM Commands
-    if lower.startswith("save "):
+    if lower.startswith("save ") and not is_restaurant_save(text):
         result = save_contact(text[5:])
         if result.startswith("_DUPLICATE_:"):
             existing_name = result.split(":", 1)[1]
@@ -7574,13 +7712,34 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = handle_search_restaurants(text)
     elif is_restaurant_save(text):
         result = handle_save_restaurant(text)
-        if result.startswith("_NEEDS_LOCATION_:"):
+        if result and result.startswith("_NEEDS_LOCATION_:"):
             parts = result.split(":", 2)
             name = parts[1] if len(parts) > 1 else ""
             country = parts[2] if len(parts) > 2 else "Singapore"
             pending_restaurant_saves[user_id] = {"name": name, "country": country, "step": "awaiting_location"}
             reply = f"⚠️ Couldn't read that Maps link — what's the location for {name}?\n(e.g. 313 Orchard Road, Singapore)"
-        elif result.startswith("_DUPLICATE_RESTAURANT_:"):
+        elif result and result.startswith("_INFER_LOCATION_:"):
+            parts = result.split(":", 5)
+            name = parts[1] if len(parts) > 1 else ""
+            country = parts[2] if len(parts) > 2 else "Singapore"
+            tags = parts[3] if len(parts) > 3 else ""
+            multiple = parts[4] == "1" if len(parts) > 4 else False
+            outlets = parts[5].split("|") if len(parts) > 5 and parts[5] else []
+            if multiple and len(outlets) > 1:
+                pending_restaurant_saves[user_id] = {
+                    "step": "awaiting_outlet", "name": name, "country": country,
+                    "tags": tags, "outlets": outlets
+                }
+                outlet_list = "\n".join(f"{i+1}. {o}" for i, o in enumerate(outlets))
+                reply = f"Found a few {name} outlets — which one, and any tags?\n{outlet_list}"
+            else:
+                location = outlets[0] if outlets else ""
+                pending_restaurant_saves[user_id] = {
+                    "step": "awaiting_confirm", "name": name, "country": country,
+                    "tags": tags, "location": location
+                }
+                reply = f"Got it — I have {name} at {location}. Is that right, and any tags? (yes / no, add tags or skip)"
+        elif result and result.startswith("_DUPLICATE_RESTAURANT_:"):
             parts = result.split(":", 5)
             pending_restaurant_saves[user_id] = {
                 "step": "duplicate", "existing": parts[1], "name": parts[2],
@@ -7726,8 +7885,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     # Natural language CRM — before fuzzy detectors (phrases like "John referred Sarah")
-    elif detect_crm_natural_update(text):
-        crm_action = detect_crm_natural_update(text)
+    elif (crm_action := detect_crm_natural_update(text)):
         action, name, field_or_referred, value = crm_action
         if action == "referral":
             reply = set_referral(name, field_or_referred)
@@ -7766,9 +7924,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = handle_new_bill(text)
 
     # Stocks — before reminder ("alert me if", "check" patterns need to win)
-    elif is_stock_request(text):
-        reply = handle_stock_request(text)
-
     # Reschedule — only fires if a reminder was recently sent
     elif is_reschedule_request(text) and user_id in last_fired_reminder:
         reply = handle_reschedule(text, user_id)
@@ -7780,24 +7935,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = handle_new_reminder(text)
 
     # Restaurants
-    elif is_restaurant_save(text):
-        result = handle_save_restaurant(text)
-        if result and result.startswith("_NEEDS_LOCATION_:"):
-            parts = result.split(":", 2)
-            name = parts[1] if len(parts) > 1 else ""
-            country = parts[2] if len(parts) > 2 else "Singapore"
-            pending_restaurant_saves[user_id] = {"name": name, "country": country, "step": "awaiting_location"}
-            reply = f"⚠️ Couldn't read that Maps link — what's the location for {name}?\n(e.g. 313 Orchard Road, Singapore)"
-        elif result and result.startswith("_DUPLICATE_RESTAURANT_:"):
-            parts = result.split(":", 5)
-            pending_restaurant_saves[user_id] = {
-                "step": "duplicate", "existing": parts[1], "name": parts[2],
-                "location": parts[3], "country": parts[4],
-                "tags": parts[5] if len(parts) > 5 else "", "notes": ""
-            }
-            reply = f"*{parts[1]}* is already in your list.\nUpdate existing or save as new? (update / new)"
-        else:
-            reply = result
     elif is_restaurant_search(text):
         reply = handle_search_restaurants(text)
 
