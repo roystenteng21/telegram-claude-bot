@@ -1059,8 +1059,18 @@ def delete_contact(name):
         sheet = crm_sheet()
         row_num, record = find_row(name)
         if not record:
+            # Fallback: raw scan for stub entries (e.g. malformed rows with no proper Name)
+            all_values = sheet.get_all_values()
+            name_lower = name.strip().lower()
+            for i, row in enumerate(all_values[1:], start=2):  # skip header
+                if any(name_lower == str(cell).strip().lower() for cell in row if cell):
+                    display = next((str(c).strip() for c in row if c), name)
+                    sheet.delete_rows(i)
+                    _invalidate_crm_cache()
+                    return f"✅ Entry *{display}* deleted"
             return f"❌ No contact found for '{name}'"
         sheet.delete_rows(row_num)
+        _invalidate_crm_cache()
         return f"✅ Contact *{record.get('Name')}* deleted"
     except Exception as e:
         return f"❌ Error deleting contact: {str(e)}"
@@ -2222,6 +2232,7 @@ TIMEZONE = pytz.timezone("Asia/Kuala_Lumpur")
 
 # Tracks the last reminder fired per user so they can say "remind me again in 2 hours"
 last_fired_reminder = {}
+_pending_reminders_cache = None  # None = stale, list = valid cache
 
 def reminders_sheet():
     try:
@@ -2289,6 +2300,7 @@ def parse_reschedule_request(text, original_message):
 
 def add_reminder(message, scheduled_time_str, recurrence="once", contact=""):
     """Add a reminder to the Reminders sheet."""
+    global _pending_reminders_cache
     sheet = reminders_sheet()
     reminder_id = generate_reminder_id()
     sheet.append_row([
@@ -2300,10 +2312,12 @@ def add_reminder(message, scheduled_time_str, recurrence="once", contact=""):
         "0",
         contact
     ])
+    _pending_reminders_cache = None  # invalidate cache
     return reminder_id
 
 def cancel_reminder_by_keyword(keyword):
     """Cancel reminders matching a keyword. Returns list of cancelled, or '_DISAMBIG_:' prefix if multiple."""
+    global _pending_reminders_cache
     sheet = reminders_sheet()
     records = sheet.get_all_records()
     matches = [
@@ -2318,6 +2332,7 @@ def cancel_reminder_by_keyword(keyword):
                                           for row, r in matches)]
     row_idx, r = matches[0]
     sheet.update_cell(row_idx, 5, "cancelled")
+    _pending_reminders_cache = None  # invalidate cache
     return [r.get("Message", "")]
 
 def list_reminders():
@@ -2357,12 +2372,18 @@ def get_next_recurrence(scheduled_time_str, recurrence):
         return None
 
 async def check_and_fire_reminders(app):
-    """Check sheet every minute and fire due reminders. Only reads pending rows."""
+    """Check pending reminders every minute. Uses in-memory cache — only re-reads sheet if cache is stale."""
+    global _pending_reminders_cache
     try:
-        sheet = reminders_sheet()
-        records = sheet.get_all_records()
         now = datetime.now(TIMEZONE).replace(second=0, microsecond=0)
-        pending_records = [(i, r) for i, r in enumerate(records) if r.get("Status") == "pending"]
+
+        # Populate cache if stale
+        if _pending_reminders_cache is None:
+            sheet = reminders_sheet()
+            records = sheet.get_all_records()
+            _pending_reminders_cache = [(i, r) for i, r in enumerate(records) if r.get("Status") == "pending"]
+
+        pending_records = _pending_reminders_cache
 
         for i, r in pending_records:
             scheduled_str = r.get("Scheduled Time", "")
@@ -2407,13 +2428,16 @@ async def check_and_fire_reminders(app):
                 if recurrence != "once":
                     # Schedule next occurrence
                     next_time = get_next_recurrence(scheduled_str, recurrence)
+                    sheet = reminders_sheet()
                     if next_time:
                         sheet.update_cell(row, 3, next_time)
                         sheet.update_cell(row, 6, "0")  # reset attempts
                     else:
                         sheet.update_cell(row, 5, "sent")
+                    _pending_reminders_cache = None  # invalidate cache after write
                 else:
                     # One-off: mark attempts, retry once after 2 hours if first attempt
+                    sheet = reminders_sheet()
                     if attempts == 0:
                         retry_time = (now + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M")
                         sheet.update_cell(row, 3, retry_time)
@@ -2421,6 +2445,7 @@ async def check_and_fire_reminders(app):
                     else:
                         # Second attempt done — mark sent and drop
                         sheet.update_cell(row, 5, "sent")
+                    _pending_reminders_cache = None  # invalidate cache after write
 
     except Exception as e:
         print(f"Error in check_and_fire_reminders: {e}")
@@ -4117,7 +4142,8 @@ async def _finalise_receipt_confirm(user_id, session, update):
     session_timestamps.pop(user_id, None)
 
     if is_new_merchant and category and card:
-        save_merchant_memory(merchant, category, card)
+        if not save_merchant_memory(merchant, category, card):
+            print(f"Warning: merchant memory not saved for '{merchant}' — will re-ask next time")
 
     reply = format_expense_logged(merchant, amount, currency, category, card, sgd_amount, last4)
     try:
@@ -4228,7 +4254,11 @@ def handle_expense_text(text, user_id, receipt_link="", last4=None):
     try:
         parsed = parse_expense_text(text)
         merchant = parsed.get("merchant", "Unknown")
-        amount = float(parsed.get("amount", 0))
+        try:
+            amount = float(parsed.get("amount", 0) or 0)
+        except (ValueError, TypeError):
+            print(f"handle_expense_text: invalid amount from parse: {parsed.get('amount')!r}")
+            amount = 0
         currency = parsed.get("currency", "SGD")
         category = parsed.get("category", "")
         card = parsed.get("card", "")
@@ -5219,13 +5249,11 @@ def get_similar_restaurants(text):
         real_context = f"These headlines may help identify real options: {'; '.join(real_names[:3])}" if real_names else ""
 
         prompt = (
-            f"Suggest restaurants in Singapore similar to '{ref_name or text}'. "
+            f"Suggest up to 3 restaurants in Singapore similar to '{ref_name or text}'. "
             f"{context} {real_context} "
-            "IMPORTANT: Only suggest real restaurants you are fully confident exist and can be found on Google Maps in Singapore right now. "
-            "Do not suggest any restaurant you are uncertain about. "
-            "If you can only confidently name 1 or 2, that is fine — do not pad with uncertain suggestions. "
+            "Only suggest real restaurants you are fully confident exist and can be found on Google Maps in Singapore right now. "
             "If you cannot confidently name any, reply with exactly: NONE "
-            "For each confident suggestion: name, area, and one sentence on why it's similar. "
+            "For each suggestion: name, area, and one sentence on why it's similar. "
             "Format each as: 🍽 [Name] — [Area] — [Why similar]\n---"
         )
         resp = client.messages.create(
@@ -5235,7 +5263,7 @@ def get_similar_restaurants(text):
         )
         result = resp.content[0].text.strip()
         if result.upper().startswith("NONE"):
-            return f"Couldn't confidently name any similar restaurants to {ref_name or text} right now — try the Michelin Guide Singapore or 50 Best Restaurants for verified options."
+            return "Nothing comes to mind right now."
         return result
     except Exception as e:
         return "Couldn't generate suggestions right now — try again in a moment."
@@ -5413,25 +5441,25 @@ SGX_TICKER_MAP = {
 
 HK_TICKER_MAP = {
     # Tencent
-    "tencent": "0700.HK", "0700": "0700.HK",
+    "tencent": "0700.HK", "0700": "0700.HK", "TENCENT": "0700.HK",
     # Alibaba HK
-    "alibaba": "9988.HK", "9988": "9988.HK",
+    "alibaba": "9988.HK", "9988": "9988.HK", "ALIBABA": "9988.HK",
     # Meituan
-    "meituan": "3690.HK", "3690": "3690.HK",
+    "meituan": "3690.HK", "3690": "3690.HK", "MEITUAN": "3690.HK",
     # HSBC
-    "hsbc": "0005.HK", "0005": "0005.HK",
+    "hsbc": "0005.HK", "0005": "0005.HK", "HSBC": "0005.HK",
     # AIA
-    "aia": "1299.HK", "1299": "1299.HK",
+    "aia": "1299.HK", "1299": "1299.HK", "AIA": "1299.HK",
     # BYD
-    "byd": "1211.HK", "1211": "1211.HK",
+    "byd": "1211.HK", "1211": "1211.HK", "BYD": "1211.HK",
     # Xiaomi
-    "xiaomi": "1810.HK", "1810": "1810.HK",
+    "xiaomi": "1810.HK", "1810": "1810.HK", "XIAOMI": "1810.HK",
     # JD
-    "jd": "9618.HK", "9618": "9618.HK",
+    "jd": "9618.HK", "9618": "9618.HK", "JD": "9618.HK",
     # NetEase
-    "netease": "9999.HK", "9999": "9999.HK",
+    "netease": "9999.HK", "9999": "9999.HK", "NETEASE": "9999.HK",
     # CNOOC
-    "cnooc": "0883.HK", "0883": "0883.HK",
+    "cnooc": "0883.HK", "0883": "0883.HK", "CNOOC": "0883.HK",
 }
 
 def normalise_ticker(ticker):
@@ -5443,6 +5471,11 @@ def normalise_ticker(ticker):
     if t in HK_TICKER_MAP:
         return HK_TICKER_MAP[t]
     upper = ticker.strip().upper()
+    # Check uppercase variants in maps (safety net for all-caps input)
+    if upper in HK_TICKER_MAP:
+        return HK_TICKER_MAP[upper]
+    if upper in SGX_TICKER_MAP:
+        return SGX_TICKER_MAP[upper]
     # Already has exchange suffix
     if "." in upper:
         return upper
@@ -5492,6 +5525,11 @@ def fetch_price(ticker):
                 prev_close = float(quote["08. previous close"])
                 change = float(quote["09. change"])
                 change_pct = float(quote["10. change percent"].replace("%", ""))
+                av_suffix = ticker.split(".")[-1] if "." in ticker else ""
+                av_exchange_flags = {
+                    "SI": "🇸🇬", "HK": "🇭🇰", "L": "🇬🇧", "AX": "🇦🇺",
+                    "T": "🇯🇵", "NS": "🇮🇳", "BO": "🇮🇳", "SS": "🇨🇳", "SZ": "🇨🇳",
+                }
                 return {
                     "ticker": ticker,
                     "name": ticker,  # Alpha Vantage Global Quote doesn't return company name
@@ -5499,7 +5537,8 @@ def fetch_price(ticker):
                     "prev_close": prev_close,
                     "change": change,
                     "change_pct": change_pct,
-                    "currency": "USD"
+                    "currency": "USD",
+                    "flag": av_exchange_flags.get(av_suffix, "🇺🇸"),
                 }
         except Exception as e:
             print(f"Alpha Vantage error for {ticker}: {e}")
@@ -5519,6 +5558,8 @@ def fetch_price(ticker):
         change = price - prev_close
         change_pct = (change / prev_close * 100) if prev_close else 0
         market_state = meta.get("marketState", "")  # REGULAR, PRE, POST, CLOSED
+        exchange = meta.get("exchange", "")
+        full_exchange = meta.get("fullExchangeName", "")
         # 52-week range from historical closes
         closes = [c for c in result["indicators"]["quote"][0].get("close", []) if c is not None]
         week52_low = min(closes) if closes else None
@@ -5539,6 +5580,8 @@ def fetch_price(ticker):
             "change_pct": change_pct,
             "currency": currency,
             "market_state": market_state,
+            "exchange": exchange,
+            "fullExchangeName": full_exchange,
             "week52_low": week52_low,
             "week52_high": week52_high,
             "flag": flag,
@@ -5676,16 +5719,16 @@ def fetch_stock_summary(ticker, name, price_data=None):
     try:
         resp = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=100,
+            max_tokens=120,
             messages=[{
                 "role": "user",
                 "content": (
                     f"Headlines about {name} ({ticker}):\n{source_context}\n\n"
-                    "Write 2-3 short factual sentences as one paragraph about this stock's recent situation. "
-                    "Focus on price movement, business developments, or earnings — not timing advice, buy/sell signals, or speculation. "
-                    "Do not include phrases like 'investors should', 'optimal entry', 'right time to buy', or any forward-looking speculation. "
-                    "End the paragraph with a single [SourceName] reference for the most relevant source used. "
-                    "Never refuse — if headlines are speculative or thin, write about price direction and 52-week range position instead with no source tag."
+                    "Write 2-3 short factual sentences as one paragraph. "
+                    "First sentence: where the stock sits in its 52-week range (near high, near low, or mid-range). "
+                    "Remaining sentences: recent business developments or earnings from the headlines — factual only. "
+                    "No timing advice, no buy/sell signals, no speculation, no phrases like 'investors should' or 'right time to buy'. "
+                    "End with a single [SourceName] tag for the most relevant source. No source tag if no usable headlines."
                 )
             }]
         )
@@ -6155,6 +6198,13 @@ def handle_stock_request(text):
                 rss_headlines, rss_sources = rss_future.result()
 
             if data:
+                # OTC filter — reject no-suffix tickers resolving to OTC markets
+                exchange = data.get("exchange", "") or data.get("fullExchangeName", "")
+                if "OTC" in exchange.upper() and "." not in normalise_ticker(ticker):
+                    return (
+                        f"⚠️ {ticker} appears to be an OTC/pink sheet listing — data may be unreliable.\n"
+                        f"Try the primary exchange listing instead (e.g. 0700.HK for Tencent, 9988.HK for Alibaba)."
+                    )
                 # Pass pre-fetched headlines into summary to avoid second RSS call
                 name = data.get("name", ticker)
                 labelled = [(h, get_source_label(s)) for h, s in zip(rss_headlines, rss_sources)]
@@ -6164,16 +6214,16 @@ def handle_stock_request(text):
                     try:
                         resp = client.messages.create(
                             model="claude-haiku-4-5-20251001",
-                            max_tokens=100,
+                            max_tokens=120,
                             messages=[{
                                 "role": "user",
                                 "content": (
                                     f"Headlines about {name} ({ticker}):\n{source_context}\n\n"
-                                    "Write 2-3 short factual sentences as one paragraph about this stock's recent situation. "
-                                    "Focus on price movement, business developments, or earnings — not timing advice, buy/sell signals, or speculation. "
-                                    "Do not include phrases like 'investors should', 'optimal entry', 'right time to buy', or any forward-looking speculation. "
-                                    "End the paragraph with a single [SourceName] reference for the most relevant source used. "
-                                    "Never refuse — if headlines are speculative or thin, write about price direction and 52-week range position instead with no source tag."
+                                    "Write 2-3 short factual sentences as one paragraph. "
+                                    "First sentence: where the stock sits in its 52-week range (near high, near low, or mid-range). "
+                                    "Remaining sentences: recent business developments or earnings from the headlines — factual only. "
+                                    "No timing advice, no buy/sell signals, no speculation, no phrases like 'investors should' or 'right time to buy'. "
+                                    "End with a single [SourceName] tag for the most relevant source. No source tag if no usable headlines."
                                 )
                             }]
                         )
@@ -7560,7 +7610,46 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     reply = None
 
     # CRM Commands
-    if lower.startswith("save ") and not is_restaurant_save(text):
+    if lower.startswith("save restaurant "):
+        result = handle_save_restaurant(text)
+        if result and result.startswith("_NEEDS_LOCATION_:"):
+            parts = result.split(":", 2)
+            name = parts[1] if len(parts) > 1 else ""
+            country = parts[2] if len(parts) > 2 else "Singapore"
+            pending_restaurant_saves[user_id] = {"name": name, "country": country, "step": "awaiting_location"}
+            reply = f"⚠️ Couldn't read that Maps link — what's the location for {name}?\n(e.g. 313 Orchard Road, Singapore)"
+        elif result and result.startswith("_INFER_LOCATION_:"):
+            parts = result.split(":", 5)
+            name = parts[1] if len(parts) > 1 else ""
+            country = parts[2] if len(parts) > 2 else "Singapore"
+            tags = parts[3] if len(parts) > 3 else ""
+            multiple = parts[4] == "1" if len(parts) > 4 else False
+            outlets = parts[5].split("|") if len(parts) > 5 and parts[5] else []
+            if multiple and len(outlets) > 1:
+                pending_restaurant_saves[user_id] = {
+                    "step": "awaiting_outlet", "name": name, "country": country,
+                    "tags": tags, "outlets": outlets
+                }
+                outlet_list = "\n".join(f"{i+1}. {o}" for i, o in enumerate(outlets))
+                reply = f"Found a few {name} outlets — which one, and any tags?\n{outlet_list}"
+            else:
+                location = outlets[0] if outlets else ""
+                pending_restaurant_saves[user_id] = {
+                    "step": "awaiting_confirm", "name": name, "country": country,
+                    "tags": tags, "location": location
+                }
+                reply = f"Got it — I have {name} at {location}. Is that right, and any tags? (yes / no, add tags or skip)"
+        elif result and result.startswith("_DUPLICATE_RESTAURANT_:"):
+            parts = result.split(":", 5)
+            pending_restaurant_saves[user_id] = {
+                "step": "duplicate", "existing": parts[1], "name": parts[2],
+                "location": parts[3], "country": parts[4],
+                "tags": parts[5] if len(parts) > 5 else "", "notes": ""
+            }
+            reply = f"*{parts[1]}* is already in your list.\nUpdate existing or save as new? (update / new)"
+        else:
+            reply = result
+    elif lower.startswith("save ") and not is_restaurant_save(text):
         result = save_contact(text[5:])
         if result.startswith("_DUPLICATE_:"):
             existing_name = result.split(":", 1)[1]
@@ -8082,17 +8171,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # Bills — before reminder (bill triggers are more specific; reminder has "remind me about my" removed)
     elif is_bill_request(text):
         reply = handle_new_bill(text)
-
-    # Stocks — before reminder ("alert me if", "check" patterns need to win)
-    # Reschedule — only fires if a reminder was recently sent
-    elif is_reschedule_request(text) and user_id in last_fired_reminder:
-        reply = handle_reschedule(text, user_id)
-
-    # Reminders
-    elif is_cancel_reminder_request(text):
-        reply = handle_cancel_reminder(text)
-    elif is_reminder_request(text):
-        reply = handle_new_reminder(text)
 
     # Restaurants
     elif is_restaurant_search(text):
