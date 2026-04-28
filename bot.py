@@ -5219,19 +5219,24 @@ def get_similar_restaurants(text):
         real_context = f"These headlines may help identify real options: {'; '.join(real_names[:3])}" if real_names else ""
 
         prompt = (
-            f"Suggest 3 restaurants in Singapore similar to '{ref_name or text}'. "
+            f"Suggest restaurants in Singapore similar to '{ref_name or text}'. "
             f"{context} {real_context} "
-            "IMPORTANT: Only suggest real restaurants that actually exist and can be found on Google. "
-            "Do not invent or hallucinate restaurant names. "
-            "For each: name, area, and one sentence on why it's similar. "
-            "Format: 🍽 [Name] — [Area] — [Why similar]\n---"
+            "IMPORTANT: Only suggest real restaurants you are fully confident exist and can be found on Google Maps in Singapore right now. "
+            "Do not suggest any restaurant you are uncertain about. "
+            "If you can only confidently name 1 or 2, that is fine — do not pad with uncertain suggestions. "
+            "If you cannot confidently name any, reply with exactly: NONE "
+            "For each confident suggestion: name, area, and one sentence on why it's similar. "
+            "Format each as: 🍽 [Name] — [Area] — [Why similar]\n---"
         )
         resp = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}]
         )
-        return resp.content[0].text.strip()
+        result = resp.content[0].text.strip()
+        if result.upper().startswith("NONE"):
+            return f"Couldn't confidently name any similar restaurants to {ref_name or text} right now — try the Michelin Guide Singapore or 50 Best Restaurants for verified options."
+        return result
     except Exception as e:
         return "Couldn't generate suggestions right now — try again in a moment."
 
@@ -5676,10 +5681,11 @@ def fetch_stock_summary(ticker, name, price_data=None):
                 "role": "user",
                 "content": (
                     f"Headlines about {name} ({ticker}):\n{source_context}\n\n"
-                    "Write 2 short factual sentences about this stock's situation based strictly on these headlines. "
-                    "End each sentence with [SourceName] from the headline it references. "
-                    "Never refuse — if headlines are thin, write about price direction and range instead. "
-                    "No fluff, no caveats about missing data."
+                    "Write 2-3 short factual sentences as one paragraph about this stock's recent situation. "
+                    "Focus on price movement, business developments, or earnings — not timing advice, buy/sell signals, or speculation. "
+                    "Do not include phrases like 'investors should', 'optimal entry', 'right time to buy', or any forward-looking speculation. "
+                    "End the paragraph with a single [SourceName] reference for the most relevant source used. "
+                    "Never refuse — if headlines are speculative or thin, write about price direction and 52-week range position instead with no source tag."
                 )
             }]
         )
@@ -5691,7 +5697,7 @@ def fetch_stock_summary(ticker, name, price_data=None):
             return _generate_price_movement_summary(price_data), []
         return None, []
 
-def format_price(data):
+def format_price(data, summary=None):
     """Format stock price — flag, name, price, state, 52-week range, sourced summary."""
     if not data:
         return None
@@ -5709,7 +5715,8 @@ def format_price(data):
     week52_high = data.get("week52_high")
     range_line = f"52-week range: {currency} {week52_low:.2f} – {currency} {week52_high:.2f}" if week52_low and week52_high else ""
 
-    summary, _ = fetch_stock_summary(ticker, name, price_data=data)
+    if summary is None:
+        summary, _ = fetch_stock_summary(ticker, name, price_data=data)
 
     lines = [f"{flag} {name} ({ticker})"]
     lines.append(f"{currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
@@ -6162,10 +6169,11 @@ def handle_stock_request(text):
                                 "role": "user",
                                 "content": (
                                     f"Headlines about {name} ({ticker}):\n{source_context}\n\n"
-                                    "Write 2 short factual sentences about this stock's situation based strictly on these headlines. "
-                                    "End each sentence with [SourceName] from the headline it references. "
-                                    "Never refuse — if headlines are thin, write about price direction and range instead. "
-                                    "No fluff, no caveats about missing data."
+                                    "Write 2-3 short factual sentences as one paragraph about this stock's recent situation. "
+                                    "Focus on price movement, business developments, or earnings — not timing advice, buy/sell signals, or speculation. "
+                                    "Do not include phrases like 'investors should', 'optimal entry', 'right time to buy', or any forward-looking speculation. "
+                                    "End the paragraph with a single [SourceName] reference for the most relevant source used. "
+                                    "Never refuse — if headlines are speculative or thin, write about price direction and 52-week range position instead with no source tag."
                                 )
                             }]
                         )
@@ -6175,23 +6183,8 @@ def handle_stock_request(text):
                 else:
                     summary = _generate_price_movement_summary(data)
 
-                # Build formatted output directly
-                flag = data.get("flag", "🌐")
-                currency = data.get("currency", "")
-                price = data.get("price", 0)
-                change_pct = data.get("change_pct", 0)
-                arrow = "▲" if change_pct >= 0 else "▼"
-                market_state = data.get("market_state", "REGULAR")
-                state_label = {"PRE": " (pre)", "POST": " (post)", "CLOSED": " (closed)", "REGULAR": ""}.get(market_state, "")
-                week52_low = data.get("week52_low")
-                week52_high = data.get("week52_high")
-                range_line = f"52-week range: {currency} {week52_low:.2f} – {currency} {week52_high:.2f}" if week52_low and week52_high else ""
-                lines = [f"{flag} {name} ({ticker})"]
-                lines.append(f"{currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
-                if range_line:
-                    lines.append(range_line)
-                lines.append(f"\n{summary}")
-                return "\n".join(lines)
+                # Pass pre-fetched summary into format_price to avoid duplicate output
+                return format_price(data, summary=summary)
 
             if ALPHA_VANTAGE_API_KEY:
                 return f"Couldn't fetch {ticker} — Alpha Vantage and Yahoo Finance both failed. The ticker may be wrong, or try again in a moment."
