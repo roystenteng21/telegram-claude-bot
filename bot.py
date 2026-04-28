@@ -8170,14 +8170,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if needs_session and session_data:
             expense_sessions[user_id] = session_data
 
-    # Bills — before reminder (bill triggers are more specific; reminder has "remind me about my" removed)
-    elif is_bill_request(text):
-        reply = handle_new_bill(text)
-
-    # Restaurants
-    elif is_restaurant_search(text):
-        reply = handle_search_restaurants(text)
-
     # Calendar
     elif is_calendar_request(text):
         reply = smart_add_event(text, user_id)
