@@ -160,6 +160,11 @@ DEV_NOTES_CONTENT = [
     ["Architecture — Sheets", "setup_sheets() uses single worksheets() call. No repeated API reads in setup. Em Log and Dev Notes never read in routing.", "2026-04-26"],
     ["Deploy Flow", "git add bot.py → git commit -m '[msg]' → git push origin main → watch Railway build → em status in Telegram → test changed features.", "2026-04-26"],
     ["Handoff Rule", "4 lines max: (1) last deployed commit, (2) bot.py status, (3) mid-session context if hanging, (4) Read Dev Notes + Em Log before starting.", "2026-04-26"],
+    ["Roadmap — Session 9", "Trips schema migration (new schema: Trip ID · Destination · Currency · Check In · Check Out · Hotel Name · Hotel Local Name · Hotel Address · Notes · Status) + AviationStack strip (~200–300 lines from trips.py and routing.py).", "2026-04-29"],
+    ["Roadmap — Session 10", "GitHub auto-deploy: api.github.com is blocked from Claude's container. Solution: a lightweight deploy script (deploy.py) that runs locally or on Railway — accepts files from Claude's outputs and commits them via GitHub API. Repo: roystenteng21/telegram-claude-bot. Token resets 2pm — generate fresh ghp_ token at session start.", "2026-04-29"],
+    ["Roadmap — Session 11 (S3 Reliability)", "Error boundaries: wrap all sheet writes, notify user on failure, never delete session before write confirmed (3x 🔴). Asyncio fixes: replace time.sleep with asyncio.sleep (2x 🟠). Error logging to Em Log at runtime. Persist sessions + price alerts across Railway restarts.", "2026-04-29"],
+    ["Roadmap — Session 12 (S4 Efficiency)", "CRM cache + single-pass find_row (currently 1000 iterations/lookup). Reminder cache (currently full sheet read every minute). Routing deduplication: eliminate duplicate detectors, clean elif chain. Claude call audit: Haiku vs Sonnet, min max_tokens everywhere.", "2026-04-29"],
+    ["Roadmap — Session 13 (S5 Completeness)", "End-to-end feature testing across all modules. Input forgiveness: broader natural phrasing recognised. Response consistency: emoji, error format, reply length standardised across all handlers.", "2026-04-29"],
 ]
 
 EM_LOG_HEADERS_BACKLOG = ["Priority", "Item", "Stage", "Notes", "Added"]
@@ -183,6 +188,9 @@ INITIAL_BACKLOG = [
     ["🟢", "CARD_FX_FEES dict defined but never referenced anywhere", "Step 3", "Remove or wire up to FX fee display", "2026-04-26"],
     ["🟢", "bare except: in format_date and calculate_age swallows all exceptions", "Step 3", "Replace with except ValueError", "2026-04-26"],
     ["🟢", "Haiku for parse_expense_text_v2 and is_calendar_request — Sonnet overkill", "Step 3", "Switch model to claude-haiku-3, verify output quality unchanged", "2026-04-26"],
+    ["🟢", "S5: End-to-end feature testing — no systematic test coverage across modules", "Step 3", "Test all features post-modularisation: expenses, CRM, trips, reminders, stocks, restaurants, calendar, todos", "2026-04-29"],
+    ["🟢", "S5: Input forgiveness — narrow phrasing recognition misses natural variants", "Step 3", "Broaden detector patterns for common commands; test with varied natural language inputs", "2026-04-29"],
+    ["🟢", "S5: Response consistency — emoji, error format, reply length vary across handlers", "Step 3", "Audit all reply strings; standardise error prefix, emoji usage, and length conventions", "2026-04-29"],
 ]
 
 INITIAL_SESSION = [
@@ -190,6 +198,16 @@ INITIAL_SESSION = [
      "Flight date fix (extract_flight_dates + AviationStack date param); Perf fixes (merchant cache, card cache, system prompt cache, history cap 20); AviationStack fallback; Dev Notes + Em Log tabs; em whats pending; setup_sheets single API call",
      "Flight dates ignored (now passed to AviationStack); Merchant map re-read every expense; Card names re-read every parse; System prompt rebuilt every Claude call; setup_sheets called worksheets() 4x",
      "All 19 issues (Step 3); Stage 3 trip features",
+     "TBD"],
+    ["2026-04-29", "Session 7",
+     "Modularisation planning; dependency hierarchy defined; config.py, clients.py, state.py, sheets.py, profile.py, crm.py, expenses.py, reminders.py, calendar.py, todos.py, stocks.py, trips.py, meetings.py, scheduler.py built",
+     "Monolithic bot.py (8426 lines) split into modules",
+     "routing.py, restaurants.py, bot.py (entry point) remaining; deploy pending",
+     "TBD"],
+    ["2026-04-29", "Session 8",
+     "routing.py (943 lines), restaurants.py (498 lines), bot.py entry point (29 lines) built; all 17 modules complete; roadmap S9–S13 logged to Dev Notes and Em Log",
+     "Monolithic bot.py fully replaced by 17-module structure",
+     "Deploy 17 modules via git; Session 9: Trips schema migration + AviationStack strip",
      "TBD"],
 ]
 
