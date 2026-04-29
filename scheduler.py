@@ -14,7 +14,7 @@ from crm import (
 )
 from expenses import send_bill_reminders
 from reminders import check_and_fire_reminders, reminders_sheet, get_next_recurrence
-from calendar import check_icloud_daily
+from cal import check_icloud_daily
 from stocks import check_price_alerts, send_weekly_market_summary
 from state import load_fx_rates_from_sheet, refresh_fx_rates
 from trips import restore_overseas_from_trips
