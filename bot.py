@@ -5432,7 +5432,7 @@ def normalise_ticker(ticker):
     return upper
 
 def fetch_weekly_change(ticker):
-    """Fetch weekly % change — last Monday open to latest close via Yahoo Finance."""
+    """Fetch weekly % change — previous completed calendar week (last Mon open → last Fri close)."""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1wk&range=1mo"
         with httpx.Client(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as hx:
@@ -5441,12 +5441,11 @@ def fetch_weekly_change(ticker):
         result = data["chart"]["result"][0]
         closes = result["indicators"]["quote"][0].get("close", [])
         opens = result["indicators"]["quote"][0].get("open", [])
-        # Filter out None values
-        closes = [c for c in closes if c is not None]
-        opens = [o for o in opens if o is not None]
-        if len(closes) >= 1 and len(opens) >= 1:
-            week_open = opens[-1]
-            week_close = closes[-1]
+        # Pair opens/closes, filter incomplete candles (None close = week still in progress)
+        pairs = [(o, c) for o, c in zip(opens, closes) if o is not None and c is not None]
+        # Take second-to-last = last fully completed week
+        if len(pairs) >= 2:
+            week_open, week_close = pairs[-2]
             if week_open:
                 pct = (week_close - week_open) / week_open * 100
                 return pct
@@ -5455,43 +5454,10 @@ def fetch_weekly_change(ticker):
     return None
 
 def fetch_price(ticker):
-    """Fetch current price — Alpha Vantage primary, Yahoo Finance fallback."""
+    """Fetch current price — Yahoo Finance primary (full data), Alpha Vantage secondary."""
     ticker = normalise_ticker(ticker)
-    # --- Alpha Vantage ---
-    if ALPHA_VANTAGE_API_KEY:
-        try:
-            url = (
-                f"https://www.alphavantage.co/query"
-                f"?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}"
-            )
-            with httpx.Client(timeout=10) as hx:
-                resp = hx.get(url)
-            data = resp.json()
-            quote = data.get("Global Quote", {})
-            if quote.get("05. price"):
-                price = float(quote["05. price"])
-                prev_close = float(quote["08. previous close"])
-                change = float(quote["09. change"])
-                change_pct = float(quote["10. change percent"].replace("%", ""))
-                av_suffix = ticker.split(".")[-1] if "." in ticker else ""
-                av_exchange_flags = {
-                    "SI": "🇸🇬", "HK": "🇭🇰", "L": "🇬🇧", "AX": "🇦🇺",
-                    "T": "🇯🇵", "NS": "🇮🇳", "BO": "🇮🇳", "SS": "🇨🇳", "SZ": "🇨🇳",
-                }
-                return {
-                    "ticker": ticker,
-                    "name": ticker,  # Alpha Vantage Global Quote doesn't return company name
-                    "price": price,
-                    "prev_close": prev_close,
-                    "change": change,
-                    "change_pct": change_pct,
-                    "currency": "USD",
-                    "flag": av_exchange_flags.get(av_suffix, "🇺🇸"),
-                }
-        except Exception as e:
-            print(f"Alpha Vantage error for {ticker}: {e}")
 
-    # --- Yahoo Finance fallback ---
+    # --- Yahoo Finance (primary) ---
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1y"
         with httpx.Client(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as hx:
@@ -5535,8 +5501,43 @@ def fetch_price(ticker):
             "flag": flag,
         }
     except Exception as e:
-        print(f"Yahoo Finance fallback error for {ticker}: {e}")
-        return None
+        print(f"Yahoo Finance error for {ticker}: {e}")
+
+    # --- Alpha Vantage (secondary fallback) ---
+    if ALPHA_VANTAGE_API_KEY:
+        try:
+            url = (
+                f"https://www.alphavantage.co/query"
+                f"?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}"
+            )
+            with httpx.Client(timeout=10) as hx:
+                resp = hx.get(url)
+            data = resp.json()
+            quote = data.get("Global Quote", {})
+            if quote.get("05. price"):
+                price = float(quote["05. price"])
+                prev_close = float(quote["08. previous close"])
+                change = float(quote["09. change"])
+                change_pct = float(quote["10. change percent"].replace("%", ""))
+                av_suffix = ticker.split(".")[-1] if "." in ticker else ""
+                av_exchange_flags = {
+                    "SI": "🇸🇬", "HK": "🇭🇰", "L": "🇬🇧", "AX": "🇦🇺",
+                    "T": "🇯🇵", "NS": "🇮🇳", "BO": "🇮🇳", "SS": "🇨🇳", "SZ": "🇨🇳",
+                }
+                return {
+                    "ticker": ticker,
+                    "name": ticker,
+                    "price": price,
+                    "prev_close": prev_close,
+                    "change": change,
+                    "change_pct": change_pct,
+                    "currency": "USD",
+                    "flag": av_exchange_flags.get(av_suffix, "🇺🇸"),
+                }
+        except Exception as e:
+            print(f"Alpha Vantage fallback error for {ticker}: {e}")
+
+    return None
 
 # Readable source name lookup — maps domain/name fragments to display labels
 SOURCE_LABELS = {
@@ -5714,7 +5715,7 @@ def format_price(data, summary=None):
     lines.append(f"{currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
     if range_line:
         lines.append(range_line)
-    lines.append(f"\n{summary if summary else _generate_price_movement_summary(data)}")
+    lines.append(f"{summary if summary else _generate_price_movement_summary(data)}")
 
     return "\n".join(lines)
 
