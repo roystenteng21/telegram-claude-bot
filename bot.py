@@ -279,6 +279,18 @@ def _setup_em_log(existing):
 def em_log_sheet():
     return get_sheet("Em Log")
 
+def log_error_to_em_log(source: str, error: str):
+    """Append a runtime error row to Em Log backlog section. Fire-and-forget — never raises."""
+    try:
+        ws = em_log_sheet()
+        if not ws:
+            return
+        today = datetime.now(pytz.timezone("Asia/Kuala_Lumpur")).strftime("%Y-%m-%d %H:%M")
+        # Append directly — no cap enforcement, errors are always kept
+        ws.append_row(["🔴 ERROR", f"[{source}] {error}", "Runtime", today, today])
+    except Exception:
+        pass  # Never let error logging itself crash anything
+
 
 def add_session_to_em_log(date_str, session_name, built, fixed, pending, commit):
     """Append a session row to Em Log. Enforces 10-row cap on session history — deletes oldest if exceeded."""
@@ -2726,7 +2738,53 @@ expense_sessions = {}
 delete_sessions = {}
 portfolio_delete_sessions = {}  # { user_id: { "step": "pick", "rows": [...] } }
 confirm_sessions = {}  # { user_id: { "action": str, "args": list, "target": str } }
-receipt_confirm_sessions = {}  # { user_id: { "merchant": str, "amount": float, ... } }
+def persist_sessions_to_sheet():
+    """Persist receipt_confirm_sessions to Settings sheet. Fire-and-forget — never raises."""
+    try:
+        sheet = get_sheet("Settings")
+        if not sheet:
+            return
+        data = json.dumps({str(k): v for k, v in receipt_confirm_sessions.items()})
+        records = sheet.get_all_records()
+        for i, r in enumerate(records):
+            if r.get("Key") == "receipt_confirm_sessions":
+                sheet.update_cell(i + 2, 2, data)
+                return
+        sheet.append_row(["receipt_confirm_sessions", data])
+    except Exception as e:
+        print(f"persist_sessions_to_sheet error: {e}")
+
+def load_sessions_from_sheet():
+    """Restore receipt_confirm_sessions from Settings sheet on startup."""
+    try:
+        sheet = get_sheet("Settings")
+        if not sheet:
+            return
+        records = sheet.get_all_records()
+        for r in records:
+            if r.get("Key") == "receipt_confirm_sessions":
+                raw = r.get("Value", "")
+                if raw:
+                    loaded = json.loads(raw)
+                    receipt_confirm_sessions.update({int(k): v for k, v in loaded.items()})
+                    if loaded:
+                        print(f"Restored {len(loaded)} receipt confirm session(s) from sheet")
+                return
+    except Exception as e:
+        print(f"load_sessions_from_sheet error: {e}")
+
+class _AutoPersistDict(dict):
+    """Dict subclass that auto-persists to Settings sheet on every write/delete.
+    persist_sessions_to_sheet must be defined before this class is instantiated."""
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        persist_sessions_to_sheet()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        persist_sessions_to_sheet()
+
+receipt_confirm_sessions = _AutoPersistDict()  # { user_id: { "merchant": str, "amount": float, ... } }
 todo_disambig_sessions = {}  # { user_id: { "tasks": list, "action": str } }
 market_summary_pending = {}  # { user_id: True }
 interrupted_sessions = {}  # { user_id: { "label": str, "pending_text": str } }
@@ -3141,6 +3199,7 @@ def save_merchant_memory(merchant, category, card):
         return True
     except Exception as e:
         print(f"save_merchant_memory failed for '{merchant}': {e}")
+        log_error_to_em_log("save_merchant_memory", f"{merchant} — {e}")
         return False
 
 def delete_merchant(merchant_name):
@@ -3218,6 +3277,7 @@ def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_
         return True
     except Exception as e:
         print(f"log_expense failed: {e}")
+        log_error_to_em_log("log_expense", f"{merchant} {amount} {currency} — {e}")
         return False
 
 def format_expense_confirmation(merchant, amount, currency, category, card, sgd_amount=None,
@@ -5215,6 +5275,41 @@ import urllib.request
 # Price alerts: { "AAPL": { "condition": "below", "price": 180.0, "active": True } }
 price_alerts = {}
 
+def persist_price_alerts_to_sheet():
+    """Save active price alerts to Settings sheet so they survive Railway restarts."""
+    try:
+        sheet = get_sheet("Settings")
+        if not sheet:
+            return
+        records = sheet.get_all_records()
+        data = json.dumps({k: v for k, v in price_alerts.items() if v.get("active")})
+        for i, r in enumerate(records):
+            if r.get("Key") == "price_alerts":
+                sheet.update_cell(i + 2, 2, data)
+                return
+        sheet.append_row(["price_alerts", data])
+    except Exception as e:
+        print(f"persist_price_alerts_to_sheet error: {e}")
+
+def load_price_alerts_from_sheet():
+    """Load price alerts from Settings sheet on startup."""
+    global price_alerts
+    try:
+        sheet = get_sheet("Settings")
+        if not sheet:
+            return
+        records = sheet.get_all_records()
+        for r in records:
+            if r.get("Key") == "price_alerts":
+                raw = r.get("Value", "")
+                if raw:
+                    loaded = json.loads(raw)
+                    price_alerts.update(loaded)
+                    print(f"Restored {len(loaded)} price alert(s) from sheet")
+                return
+    except Exception as e:
+        print(f"load_price_alerts_from_sheet error: {e}")
+
 # Indices to track for weekly summary
 MARKET_INDICES = {
     "US": {"^GSPC": "S&P 500"},
@@ -5814,9 +5909,11 @@ def search_portfolio_by_ticker(query):
     return [(row_idx, r) for row_idx, r in rows if q in r.get("Stock", "").upper()]
 
 
+def set_price_alert(ticker, condition, price):
     """Set a price alert for a ticker."""
     ticker = ticker.upper()
     price_alerts[ticker] = {"condition": condition, "price": price, "active": True}
+    persist_price_alerts_to_sheet()
 
 def parse_stock_request(text):
     """Use Claude to parse a stock-related request."""
@@ -5884,6 +5981,7 @@ async def check_price_alerts(app):
                 )
                 await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
                 price_alerts[ticker]["active"] = False  # deactivate after firing
+                persist_price_alerts_to_sheet()
 
     except Exception as e:
         print(f"Error checking price alerts: {e}")
@@ -8077,6 +8175,12 @@ async def post_init(app):
 
     # Restore cached FX rates from Settings sheet
     load_fx_rates_from_sheet()
+
+    # Restore price alerts from Settings sheet
+    load_price_alerts_from_sheet()
+
+    # Restore pending expense sessions from Settings sheet
+    load_sessions_from_sheet()
 
     timezone = pytz.timezone("Asia/Kuala_Lumpur")
     scheduler = AsyncIOScheduler(timezone=timezone, misfire_grace_time=30)
