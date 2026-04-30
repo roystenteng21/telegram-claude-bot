@@ -2,7 +2,7 @@ import os
 import json
 import re
 import io
-import requests
+import httpx
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from telegram import Update
@@ -614,8 +614,9 @@ def run_infrastructure_setup():
         if not em_profile:
             raise Exception("Profile empty after load")
     except Exception:
+        # Brief pause before retry — acceptable at startup (sync context, not in event loop yet)
         import time as _time
-        _time.sleep(5)
+        _time.sleep(1)
         try:
             setup_em_profile()
             if not em_profile:
@@ -733,15 +734,15 @@ def sheets_call_with_retry(fn, *args, max_retries=2, **kwargs):
     """Wrap a Google Sheets API call with quota retry logic.
     Sleep is kept short (5s) — this is a sync function and cannot use asyncio.sleep.
     Quota errors are rare; long sleeps block the entire event loop."""
-    import time as _time
     for attempt in range(max_retries):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
             err_str = str(e).lower()
             if "quota" in err_str or "rate" in err_str or "429" in err_str:
-                print(f"Sheets quota hit — retrying in 5s (attempt {attempt+1})")
-                _time.sleep(5)
+                print(f"Sheets quota hit — retrying immediately (attempt {attempt+1})")
+                # No sleep here: sheets_call_with_retry is sync and called from async context.
+                # Sleeping here blocks the event loop. Quota hits are rare; immediate retry is fine.
             else:
                 raise
     raise Exception("Google Sheets rate limit exceeded after retries.")
@@ -886,19 +887,25 @@ def format_contact(r, show_private=False):
 
     return "\n".join(lines)
 
-# CRM record cache — invalidated on any write
+# CRM record cache — invalidated on any write; TTL: 5 minutes
 _crm_cache = None
+_crm_cache_ts = None
+_CRM_CACHE_TTL = 300  # seconds
 
 def _invalidate_crm_cache():
-    global _crm_cache
+    global _crm_cache, _crm_cache_ts
     _crm_cache = None
+    _crm_cache_ts = None
 
 def _get_crm_records():
-    """Return CRM records from cache, fetching from sheet if stale."""
-    global _crm_cache
-    if _crm_cache is None:
+    """Return CRM records from cache, fetching from sheet if stale or TTL expired."""
+    global _crm_cache, _crm_cache_ts
+    import time as _time
+    now = _time.monotonic()
+    if _crm_cache is None or _crm_cache_ts is None or (now - _crm_cache_ts) > _CRM_CACHE_TTL:
         sheet = crm_sheet()
         _crm_cache = sheet.get_all_records() if sheet else []
+        _crm_cache_ts = now
     return _crm_cache
 
 def find_row(name):
@@ -1688,7 +1695,7 @@ Rules:
 
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=300,
+            max_tokens=150,
             messages=[{"role": "user", "content": parse_prompt}]
         )
 
@@ -2020,30 +2027,6 @@ def tag_crm_contacts(text):
         print(f"tag_crm_contacts error: {e}")
         return []
 
-def process_meeting_notes(event_name, notes_list):
-    """Send all buffered notes to Claude and get a structured recap back as JSON."""
-    combined = "\n".join(notes_list)
-    prompt = (
-        f"You are processing meeting notes for an event called: {event_name or 'unknown event'}\n\n"
-        f"Here are the raw notes:\n{combined}\n\n"
-        f"Extract and return a JSON object with these fields:\n"
-        f"- event_name: string (use the provided event name, or infer if not given)\n"
-        f"- topic: string (1 line summary of what the meeting/event was about)\n"
-        f"- summary: string (2-4 sentences capturing key points, insights, context)\n"
-        f"- action_items: list of strings (only include if there are clear action items, otherwise empty list)\n"
-        f"- contacts_mentioned: list of strings (names of people mentioned)\n"
-        f"- foreign_phrases: dict (any non-English phrases found, key=original, value=English translation)\n\n"
-        f"Return ONLY the JSON object, no markdown, no preamble."
-    )
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=800,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = resp.content[0].text.strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
-
 def format_recap_confirmation(recap):
     """Format recap for user confirmation — no emoji on header line."""
     lines = []
@@ -2328,7 +2311,11 @@ def parse_reschedule_request(text, original_message):
         messages=[{"role": "user", "content": prompt}]
     )
     raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"parse_reschedule_request JSON error: {e} | raw: {raw[:100]}")
+        return None
 
 def add_reminder(message, scheduled_time_str, recurrence="once", contact=""):
     """Add a reminder to the Reminders sheet."""
@@ -2431,53 +2418,56 @@ async def check_and_fire_reminders(app):
 
             # Fire if within the current minute
             if scheduled <= now:
-                attempts = int(r.get("Attempts", 0))
-                message = r.get("Message", "")
-                recurrence = r.get("Recurrence", "once")
-                contact = r.get("Contact", "")
-                row = i + 2
+                try:
+                    attempts = int(r.get("Attempts", 0))
+                    message = r.get("Message", "")
+                    recurrence = r.get("Recurrence", "once")
+                    contact = r.get("Contact", "")
+                    row = i + 2
 
-                # Build reminder message (contact notes looked up from cache, not a fresh sheet read)
-                reminder_msg = f"🔔 Reminder: {message}"
-                if contact:
-                    crm_records = _get_crm_records()
-                    contact_l = contact.lower()
-                    matched = next((r for r in crm_records if r.get("Name", "").lower() == contact_l), None)
-                    if matched:
-                        notes = matched.get("Notes", "")
-                        if notes:
-                            reminder_msg += f"\n\n({contact}: {notes.split(';')[0].strip()})"
+                    # Build reminder message (contact notes looked up from cache, not a fresh sheet read)
+                    reminder_msg = f"🔔 Reminder: {message}"
+                    if contact:
+                        crm_records = _get_crm_records()
+                        contact_l = contact.lower()
+                        matched = next((r for r in crm_records if r.get("Name", "").lower() == contact_l), None)
+                        if matched:
+                            notes = matched.get("Notes", "")
+                            if notes:
+                                reminder_msg += f"\n\n({contact}: {notes.split(';')[0].strip()})"
 
-                await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=reminder_msg)
+                    await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=reminder_msg)
 
-                # Store as last fired for potential reschedule
-                last_fired_reminder[YOUR_CHAT_ID] = {
-                    "id": r.get("ID"),
-                    "message": message,
-                    "row": row
-                }
+                    # Store as last fired for potential reschedule
+                    last_fired_reminder[YOUR_CHAT_ID] = {
+                        "id": r.get("ID"),
+                        "message": message,
+                        "row": row
+                    }
 
-                if recurrence != "once":
-                    # Schedule next occurrence
-                    next_time = get_next_recurrence(scheduled_str, recurrence)
-                    sheet = reminders_sheet()
-                    if next_time:
-                        sheet.update_cell(row, 3, next_time)
-                        sheet.update_cell(row, 6, "0")  # reset attempts
+                    if recurrence != "once":
+                        # Schedule next occurrence
+                        next_time = get_next_recurrence(scheduled_str, recurrence)
+                        sheet = reminders_sheet()
+                        if next_time:
+                            sheet.update_cell(row, 3, next_time)
+                            sheet.update_cell(row, 6, "0")  # reset attempts
+                        else:
+                            sheet.update_cell(row, 5, "sent")
+                        _pending_reminders_cache = None  # invalidate cache after write
                     else:
-                        sheet.update_cell(row, 5, "sent")
-                    _pending_reminders_cache = None  # invalidate cache after write
-                else:
-                    # One-off: mark attempts, retry once after 2 hours if first attempt
-                    sheet = reminders_sheet()
-                    if attempts == 0:
-                        retry_time = (now + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M")
-                        sheet.update_cell(row, 3, retry_time)
-                        sheet.update_cell(row, 6, "1")
-                    else:
-                        # Second attempt done — mark sent and drop
-                        sheet.update_cell(row, 5, "sent")
-                    _pending_reminders_cache = None  # invalidate cache after write
+                        # One-off: mark attempts, retry once after 2 hours if first attempt
+                        sheet = reminders_sheet()
+                        if attempts == 0:
+                            retry_time = (now + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M")
+                            sheet.update_cell(row, 3, retry_time)
+                            sheet.update_cell(row, 6, "1")
+                        else:
+                            # Second attempt done — mark sent and drop
+                            sheet.update_cell(row, 5, "sent")
+                        _pending_reminders_cache = None  # invalidate cache after write
+                except Exception as e:
+                    print(f"check_and_fire_reminders: failed to fire reminder id={r.get('ID', '?')}: {e}")
 
     except Exception as e:
         print(f"Error in check_and_fire_reminders: {e}")
@@ -2554,6 +2544,8 @@ def handle_reschedule(text, user_id):
             return "Not sure which reminder you mean. Can you be more specific?"
 
         parsed = parse_reschedule_request(text, last["message"])
+        if not parsed:
+            return "Couldn't parse the reschedule — try 'remind me again in 2 hours'."
         new_time = parsed.get("scheduled_time", "")
         recurrence = parsed.get("recurrence", "once")
 
@@ -2590,6 +2582,8 @@ EXPENSE_CARDS = ["Citi", "Maybank", "Amex", "UOB"]  # fallback only — live lis
 
 # In-memory caches to avoid repeated Sheets API calls
 _merchant_cache = None          # list of dicts from Merchant Map sheet
+_merchant_cache_ts = None       # monotonic timestamp of last load
+_MERCHANT_CACHE_TTL = 300       # 5 minutes
 _card_names_cache = None        # list of card name strings
 _system_prompt_cache = None     # cached system prompt string
 _system_prompt_overseas_key = None  # tracks when to invalidate system prompt cache
@@ -2774,15 +2768,26 @@ def load_sessions_from_sheet():
         print(f"load_sessions_from_sheet error: {e}")
 
 class _AutoPersistDict(dict):
-    """Dict subclass that auto-persists to Settings sheet on every write/delete.
+    """Dict subclass that auto-persists to Settings sheet on write/delete.
+    Debounced: coalesces rapid successive writes into a single sheet call after 2s.
     persist_sessions_to_sheet must be defined before this class is instantiated."""
+    _timer = None
+
+    def _schedule_persist(self):
+        import threading
+        if _AutoPersistDict._timer is not None:
+            _AutoPersistDict._timer.cancel()
+        _AutoPersistDict._timer = threading.Timer(2.0, persist_sessions_to_sheet)
+        _AutoPersistDict._timer.daemon = True
+        _AutoPersistDict._timer.start()
+
     def __setitem__(self, key, value):
         super().__setitem__(key, value)
-        persist_sessions_to_sheet()
+        self._schedule_persist()
 
     def __delitem__(self, key):
         super().__delitem__(key)
-        persist_sessions_to_sheet()
+        self._schedule_persist()
 
 receipt_confirm_sessions = _AutoPersistDict()  # { user_id: { "merchant": str, "amount": float, ... } }
 todo_disambig_sessions = {}  # { user_id: { "tasks": list, "action": str } }
@@ -2883,7 +2888,8 @@ def get_fx_rate(currency):
     if EXCHANGE_RATE_API_KEY:
         try:
             url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_RATE_API_KEY}/pair/{currency}/SGD"
-            resp = requests.get(url, timeout=8)
+            with httpx.Client(timeout=8) as hx:
+                resp = hx.get(url)
             data = resp.json()
             if data.get("result") == "success":
                 rate = float(data["conversion_rate"])
@@ -3070,7 +3076,8 @@ async def refresh_fx_rates(app=None):
             if EXCHANGE_RATE_API_KEY:
                 try:
                     url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_RATE_API_KEY}/pair/{currency}/SGD"
-                    resp = requests.get(url, timeout=8)
+                    with httpx.Client(timeout=8) as hx:
+                        resp = hx.get(url)
                     data = resp.json()
                     if data.get("result") == "success":
                         rate = float(data["conversion_rate"])
@@ -3151,19 +3158,23 @@ def merchant_map_sheet():
     return spreadsheet.worksheet("Merchant Map")
 
 def _get_merchant_records():
-    """Return merchant map records from cache, loading from sheet if needed."""
-    global _merchant_cache
-    if _merchant_cache is None:
+    """Return merchant map records from cache, loading from sheet if needed or TTL expired."""
+    global _merchant_cache, _merchant_cache_ts
+    import time as _time
+    now = _time.monotonic()
+    if _merchant_cache is None or _merchant_cache_ts is None or (now - _merchant_cache_ts) > _MERCHANT_CACHE_TTL:
         try:
             _merchant_cache = merchant_map_sheet().get_all_records()
+            _merchant_cache_ts = now
         except Exception as e:
             print(f"_get_merchant_records error: {e}")
             return []
     return _merchant_cache
 
 def _invalidate_merchant_cache():
-    global _merchant_cache
+    global _merchant_cache, _merchant_cache_ts
     _merchant_cache = None
+    _merchant_cache_ts = None
 
 def get_merchant_memory(merchant):
     """Look up known merchant in Merchant Map. Returns (category, card, canonical_name) or (None, None, None)."""
@@ -3263,7 +3274,7 @@ def parse_expense_text_v2(text):
         return parsed
     except Exception as e:
         print(f"parse_expense_text Claude error: {e}")
-        raise
+        return None
 
 def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link="", reconciled="No", notes=""):
     """Append expense row to Expenses sheet. Returns True on success, False on failure."""
@@ -3274,6 +3285,7 @@ def log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_
             today, merchant, amount, currency, sgd_amount,
             category, card, receipt_link, reconciled, notes
         ])
+        _invalidate_expense_cache()
         return True
     except Exception as e:
         print(f"log_expense failed: {e}")
@@ -4087,20 +4099,31 @@ async def handle_expense_session(user_id, text, update):
 
 # _finalise_expense_session removed — was legacy dead code, use _finalise_receipt_confirm directly
 
+# In-memory cache for same-day duplicate detection: set of (date, merchant_lower, amount_str, currency)
+_same_day_expense_cache: set = set()
+_same_day_expense_cache_date: str = ""
 
+def _invalidate_expense_cache():
+    global _same_day_expense_cache, _same_day_expense_cache_date
+    _same_day_expense_cache = set()
+    _same_day_expense_cache_date = ""
 
 def check_same_day_duplicate(merchant, amount, currency):
-    """Return True if same merchant+amount+currency already logged today."""
+    """Return True if same merchant+amount+currency already logged today.
+    Uses in-memory cache populated on first call each day; invalidated on write."""
+    global _same_day_expense_cache, _same_day_expense_cache_date
+    today = date.today().strftime("%d/%m/%Y")
     try:
-        sheet = expenses_sheet()
-        records = sheet.get_all_records()
-        today = date.today().strftime("%d/%m/%Y")
-        for r in records:
-            if (r.get("Date") == today and
-                r.get("Merchant", "").lower() == merchant.lower() and
-                str(r.get("Amount", "")) == str(amount) and
-                r.get("Currency", "") == currency):
-                return True
+        if _same_day_expense_cache_date != today:
+            sheet = expenses_sheet()
+            records = sheet.get_all_records()
+            _same_day_expense_cache = {
+                (r.get("Date", ""), r.get("Merchant", "").lower(),
+                 str(r.get("Amount", "")), r.get("Currency", ""))
+                for r in records if r.get("Date") == today
+            }
+            _same_day_expense_cache_date = today
+        return (today, merchant.lower(), str(amount), currency) in _same_day_expense_cache
     except Exception as e:
         print(f"Duplicate check error: {e}")
     return False
@@ -4127,6 +4150,10 @@ def handle_expense_text(text, user_id, receipt_link="", last4=None):
     """
     try:
         parsed = parse_expense_text(text)
+        if not parsed:
+            return (
+                "Couldn't read that as an expense — try: 'Starbucks $5.60' or 'spent $12 on lunch'."
+            ), False, None
         merchant = parsed.get("merchant", "Unknown")
         try:
             amount = float(parsed.get("amount", 0) or 0)
@@ -4230,7 +4257,9 @@ def handle_expense_text(text, user_id, receipt_link="", last4=None):
         # Option B: auto-log only if everything known, no flags, AND it's a known merchant
         # New merchants always go through confirm screen
         if not missing and not high_amount and not use_manual_rate and not is_new_merchant:
-            log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
+            success = log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
+            if not success:
+                return "⚠️ Failed to save expense — please try again.", False, None
             save_merchant_memory(merchant, category, card)
             return format_expense_logged(merchant, amount, currency, category, card, sgd_amount, last4), False, None
 
@@ -4619,7 +4648,11 @@ def parse_bill_request(text):
         messages=[{"role": "user", "content": prompt}]
     )
     raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"parse_bill_request JSON error: {e} | raw: {raw[:100]}")
+        return None
 
 def add_bill(name, bank, due_day, estimated_amount, notes=""):
     """Add a bill to the Bills sheet."""
@@ -4975,7 +5008,8 @@ def get_restaurant_review(name):
             q = q_text.replace(" ", "+")
             url = f"https://news.google.com/rss/search?q={q}&hl=en-SG&gl=SG&ceid=SG:en"
             try:
-                resp = requests.get(url, timeout=5)
+                with httpx.Client(timeout=5) as hx:
+                    resp = hx.get(url)
                 root = ET.fromstring(resp.content)
                 for item in root.findall(".//item"):
                     if len(headlines) >= 4:
@@ -5111,7 +5145,8 @@ def get_similar_restaurants(text):
         try:
             query = f"best restaurants similar to {ref_name or text} Singapore".replace(" ", "+")
             url = f"https://news.google.com/rss/search?q={query}&hl=en-SG&gl=SG&ceid=SG:en"
-            resp = requests.get(url, timeout=3)
+            with httpx.Client(timeout=3) as hx:
+                resp = hx.get(url)
             root = ET.fromstring(resp.content)
             for item in root.findall(".//item")[:5]:
                 title = item.findtext("title", "").split(" - ")[0].strip()
@@ -5185,7 +5220,10 @@ def infer_restaurant_location(name, country="Singapore"):
             }]
         )
         raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return {"multiple_outlets": False, "outlets": []}
     except Exception as e:
         print(f"infer_restaurant_location error: {e}")
         return {"multiple_outlets": False, "outlets": []}
@@ -5397,9 +5435,9 @@ def fetch_weekly_change(ticker):
     """Fetch weekly % change — last Monday open to latest close via Yahoo Finance."""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1wk&range=1mo"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
+        with httpx.Client(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as hx:
+            resp = hx.get(url)
+        data = resp.json()
         result = data["chart"]["result"][0]
         closes = result["indicators"]["quote"][0].get("close", [])
         opens = result["indicators"]["quote"][0].get("open", [])
@@ -5426,7 +5464,8 @@ def fetch_price(ticker):
                 f"https://www.alphavantage.co/query"
                 f"?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}"
             )
-            resp = requests.get(url, timeout=10)
+            with httpx.Client(timeout=10) as hx:
+                resp = hx.get(url)
             data = resp.json()
             quote = data.get("Global Quote", {})
             if quote.get("05. price"):
@@ -5455,9 +5494,9 @@ def fetch_price(ticker):
     # --- Yahoo Finance fallback ---
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1y"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
+        with httpx.Client(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as hx:
+            resp = hx.get(url)
+        data = resp.json()
         result = data["chart"]["result"][0]
         meta = result["meta"]
         price = meta.get("regularMarketPrice", 0)
@@ -5549,7 +5588,8 @@ def _fetch_rss_headlines_for_stock(ticker, name):
 
     def fetch_one(url):
         try:
-            resp = requests.get(url, timeout=3)
+            with httpx.Client(timeout=3) as hx:
+                resp = hx.get(url)
             root = ET.fromstring(resp.content)
             results = []
             for item in root.findall(".//item"):
@@ -5792,6 +5832,7 @@ def format_trip_history():
     return "\n\n".join(lines)
 
 
+def log_portfolio_buy(ticker, quantity, price, buy_date=None):
     """Log a stock purchase to Portfolio sheet."""
     sheet = portfolio_sheet()
     today = buy_date or date.today().strftime("%d/%m/%Y")
@@ -5805,8 +5846,14 @@ def get_portfolio_holdings():
         holdings = {}
         for r in records:
             ticker = r.get("Stock", "").upper()
-            qty = float(r.get("Quantity", 0))
-            price = float(r.get("Buy Price", 0))
+            if not ticker:
+                continue
+            try:
+                qty = float(r.get("Quantity", 0))
+                price = float(r.get("Buy Price", 0))
+            except (ValueError, TypeError):
+                print(f"get_portfolio_holdings: bad qty/price for {ticker}, skipping row")
+                continue
             if ticker not in holdings:
                 holdings[ticker] = {"total_qty": 0, "total_cost": 0}
             holdings[ticker]["total_qty"] += qty
@@ -5936,7 +5983,11 @@ def parse_stock_request(text):
         messages=[{"role": "user", "content": prompt}]
     )
     raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
-    parsed = json.loads(raw)
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"parse_stock_request JSON error: {e} | raw: {raw[:100]}")
+        return None
     if parsed.get("ticker"):
         parsed["ticker"] = normalise_ticker(parsed["ticker"])
     return parsed
@@ -6071,6 +6122,8 @@ def handle_stock_request(text):
     """Route a stock request to the right handler."""
     try:
         parsed = parse_stock_request(text)
+        if not parsed:
+            return "Couldn't parse that stock request — try again with a ticker or clearer intent."
         intent = parsed.get("intent", "")
         ticker = parsed.get("ticker", "").upper()
 
@@ -6256,7 +6309,8 @@ def fetch_market_rss_headlines(market_name):
             q = q_text.replace(" ", "+")
             url = f"https://news.google.com/rss/search?q={q}&hl=en-SG&gl=SG&ceid=SG:en"
             try:
-                resp = requests.get(url, timeout=5)
+                with httpx.Client(timeout=5) as hx:
+                    resp = hx.get(url)
                 root = ET.fromstring(resp.content)
                 for item in root.findall(".//item"):
                     if len(headlines) >= 3:
@@ -7292,13 +7346,12 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 ts["step"] = "dep_time"
                 if AVIATIONSTACK_API_KEY and fn:
                     # Try AviationStack
-                    import requests as _req
                     try:
-                        resp = _req.get(
-                            "http://api.aviationstack.com/v1/flights",
-                            params={"access_key": AVIATIONSTACK_API_KEY, "flight_iata": fn},
-                            timeout=10
-                        )
+                        with httpx.Client(timeout=10) as hx:
+                            resp = hx.get(
+                                "http://api.aviationstack.com/v1/flights",
+                                params={"access_key": AVIATIONSTACK_API_KEY, "flight_iata": fn}
+                            )
                         data = resp.json()
                         flights = data.get("data", [])
                         if flights:
@@ -8169,6 +8222,12 @@ async def post_init(app):
     global _scheduler, _app_ref
     # Run infrastructure setup and capture health status
     health = run_infrastructure_setup()
+
+    # Warm card names cache on startup
+    try:
+        get_cards_live()
+    except Exception as e:
+        print(f"Startup: card cache warm failed: {e}")
 
     # Restore overseas mode if there was an active trip before restart
     restore_overseas_from_trips()
