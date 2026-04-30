@@ -1958,7 +1958,10 @@ def check_birthday_acknowledgement(text):
         return False, None
 
     lower = text.strip().lower()
-    if lower not in ["sent", "done", "skip", "skipped", "sent it", "sent!"]:
+    if lower not in ["sent", "done", "skip", "skipped", "sent it", "sent!",
+                     "yeah sent it", "already sent", "ok done", "yep sent",
+                     "yup sent", "sent already", "done already", "ok skip",
+                     "yeah skip", "just sent", "just sent it"]:
         return False, None
 
     acknowledged = []
@@ -2481,6 +2484,8 @@ def is_reminder_request(text):
         "remind me", "remind", "set a reminder", "set me a reminder",
         "reminder for", "reminder at", "reminder to",
         "don't let me forget", "dont let me forget",
+        "i need to remember to", "i need to remember",
+        "don't let me forget to", "dont let me forget to",
         "alert me when", "alert me to",
         "notify me when", "notify me about", "notify me to",
         "ping me at", "ping me when", "ping me to",
@@ -7637,7 +7642,11 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = list_contacts()
     elif lower == "stats":
         reply = get_stats()
-    elif lower == "followups":
+    elif lower == "followups" or lower in [
+        "show my followups", "show followups", "pending followups",
+        "what followups do i have", "my followups", "list followups",
+        "upcoming followups", "show my follow ups", "what are my followups"
+    ]:
         reply = upcoming_followups()
     elif lower == "overdue":
         reply = overdue_followups()
@@ -7917,8 +7926,14 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = result
 
     # Todo Commands
-    elif lower.startswith("todo "):
-        reply = add_todo(text[5:])
+    elif any(lower.startswith(p) for p in [
+        "todo ", "add task ", "new task ", "create todo ",
+        "add todo ", "add to my list ", "add to my todo "
+    ]):
+        for p in ["todo ", "add task ", "new task ", "create todo ", "add todo ", "add to my list ", "add to my todo "]:
+            if lower.startswith(p):
+                reply = add_todo(text[len(p):])
+                break
     elif lower.startswith("done "):
         result = complete_todo(text[5:])
         if result.startswith("_DISAMBIG_TODO_COMPLETE_:"):
@@ -8006,9 +8021,35 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             "Just tell me naturally — 'schedule dinner tomorrow 7pm' or 'add event'\n"
             "events today / events week / delete event\n\n"
             "*To-Do:*\n"
-            "todo, done, todos\n\n"
+            "todo [task] / add task [task] / new task [task]\n"
+            "done [task] — mark complete\n"
+            "todos — list all\n\n"
+            "*Expenses:*\n"
+            "log [merchant] [amount] — or just send a receipt photo\n"
+            "last expense / edit last expense / delete last expense\n"
+            "monthly summary / expense categories\n\n"
+            "*Reminders:*\n"
+            "remind me to [task] at [time] — or 'don't let me forget to [task]'\n"
+            "reminders — list pending\n"
+            "cancel reminder [keyword]\n\n"
+            "*Bills:*\n"
+            "add bill / bills due / delete bill\n\n"
+            "*Stocks:*\n"
+            "how is [ticker] doing / price of [ticker] / check [ticker]\n"
+            "my portfolio / add to portfolio / market summary\n"
+            "alert me if [ticker] hits [price]\n\n"
+            "*Restaurants:*\n"
+            "save restaurant [name] / restaurants / review [name]\n"
+            "suggest restaurant [cuisine/area]\n\n"
+            "*Trips & Overseas:*\n"
+            "now in [country] — activate overseas mode\n"
+            "flying [flight number] — log a flight\n"
+            "trip summary / close trip\n\n"
+            "*Meeting Recap:*\n"
+            "meeting recap — then send your notes\n\n"
             "*Other:*\n"
-            "em status — check Em's health\n\n"
+            "em status — check Em's health\n"
+            "dnd on / dnd off — do not disturb\n\n"
             "Or just chat — I'll figure it out 👍"
         )
 
