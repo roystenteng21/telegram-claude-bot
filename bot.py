@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 import re
 import io
@@ -409,7 +410,7 @@ def get_pending_backlog():
             lines.append(f"{priority} {item}{stage_str}")
         return "\n".join(lines)
     except Exception as e:
-        return f"Couldn't read backlog: {e}"
+        return f"❌ Couldn't read backlog: {e}"
 
 
 def _migrate_crm_headers(ws, old_headers, new_headers):
@@ -1824,6 +1825,44 @@ async def send_followup_reminders(app):
 # Tracks who got a 12pm prompt today, pending acknowledgement
 birthday_pending = {}
 
+def persist_birthday_pending():
+    """Persist birthday_pending to Settings sheet. Fire-and-forget — never raises."""
+    try:
+        sheet = get_sheet("Settings")
+        if not sheet:
+            return
+        today_str = date.today().strftime("%d/%m/%Y")
+        data = json.dumps({"date": today_str, "pending": birthday_pending})
+        records = sheet.get_all_records()
+        for i, r in enumerate(records):
+            if r.get("Key") == "birthday_pending":
+                sheet.update_cell(i + 2, 2, data)
+                return
+        sheet.append_row(["birthday_pending", data])
+    except Exception as e:
+        print(f"persist_birthday_pending error: {e}")
+
+def load_birthday_pending_from_sheet():
+    """Restore birthday_pending from Settings sheet on startup. Only restore if date matches today."""
+    global birthday_pending
+    try:
+        sheet = get_sheet("Settings")
+        if not sheet:
+            return
+        records = sheet.get_all_records()
+        for r in records:
+            if r.get("Key") == "birthday_pending":
+                raw = r.get("Value", "")
+                if raw:
+                    loaded = json.loads(raw)
+                    if loaded.get("date") == date.today().strftime("%d/%m/%Y"):
+                        birthday_pending = loaded.get("pending", {})
+                        if birthday_pending:
+                            print(f"Restored {len(birthday_pending)} birthday pending(s) from sheet")
+                return
+    except Exception as e:
+        print(f"load_birthday_pending_from_sheet error: {e}")
+
 def ensure_birthday_greeted_column():
     """Birthday Greeted is col 10 in new CRM schema — nothing to add."""
     pass  # Column already defined in new header structure
@@ -1833,7 +1872,7 @@ def get_birthday_greeted_col():
     return 10
 
 def generate_birthday_greeting(name, age, relationship, context, notes):
-    """Generate a personalised birthday greeting via Claude."""
+    """Generate a personalised birthday greeting via Claude. Runs sync — call via asyncio.to_thread."""
     context_str = f"Relationship: {relationship}. Context: {context}. Notes: {notes or 'none'}."
     greeting_prompt = (
         f"Write a warm, casual birthday greeting that someone could copy and paste to send to {name}, "
@@ -1851,7 +1890,7 @@ def generate_birthday_greeting(name, age, relationship, context, notes):
     )
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-haiku-4-5-20251001",
             max_tokens=200,
             messages=[{"role": "user", "content": greeting_prompt}]
         )
@@ -1888,7 +1927,9 @@ async def send_birthday_reminders(app):
                 if already_greeted == today.strftime("%d/%m/%Y"):
                     continue
 
-                greeting = generate_birthday_greeting(name, age, relationship, context, notes)
+                greeting = await asyncio.to_thread(
+                    generate_birthday_greeting, name, age, relationship, context, notes
+                )
 
                 msg = (
                     f"It's {name}'s birthday today! Turning {age}. 🎂\n\n"
@@ -1903,6 +1944,7 @@ async def send_birthday_reminders(app):
                     "greeted": False,
                     "greeting": greeting
                 }
+                persist_birthday_pending()
                 print(f"Birthday prompt sent for {name}")
 
             except Exception as e:
@@ -1930,6 +1972,7 @@ async def send_birthday_followups(app):
                 print(f"Error sending 2pm follow-up for {name}: {e}")
 
         birthday_pending = {}
+        persist_birthday_pending()
 
     except Exception as e:
         print(f"Error in send_birthday_followups: {e}")
@@ -1976,6 +2019,7 @@ def check_birthday_acknowledgement(text):
                 acknowledged.append(f"Marked {name} as greeted ✅")
 
     if acknowledged:
+        persist_birthday_pending()
         return True, "\n".join(acknowledged)
     return False, None
 
@@ -2574,7 +2618,7 @@ def handle_reschedule(text, user_id):
         return f"Got it, I'll remind you about {last['message']} again on {time_str}."
 
     except Exception as e:
-        return f"Couldn't reschedule: {str(e)}"
+        return f"❌ Couldn't reschedule: {str(e)}"
 
 
 
@@ -2666,7 +2710,7 @@ def set_card_default_category(card_name, category):
                 return f"Updated — {card_name} will now default to {category} ✅"
         return f"Card '{card_name}' not found. Your cards: {', '.join(get_card_names_live())}"
     except Exception as e:
-        return f"Couldn't update card default: {str(e)}"
+        return f"❌ Couldn't update card default: {str(e)}"
 
 def fuzzy_match_card(text):
     """Fuzzy match text against card names. Returns (matched_name, exact) or (None, False)."""
@@ -2726,6 +2770,41 @@ overseas_state = {
     "trip_start": None,        # date string DD/MM/YYYY when overseas mode activated
     "trip_destinations": [],   # list of destinations visited this trip
 }
+
+def persist_trip_setup():
+    """Persist _trip_setup state to Settings sheet. Fire-and-forget — never raises."""
+    try:
+        sheet = get_sheet("Settings")
+        if not sheet:
+            return
+        ts = overseas_state.get("_trip_setup")
+        data = json.dumps(ts) if ts else ""
+        records = sheet.get_all_records()
+        for i, r in enumerate(records):
+            if r.get("Key") == "trip_setup_state":
+                sheet.update_cell(i + 2, 2, data)
+                return
+        sheet.append_row(["trip_setup_state", data])
+    except Exception as e:
+        print(f"persist_trip_setup error: {e}")
+
+def load_trip_setup_from_sheet():
+    """Restore _trip_setup state from Settings sheet on startup."""
+    try:
+        sheet = get_sheet("Settings")
+        if not sheet:
+            return
+        records = sheet.get_all_records()
+        for r in records:
+            if r.get("Key") == "trip_setup_state":
+                raw = r.get("Value", "")
+                if raw:
+                    ts = json.loads(raw)
+                    overseas_state["_trip_setup"] = ts
+                    print(f"Restored _trip_setup from sheet: step={ts.get('step')}")
+                return
+    except Exception as e:
+        print(f"load_trip_setup_from_sheet error: {e}")
 
 # Global scheduler reference (set in post_init)
 _scheduler = None
@@ -3242,7 +3321,7 @@ def delete_merchant(merchant_name):
         lines.append("\nReply \'delete merchant [exact name]\' to remove a specific one.")
         return "\n".join(lines)
     except Exception as e:
-        return f"Error deleting merchant: {e}"
+        return f"❌ Error deleting merchant: {e}"
 
 def parse_expense_text(text):
     """Redirect to v2 which uses live category/card lists."""
@@ -3418,7 +3497,7 @@ def get_monthly_summary(month=None, year=None):
 
         return "\n".join(lines)
     except Exception as e:
-        return f"Error generating summary: {str(e)}"
+        return f"❌ Error generating summary: {str(e)}"
 
 def is_log_prefix_input(text):
     """Detect 'log [merchant] [amount]' — always routes to expense flow."""
@@ -3479,7 +3558,7 @@ def get_merchant_list():
             lines.append("")
         return "\n".join(lines).strip()
     except Exception as e:
-        return f"Error fetching merchants: {e}"
+        return f"❌ Error fetching merchants: {e}"
 
 def is_expense_input(text):
     """Detect if message looks like an expense entry or expense question."""
@@ -3720,7 +3799,9 @@ def handle_overseas_request(text):
 
     if dest_hint:
         overseas_state["_trip_setup"]["step"] = "check_in"
+        persist_trip_setup()
         return f"Got it — {dest_hint} 🌏\nCheck-in date? (or 'skip')"
+    persist_trip_setup()
     return "Where are you headed?"
 
 
@@ -3744,6 +3825,7 @@ async def _send_trip_confirm(update, ts):
 
     ts["step"] = "confirm"
     overseas_state["_trip_setup"] = ts
+    persist_trip_setup()
     try:
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception:
@@ -4311,7 +4393,7 @@ def delete_last_expense():
         sheet.delete_rows(last_row)
         return f"Deleted last expense: {last[1]} ${last[2]}"
     except Exception as e:
-        return f"Error deleting expense: {str(e)}"
+        return f"❌ Error deleting expense: {str(e)}"
 
 def get_recent_expenses(n=5):
     """Return the last N expense rows as list of (sheet_row_index, dict)."""
@@ -4494,7 +4576,7 @@ def edit_last_expense(edit_text):
                                      float(sgd_amount) if sgd_amount else None)
 
     except Exception as e:
-        return f"Error editing expense: {str(e)}"
+        return f"❌ Error editing expense: {str(e)}"
 
 
 
@@ -4567,7 +4649,7 @@ def get_trip_summary():
                 lines.append(f"{curr}: {amt:,.0f}")
         return "\n".join(lines)
     except Exception as e:
-        return f"Error generating trip summary: {str(e)}"
+        return f"❌ Error generating trip summary: {str(e)}"
 
 def rename_category(old_name, new_name):
     """Rename a category everywhere — category list, Merchant Map, Expenses sheet."""
@@ -4678,7 +4760,7 @@ def list_bills():
             lines.append(f"• {r.get('Name', '')} (due day {r.get('Due Date', '')}){amt_str}")
         return "\n".join(lines)
     except Exception as e:
-        return f"Error listing bills: {str(e)}"
+        return f"❌ Error listing bills: {str(e)}"
 
 def delete_bill(name):
     """Delete a bill by name."""
@@ -4691,7 +4773,7 @@ def delete_bill(name):
                 return f"Deleted bill: {r.get('Name')}"
         return f"No bill found matching '{name}'."
     except Exception as e:
-        return f"Error deleting bill: {str(e)}"
+        return f"❌ Error deleting bill: {str(e)}"
 
 def get_cycle_expenses(card_name, due_day):
     """Sum expenses for a card in the current billing cycle."""
@@ -4797,7 +4879,7 @@ def handle_new_bill(text):
         amt_str = f", estimated ~${estimated_amount}" if estimated_amount else ""
         return f"Got it, I'll remind you about your {name} bill 7 days before it's due (day {due_day} of each month{amt_str})."
     except Exception as e:
-        return f"Couldn't save that bill: {str(e)}"
+        return f"❌ Couldn't save that bill: {str(e)}"
 
 
 # =============================================================================
@@ -4911,7 +4993,7 @@ def search_restaurants(query):
             lines.append(line)
         return "\n".join(lines)
     except Exception as e:
-        return f"Error searching restaurants: {str(e)}"
+        return f"❌ Error searching restaurants: {str(e)}"
 
 def list_restaurants(country_filter=None):
     """List all saved restaurants, optionally filtered by country."""
@@ -4935,7 +5017,7 @@ def list_restaurants(country_filter=None):
             lines.append(line)
         return "\n".join(lines)
     except Exception as e:
-        return f"Error listing restaurants: {str(e)}"
+        return f"❌ Error listing restaurants: {str(e)}"
 
 def delete_restaurant(name):
     """Delete a restaurant by name."""
@@ -4948,7 +5030,7 @@ def delete_restaurant(name):
                 return f"Removed {r.get('Name')} from your list."
         return f"No restaurant found matching '{name}'."
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"❌ Error: {str(e)}"
 
 def is_restaurant_review_request(text):
     """Detect restaurant review request intent. Avoids colliding with CRM contact lookup."""
@@ -5113,6 +5195,11 @@ def get_restaurant_review(name):
 def is_restaurant_suggestion_request(text):
     """Detect similar restaurant suggestion request."""
     lower = text.lower()
+    # Explicit suggest restaurant command
+    if re.match(r"suggest restaurant", lower):
+        return True
+    if re.match(r"recommend (a )?restaurant", lower):
+        return True
     triggers = ["similar to", "like ", "anything like", "places like",
                 "restaurants like", "something like", "alternatives to", "similar places"]
     return any(t in lower for t in triggers)
@@ -5123,12 +5210,17 @@ def get_similar_restaurants(text):
         import xml.etree.ElementTree as ET
         lower = text.lower()
         ref_name = None
-        for trigger in ["similar to", "like ", "anything like", "places like",
-                        "restaurants like", "something like", "alternatives to", "similar places to"]:
-            if trigger in lower:
-                idx = lower.index(trigger) + len(trigger)
-                ref_name = text[idx:].strip().rstrip("?").strip()
-                break
+        # Handle explicit "suggest restaurant [cuisine/area]" or "recommend restaurant [type]"
+        explicit_match = re.match(r"(?:suggest|recommend)(?: a)? restaurant[s]?\s+(.*)", lower)
+        if explicit_match:
+            ref_name = explicit_match.group(1).strip().rstrip("?").strip()
+        else:
+            for trigger in ["similar to", "like ", "anything like", "places like",
+                            "restaurants like", "something like", "alternatives to", "similar places to"]:
+                if trigger in lower:
+                    idx = lower.index(trigger) + len(trigger)
+                    ref_name = text[idx:].strip().rstrip("?").strip()
+                    break
 
         # Look up tags from saved sheet
         context = ""
@@ -5279,7 +5371,7 @@ def handle_save_restaurant(text, force_new=False):
         return f"_INFER_LOCATION_:{name}:{country}:{tags}:{int(multiple)}:" + "|".join(outlets)
 
     except Exception as e:
-        return f"Couldn't save that restaurant: {str(e)}"
+        return f"❌ Couldn't save that restaurant: {str(e)}"
 
 def handle_search_restaurants(text):
     """Handle a restaurant search request."""
@@ -5302,7 +5394,7 @@ def handle_search_restaurants(text):
         # Fallback — search by full text
         return search_restaurants(text)
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"❌ Error: {str(e)}"
 
 
 
@@ -6473,7 +6565,7 @@ async def handle_statement_upload(file_bytes, fname, user_id, update):
                 statement_rows.append(dict(zip(headers, row)))
 
         if not statement_rows:
-            await update.message.reply_text("Couldn't read any rows from that file.")
+            await update.message.reply_text("❌ Couldn't read any rows from that file.")
             return
 
         # Use Claude to normalise statement columns
@@ -6494,7 +6586,7 @@ async def handle_statement_upload(file_bytes, fname, user_id, update):
         amt_col = col_map.get("amount")
 
         if not all([date_col, desc_col, amt_col]):
-            await update.message.reply_text("Couldn't identify date/description/amount columns. Try a CSV with clear headers.")
+            await update.message.reply_text("❌ Couldn't identify date/description/amount columns. Try a CSV with clear headers.")
             return
 
         # Load logged expenses
@@ -6564,6 +6656,8 @@ async def handle_statement_upload(file_bytes, fname, user_id, update):
             lines.extend(f"  {m}" for m in missing[:10])
             if len(missing) > 10:
                 lines.append(f"  ...and {len(missing) - 10} more")
+            lines.append("\nReply 'log [expense]' to log the first unmatched item, 'skip' to go through them, or 'done' to close.")
+            recon_sessions[user_id] = {"step": "review", "unmatched": missing, "index": 0}
         if not corrections and not missing:
             lines.append("Everything matches up.")
 
@@ -6956,6 +7050,14 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     text = update.message.text.strip()
     lower = text.lower()
 
+    # --- DND intercept — hold messages while DND is active ---
+    if em_profile.get("dnd_active") and lower not in ("dnd off", "dnd on"):
+        held = em_profile.get("dnd_held_messages", [])
+        held.append({"text": text, "time": datetime.now(TIMEZONE).strftime("%H:%M")})
+        em_profile["dnd_held_messages"] = held
+        save_em_profile()
+        return  # silently hold — no reply while DND active
+
     # Check birthday acknowledgement — explicit sent/skip only
     bday_handled, bday_reply = check_birthday_acknowledgement(text)
     if bday_handled:
@@ -7132,11 +7234,11 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if lower in ["new", "save new", "save as new"]:
             del pending_contact_saves[user_id]
             reply = save_contact(pcs["data"], force_new=True)
-            await update.message.reply_text(reply)
+            await send_safe(update.message, reply, parse_mode="Markdown")
         elif lower in ["update", "update existing"]:
             del pending_contact_saves[user_id]
             reply = f"Opening {pcs['existing_name']} for editing — use 'edit {pcs['existing_name']}' to update fields."
-            await update.message.reply_text(reply)
+            await send_safe(update.message, reply, parse_mode="Markdown")
         elif lower in ["skip", "s", "cancel", "no", "n", "nope", "nah"]:
             del pending_contact_saves[user_id]
             await update.message.reply_text("Skipped.")
@@ -7216,7 +7318,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     sheet_row, _ = expenses[idx]
                     reply = delete_expense_by_row(sheet_row)
                     del delete_sessions[user_id]
-                    await update.message.reply_text(reply)
+                    await send_safe(update.message, reply, parse_mode="Markdown")
                 else:
                     await update.message.reply_text("Invalid number. Try again or 'search [merchant]'.")
                 return
@@ -7230,7 +7332,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     sheet_row, r = results[0]
                     reply = delete_expense_by_row(sheet_row)
                     del delete_sessions[user_id]
-                    await update.message.reply_text(reply)
+                    await send_safe(update.message, reply, parse_mode="Markdown")
                 else:
                     delete_sessions[user_id] = {"step": "pick", "expenses": results}
                     await update.message.reply_text(format_delete_list(results))
@@ -7263,7 +7365,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 reply = delete_calendar_event(args[0])
             else:
                 reply = "Done."
-            await update.message.reply_text(reply)
+            await send_safe(update.message, reply, parse_mode="Markdown")
         elif lower in ["no", "n", "cancel"]:
             del confirm_sessions[user_id]
             session_timestamps.pop(user_id, None)
@@ -7314,12 +7416,53 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await handle_edit_session(user_id, text, update)
         return
 
+    # Handle active reconciliation session
+    if user_id in recon_sessions:
+        touch_session(user_id)
+        rs = recon_sessions[user_id]
+        step = rs.get("step")
+        unmatched = rs.get("unmatched", [])
+        idx = rs.get("index", 0)
+        if lower in ["done", "skip all", "close"]:
+            del recon_sessions[user_id]
+            await update.message.reply_text("Reconciliation session closed ✅")
+        elif lower.startswith("log "):
+            # User wants to log an unmatched item as an expense
+            log_text = text[4:].strip()
+            reply_str, needs_session, session_data = handle_expense_text(log_text, user_id)
+            if needs_session and session_data:
+                expense_sessions[user_id] = session_data
+            del recon_sessions[user_id]
+            await send_safe(update.message, reply_str, parse_mode="Markdown")
+        elif lower in ["skip", "next", "s"]:
+            rs["index"] = idx + 1
+            if rs["index"] < len(unmatched):
+                await update.message.reply_text(
+                    f"Next unmatched ({rs['index']+1}/{len(unmatched)}):\n{unmatched[rs['index']]}\n\nReply 'log [expense]' to log, 'skip' for next, or 'done' to close."
+                )
+            else:
+                del recon_sessions[user_id]
+                await update.message.reply_text("All unmatched items reviewed ✅")
+        else:
+            if idx < len(unmatched):
+                await update.message.reply_text(
+                    f"Unmatched item ({idx+1}/{len(unmatched)}):\n{unmatched[idx]}\n\nReply 'log [expense]' to log it, 'skip' for next, or 'done' to close."
+                )
+            else:
+                del recon_sessions[user_id]
+                await update.message.reply_text("All unmatched items reviewed ✅")
+        return
+
     # Trip setup session — step-by-step collection
     if overseas_state.get("_trip_setup"):
         ts = overseas_state["_trip_setup"]
         step = ts.get("step", "destination")
         t = text.strip()
         skipped = t.lower() in ("skip", "s", "-", "later", "idk", "not sure")
+
+        # Persist trip setup state on every step so it survives restarts
+        overseas_state["_trip_setup"] = ts
+        persist_trip_setup()
 
         if step == "destination":
             if not t:
@@ -7452,6 +7595,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         elif step == "confirm":
             if t.upper() == "Y":
                 overseas_state.pop("_trip_setup", None)
+                persist_trip_setup()
                 dest = ts.get("destination", "Unknown")
                 curr = ts.get("currency", "SGD")
                 check_in = ts.get("check_in", "")
@@ -7502,9 +7646,10 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                         f"Destination: {dest} ({curr})\n"
                         f"I\'ll send a confirmation when it kicks in."
                     )
-                await update.message.reply_text(reply)
+                await send_safe(update.message, reply, parse_mode="Markdown")
             else:
                 overseas_state.pop("_trip_setup", None)
+                persist_trip_setup()
                 await update.message.reply_text("Trip setup cancelled.")
             return
 
@@ -7604,6 +7749,25 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             del receipt_confirm_sessions[user_id]
         session_timestamps.pop(user_id, None)
         reply = "Cancelled."
+
+    # DND commands
+    elif lower == "dnd on":
+        em_profile["dnd_active"] = True
+        em_profile["dnd_held_messages"] = []
+        save_em_profile()
+        reply = "DND on — holding all messages until you turn it off."
+    elif lower == "dnd off":
+        em_profile["dnd_active"] = False
+        held = em_profile.get("dnd_held_messages", [])
+        em_profile["dnd_held_messages"] = []
+        save_em_profile()
+        if held:
+            lines = [f"DND off. {len(held)} message(s) held while you were away:\n"]
+            for m in held:
+                lines.append(f"[{m['time']}] {m['text']}")
+            reply = "\n".join(lines)
+        else:
+            reply = "DND off."
 
     # Profile
     elif lower == "reload profile":
@@ -7737,7 +7901,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif lower.startswith("delete merchant ") or lower.startswith("remove merchant ") or lower.startswith("forget merchant "):
         merchant_name = text.split(" ", 2)[2].strip()
         reply = delete_merchant(merchant_name)
-    elif lower in ["expense report", "monthly report", "spending report", "expenses"]:
+    elif lower in ["expense report", "monthly report", "spending report", "expenses",
+                   "monthly summary", "monthly spend", "this month", "expense summary"]:
         reply = get_expense_report()
     elif lower in ["delete last expense", "remove last expense"]:
         reply = delete_last_expense()
@@ -7767,6 +7932,13 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = get_trip_summary()
     elif lower in ["trip history", "my trips", "past trips", "trips"]:
         reply = format_trip_history()
+    elif lower == "close trip":
+        if overseas_state.get("active"):
+            deactivate_overseas_mode()
+            reply = "Trip closed. Back to SG mode. 🏠"
+        else:
+            closed = close_trip()
+            reply = "Trip closed ✅" if closed else "No active trip to close."
     elif lower in ["current trip", "active trip", "am i overseas", "overseas status"]:
         if overseas_state.get("active"):
             dest = overseas_state.get("destination", "Unknown")
@@ -7831,7 +8003,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if needs_session and session_data:
             expense_sessions[user_id] = session_data
 
-    elif lower in ["bills", "my bills", "list bills"]:
+    elif lower in ["bills", "my bills", "list bills", "bills due", "what bills do i have",
+                   "upcoming bills", "show bills"]:
         reply = list_bills()
     elif lower.startswith("delete bill "):
         bill_name = text[12:].strip()
@@ -8107,24 +8280,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         conversation_histories[user_id].append({"role": "assistant", "content": reply})
 
     if not reply:
-        try:
-            fallback_response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=300,
-                system=(
-                    "You are Em, a personal assistant bot built in Python using python-telegram-bot and the Anthropic API. "
-                    "The user just sent a message that no handler in the bot code recognised — it fell through everything. "
-                    "Acknowledge you couldn't handle it in one short sentence (casual, no corporate speak). "
-                    "Then suggest one concrete thing the developer could add to the bot to support this — "
-                    "be specific about what kind of handler, function, or API would help. "
-                    "Keep it to 2-3 sentences total. No bullet points."
-                ),
-                messages=[{"role": "user", "content": text}]
-            )
-            reply = fallback_response.content[0].text
-        except Exception as e:
-            print(f"Fallback Claude call failed: {e}")
-            reply = "Not sure how to handle that one — might be worth adding a handler for it in the bot code."
+        reply = "Not sure what you mean — try rephrasing, or say 'help' to see what I can do."
 
     if reply:
         await send_safe(update.message, reply, parse_mode="Markdown")
@@ -8142,8 +8298,7 @@ async def check_missed_items_on_startup(app):
 
         # Missed follow-ups
         try:
-            sheet = crm_sheet()
-            records = sheet.get_all_records()
+            records = _get_crm_records()
             for r in records:
                 fu_date_str = r.get("Follow Up Date", "")
                 if fu_date_str:
@@ -8283,6 +8438,12 @@ async def post_init(app):
 
     # Restore pending expense sessions from Settings sheet
     load_sessions_from_sheet()
+
+    # Restore birthday pending from Settings sheet
+    load_birthday_pending_from_sheet()
+
+    # Restore trip setup state from Settings sheet
+    load_trip_setup_from_sheet()
 
     timezone = pytz.timezone("Asia/Kuala_Lumpur")
     scheduler = AsyncIOScheduler(timezone=timezone, misfire_grace_time=30)
