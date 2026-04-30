@@ -1687,7 +1687,7 @@ Rules:
 - If no calendar specified, use Personal"""
 
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-haiku-4-5-20251001",
             max_tokens=300,
             messages=[{"role": "user", "content": parse_prompt}]
         )
@@ -2300,7 +2300,7 @@ def parse_reminder_request(text):
     )
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-haiku-4-5-20251001",
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -2323,7 +2323,7 @@ def parse_reschedule_request(text, original_message):
         f"Return ONLY the JSON."
     )
     resp = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=100,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -3133,7 +3133,7 @@ def get_merchant_emoji(category, merchant):
             return _category_emoji_cache[category]
         try:
             resp = client.messages.create(
-                model="claude-sonnet-4-6",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=5,
                 messages=[{"role": "user", "content": f"Return a single emoji that best represents the expense category '{category}'. Return ONLY the emoji, nothing else."}]
             )
@@ -4614,7 +4614,7 @@ def parse_bill_request(text):
         f"Return ONLY the JSON."
     )
     resp = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -4782,7 +4782,7 @@ def parse_restaurant_save(text):
         f"Return ONLY the JSON."
     )
     resp = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -4802,7 +4802,7 @@ def lookup_restaurant_from_maps(url):
     )
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-haiku-4-5-20251001",
             max_tokens=150,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -5931,7 +5931,7 @@ def parse_stock_request(text):
         f"Return ONLY the JSON."
     )
     resp = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -6424,7 +6424,7 @@ async def handle_statement_upload(file_bytes, fname, user_id, update):
             f"If a column doesn't exist, use null."
         )
         norm_resp = client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=100,
+            model="claude-haiku-4-5-20251001", max_tokens=100,
             messages=[{"role": "user", "content": norm_prompt}]
         )
         col_map = json.loads(norm_resp.content[0].text.strip().replace("```json","").replace("```","").strip())
