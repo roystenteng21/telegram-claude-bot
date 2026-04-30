@@ -111,8 +111,8 @@ def setup_sheets():
         "Merchant Map": ["Merchant", "Category", "Card"],
         "Restaurants": ["Name", "Location", "Country", "Tags", "Notes"],
         "Portfolio": ["Stock", "Quantity", "Buy Price", "Buy Date", "Notes"],
-        "Trips": ["Trip ID", "Destination", "Currency", "Dep Flight", "Dep Time",
-                  "Return Flight", "Return Time", "Status", "Started", "Ended"],
+        "Trips": ["Trip ID", "Destination", "Currency", "Check In", "Check Out",
+                  "Hotel Name", "Hotel Local Name", "Hotel Address", "Notes", "Status"],
         "Reminders": ["ID", "Message", "Scheduled Time", "Recurrence", "Status", "Attempts", "Contact"],
         "Settings": ["Key", "Value"],
     }
@@ -2710,7 +2710,6 @@ overseas_state = {
     "return_date": "",
     "dep_job_id": None,        # scheduler job ID for departure activation
     "return_job_id": None,     # scheduler job ID for return deactivation
-    "return_flight": None,     # return flight data dict
     "trip_start": None,        # date string DD/MM/YYYY when overseas mode activated
     "trip_destinations": [],   # list of destinations visited this trip
 }
@@ -3477,167 +3476,11 @@ def is_overseas_mode_request(text):
 
     return False
 
-def lookup_flight(flight_number, flight_date=None):
-    """Look up flight details via AviationStack API. Returns dict or None.
-    flight_date: date object or YYYY-MM-DD string. If provided, filters by that date."""
-    if not AVIATIONSTACK_API_KEY:
-        print("Flight lookup: no AVIATIONSTACK_API_KEY set")
-        return None
-    try:
-        url = "http://api.aviationstack.com/v1/flights"
-        params = {
-            "access_key": AVIATIONSTACK_API_KEY,
-            "flight_iata": flight_number.upper()
-        }
-        if flight_date:
-            if hasattr(flight_date, "strftime"):
-                params["flight_date"] = flight_date.strftime("%Y-%m-%d")
-            else:
-                params["flight_date"] = str(flight_date)
-        resp = requests.get(url, params=params, timeout=10)
-        data = resp.json()
-        print(f"AviationStack {flight_number}: {json.dumps(data)[:400]}")
-        if "error" in data:
-            print(f"AviationStack API error: {data['error']}")
-            return None
-        flights = data.get("data", [])
-        if not flights:
-            print(f"AviationStack: no data for {flight_number}")
-            return None
-        f = flights[0]
-        dep = f.get("departure", {})
-        arr = f.get("arrival", {})
-        return {
-            "flight": flight_number.upper(),
-            "dep_airport": dep.get("airport", ""),
-            "dep_iata": dep.get("iata", ""),
-            "dep_time": dep.get("scheduled", ""),
-            "dep_terminal": dep.get("terminal", ""),
-            "dep_gate": dep.get("gate", ""),
-            "arr_airport": arr.get("airport", ""),
-            "arr_iata": arr.get("iata", ""),
-            "arr_city": arr.get("city") or arr.get("airport", ""),
-            "arr_time": arr.get("scheduled", ""),
-            "arr_terminal": arr.get("terminal", ""),
-            "arr_gate": arr.get("gate", ""),
-        }
-    except Exception as e:
-        print(f"Flight lookup error for {flight_number}: {e}")
-        return None
 
-def extract_flight_number(text):
-    """Extract first valid flight number (e.g. TR450, SQ321) from text."""
-    matches = re.findall(r'\b([A-Z]{1,3}\d{2,4}[A-Z]?)\b', text.upper())
-    return matches[0] if matches else None
-
-def extract_all_flight_numbers(text):
-    """Extract all flight numbers from text."""
-    return re.findall(r'\b([A-Z]{1,3}\d{2,4}[A-Z]?)\b', text.upper())
-
-def extract_flight_dates(text):
-    """Extract dates mentioned near flight numbers in text.
-    Returns list of date objects in order of mention, or [] if none found.
-    Handles: '24th Apr', '24 Apr', 'Apr 24', '24/4', '2026-04-24', 'tomorrow', 'today'.
-    """
-    today = date.today()
-    found = []
-    # Patterns to try (order matters — most specific first)
-    patterns = [
-        # ISO: 2026-04-24
-        (r'\b(\d{4}-\d{2}-\d{2})\b', "%Y-%m-%d"),
-        # 24th/24 Apr [2026]
-        (r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:\s+\d{4})?\b', None),
-        # Apr 24 [2026]
-        (r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+\d{4})?\b', None),
-        # 24/4 or 24/04
-        (r'\b(\d{1,2})[/\-](\d{1,2})\b', None),
-    ]
-    seen_dates = set()
-
-    # Handle relative dates first
-    for word, delta in [("today", 0), ("tomorrow", 1), ("tmr", 1), ("tmrw", 1)]:
-        if word in text.lower():
-            d = today + timedelta(days=delta)
-            if d not in seen_dates:
-                seen_dates.add(d)
-                found.append(d)
-
-    # Regex-based extraction
-    month_map = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
-                 "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
-    current_year = today.year
-
-    # Try "24 Apr" / "24th Apr"
-    for m in re.finditer(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:\s+(\d{4}))?\b', text, re.IGNORECASE):
-        day = int(m.group(1))
-        mon = month_map[m.group(2).lower()]
-        yr = int(m.group(3)) if m.group(3) else current_year
-        try:
-            d = date(yr, mon, day)
-            if d not in seen_dates:
-                seen_dates.add(d)
-                found.append(d)
-        except ValueError:
-            pass
-
-    # Try "Apr 24"
-    for m in re.finditer(r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?\b', text, re.IGNORECASE):
-        mon = month_map[m.group(1).lower()]
-        day = int(m.group(2))
-        yr = int(m.group(3)) if m.group(3) else current_year
-        try:
-            d = date(yr, mon, day)
-            if d not in seen_dates:
-                seen_dates.add(d)
-                found.append(d)
-        except ValueError:
-            pass
-
-    # Try ISO format
-    for m in re.finditer(r'\b(\d{4}-\d{2}-\d{2})\b', text):
-        try:
-            d = datetime.strptime(m.group(1), "%Y-%m-%d").date()
-            if d not in seen_dates:
-                seen_dates.add(d)
-                found.append(d)
-        except ValueError:
-            pass
-
-    return found
-
-def format_flight_time(iso_str):
-    """Format ISO datetime string to readable local time."""
-    if not iso_str:
-        return "time unknown"
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        return dt.strftime("%d %b, %H:%M")
-    except Exception as e:
-        print(f"format_flight_time: bad ISO string '{iso_str}': {e}")
-        return iso_str[:16]
-
-def get_dest_info_from_iata(iata_code, airport_name):
-    """Resolve IATA code + airport name to city and currency via Claude."""
-    prompt = (
-        f"Airport IATA code: '{iata_code}', airport name: '{airport_name}'.\n"
-        f"Return ONLY JSON: {{\"destination\": \"city name\", \"currency\": \"3-letter ISO code\"}}"
-    )
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=60,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    try:
-        return json.loads(raw)
-    except Exception as e:
-        print(f"get_dest_info_from_iata JSON parse error: {e} | raw: {raw}")
-        return {"destination": airport_name or iata_code, "currency": "SGD"}
 
 def deactivate_overseas_mode():
     """Deactivate overseas mode and clear scheduled jobs."""
     global overseas_state, _scheduler
-    # Close active trip in Trips sheet
     try:
         close_trip()
     except Exception:
@@ -3647,7 +3490,6 @@ def deactivate_overseas_mode():
     overseas_state["currency"] = "SGD"
     overseas_state["currencies"] = []
     overseas_state["return_date"] = ""
-    overseas_state["return_flight"] = None
     overseas_state["trip_start"] = None
     overseas_state["trip_destinations"] = []
     for job_key in ["dep_job_id", "return_job_id"]:
@@ -3659,10 +3501,10 @@ def deactivate_overseas_mode():
                 pass
         overseas_state[job_key] = None
 
-async def activate_overseas_mode_scheduled(dest, curr, return_flight_data=None):
+
+async def activate_overseas_mode_scheduled(dest, curr, check_in, check_out):
     """Called by scheduler at departure time to activate overseas mode."""
     global overseas_state, _app_ref
-    # Clear any open expense sessions for the user to prevent orphans
     for d in [expense_sessions, receipt_confirm_sessions]:
         d.pop(YOUR_CHAT_ID, None)
     session_timestamps.pop(YOUR_CHAT_ID, None)
@@ -3672,36 +3514,14 @@ async def activate_overseas_mode_scheduled(dest, curr, return_flight_data=None):
     overseas_state["currencies"] = [curr] if curr != "SGD" else []
     overseas_state["trip_start"] = date.today().strftime("%d/%m/%Y")
     overseas_state["trip_destinations"] = [dest]
-    # Persist trip to Trips sheet
-    ret_flight_num = return_flight_data.get("flight", "") if return_flight_data else ""
-    ret_time_str = return_flight_data.get("dep_time", "") if return_flight_data else ""
-    dep_flight = overseas_state.get("dep_flight", "")
-    dep_time = overseas_state.get("dep_time", "")
-    save_trip(dest, curr, dep_flight, dep_time, ret_flight_num, ret_time_str)
+    save_trip(dest, curr, check_in=check_in, check_out=check_out)
     msg = f"Overseas mode on ✈️\nDestination: {dest}\nCurrency: {curr}\nI'll log expenses in {curr} with SGD equivalent."
-    if return_flight_data:
-        ret_dep = format_flight_time(return_flight_data.get("dep_time", ""))
-        msg += f"\nReturn flight: {return_flight_data.get('flight', '')} departs {ret_dep}"
-        # Schedule return deactivation at return arrival time
-        ret_arr_str = return_flight_data.get("arr_time", "")
-        if ret_arr_str and _scheduler and _app_ref:
-            try:
-                ret_arr_dt = datetime.fromisoformat(ret_arr_str.replace("Z", "+00:00"))
-                ret_arr_local = ret_arr_dt.astimezone(TIMEZONE)
-                job = _scheduler.add_job(
-                    deactivate_and_notify,
-                    "date",
-                    run_date=ret_arr_local,
-                    args=[_app_ref]
-                )
-                overseas_state["return_job_id"] = job.id
-            except Exception as e:
-                print(f"Failed to schedule return deactivation: {e}")
     if _app_ref:
         try:
             await _app_ref.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
         except Exception as e:
             print(f"Failed to send overseas mode activation message: {e}")
+
 
 async def deactivate_and_notify(app):
     """Called by scheduler at return arrival — deactivate overseas mode and notify."""
@@ -3715,163 +3535,141 @@ async def deactivate_and_notify(app):
     except Exception as e:
         print(f"Failed to send return notification: {e}")
 
+
+def extract_flight_number(text):
+    """Extract first IATA-style flight number from text (e.g. TR450, SQ321)."""
+    matches = re.findall(r'\b([A-Z]{1,3}\d{2,4}[A-Z]?)\b', text.upper())
+    return matches[0] if matches else None
+
+
+def _parse_trip_dates(text):
+    """Extract one or two dates from free text. Returns list of date objects."""
+    today = date.today()
+    found = []
+    seen = set()
+    month_map = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                 "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+    yr = today.year
+
+    def _add(d):
+        if d not in seen:
+            seen.add(d)
+            found.append(d)
+
+    for word, delta in [("today", 0), ("tomorrow", 1), ("tmr", 1), ("tmrw", 1)]:
+        if word in text.lower():
+            _add(today + timedelta(days=delta))
+
+    for m in re.finditer(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?:\s+(\d{4}))?\b', text, re.IGNORECASE):
+        try:
+            _add(date(int(m.group(3)) if m.group(3) else yr, month_map[m.group(2).lower()], int(m.group(1))))
+        except ValueError:
+            pass
+
+    for m in re.finditer(r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s+(\d{4}))?\b', text, re.IGNORECASE):
+        try:
+            _add(date(int(m.group(3)) if m.group(3) else yr, month_map[m.group(1).lower()], int(m.group(2))))
+        except ValueError:
+            pass
+
+    for m in re.finditer(r'\b(\d{4}-\d{2}-\d{2})\b', text):
+        try:
+            _add(datetime.strptime(m.group(1), "%Y-%m-%d").date())
+        except ValueError:
+            pass
+
+    for m in re.finditer(r'\b(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{2,4}))?\b', text):
+        try:
+            y = int(m.group(3)) if m.group(3) else yr
+            if y < 100:
+                y += 2000
+            _add(date(y, int(m.group(2)), int(m.group(1))))
+        except ValueError:
+            pass
+
+    return found
+
+
+def _get_currency_for_dest(destination):
+    """Ask Haiku for the currency of a destination. Returns 3-letter ISO code."""
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            messages=[{"role": "user", "content":
+                f"What is the primary currency ISO code for {destination}? Reply with ONLY the 3-letter code."}]
+        )
+        code = resp.content[0].text.strip().upper()
+        if re.match(r'^[A-Z]{3}$', code):
+            return code
+    except Exception as e:
+        print(f"_get_currency_for_dest error: {e}")
+    return "SGD"
+
+
 def handle_overseas_request(text):
-    """Toggle overseas mode on/off, with optional flight lookup."""
-    global overseas_state, _scheduler
+    """Start a trip setup session or handle return-home."""
+    global overseas_state
     lower = text.lower()
 
-    # Returning home manually
+    # Returning home
     if any(p in lower for p in ["back home", "returned", "i'm back", "landed back", "home now"]):
         import random
         greeting = random.choice(["Welcome back!", "Good to have you back!", "Hope the trip was great!"])
         deactivate_overseas_mode()
         return f"{greeting} Switching back to SGD. 🏠"
 
-    SG_IATA_CODES = {"SIN", "SLM"}
-    SG_CITY_KEYWORDS = {"singapore", "changi"}
-    # Words indicating return intent before a flight number
-    RETURN_INTENT = ["returning on", "returning on the", "flying back on", "back on",
-                     "return on", "coming back on", "heading back on"]
+    # Extract flight number if present — begin trip setup session with it
+    flight_num = extract_flight_number(text)
 
-    def _has_return_intent(msg, flight_num):
-        """Return True if user's message expresses return intent for this flight."""
-        lower_msg = msg.lower()
-        for phrase in RETURN_INTENT:
-            if phrase in lower_msg and flight_num.lower() in lower_msg:
-                # Check phrase appears before the flight number
-                if lower_msg.index(phrase) < lower_msg.index(flight_num.lower()):
-                    return True
-        return False
+    # Try to extract destination from text (e.g. "flying to Bangkok", "going to KL")
+    dest_match = re.search(r'(?:to|in|flying to|going to|headed to|heading to|trip to)\s+([A-Za-z][A-Za-z\s]{2,25}?)(?:\s+on|\s+\d|$|[,.])', text, re.IGNORECASE)
+    dest_hint = dest_match.group(1).strip().title() if dest_match else None
 
-    def _is_sg_arrival(flight_info, force_return=False):
-        """Return True if this flight lands back in Singapore."""
-        if force_return:
-            return True
-        if not flight_info:
-            return False
-        iata = (flight_info.get("arr_iata") or "").upper()
-        city = (flight_info.get("arr_city") or "").lower()
-        airport = (flight_info.get("arr_airport") or "").lower()
-        return (iata in SG_IATA_CODES or
-                any(k in city for k in SG_CITY_KEYWORDS) or
-                any(k in airport for k in SG_CITY_KEYWORDS))
+    overseas_state["_trip_setup"] = {
+        "step": "destination",
+        "flight_number": flight_num or "",
+        "destination": dest_hint or "",
+        "check_in": "",
+        "check_out": "",
+        "currency": "",
+        "hotel_name": "",
+        "hotel_local_name": "",
+        "hotel_address": "",
+        "notes": "",
+    }
 
-    def _extract_leg2_dest(msg, flight2):
-        """Extract explicit destination for second flight from user message.
-        Avoids capturing prepositions like 'on', 'the', 'a'.
-        """
-        f2 = re.escape(flight2)
-        # Patterns: 'TG416 KL to BKK', 'TG416 to Bangkok', 'then TG416 to BKK'
-        patterns = [
-            rf"{f2}\s+(?:[A-Z]{{3}}\s+)?to\s+([A-Za-z][A-Za-z\s]{{2,25}}?)(?:\s+on\s+|\s+Mon|\s+Tue|\s+Wed|\s+Thu|\s+Fri|\s+Sat|\s+Sun|$)",
-            rf"then\s+{f2}\s+(?:[A-Z]{{3}}\s+)?to\s+([A-Za-z][A-Za-z\s]{{2,25}}?)(?:\s+on\s+|$)",
-        ]
-        STOPWORDS = {"on", "the", "a", "an", "my", "this", "next"}
-        for pat in patterns:
-            m = re.search(pat, msg, re.IGNORECASE)
-            if m:
-                dest = m.group(1).strip()
-                # Reject if it's just a stopword
-                if dest.lower() not in STOPWORDS and len(dest) > 2:
-                    return dest
-        return None
+    if dest_hint:
+        overseas_state["_trip_setup"]["step"] = "check_in"
+        return f"Got it — {dest_hint} 🌏\nCheck-in date? (or 'skip')"
+    return "Where are you headed?"
 
-    # Look for flight numbers in message
-    all_flights = extract_all_flight_numbers(text)
-    if all_flights and AVIATIONSTACK_API_KEY:
-        outbound = all_flights[0]
-        return_flight_num = all_flights[1] if len(all_flights) > 1 else None
 
-        # Extract dates from message — first date = departure, second = return
-        flight_dates = extract_flight_dates(text)
-        dep_date = flight_dates[0] if len(flight_dates) > 0 else None
-        ret_date = flight_dates[1] if len(flight_dates) > 1 else None
+async def _send_trip_confirm(update, ts):
+    """Send trip confirmation summary asking Y/N."""
+    dest = ts.get("destination", "—")
+    curr = ts.get("currency", "") or "auto-detect"
+    check_in = ts.get("check_in", "") or "—"
+    check_out = ts.get("check_out", "") or "—"
+    flight = ts.get("flight_number", "")
+    dep_display = ts.get("dep_time_display", "")
+    hotel = ts.get("hotel_name", "") or "—"
 
-        flight_data = lookup_flight(outbound, flight_date=dep_date)
-        if flight_data:
-            dep_fmt = format_flight_time(flight_data["dep_time"])
-            arr_fmt = format_flight_time(flight_data["arr_time"])
-            arr_label = flight_data["arr_city"] or flight_data["arr_airport"] or flight_data["arr_iata"]
+    lines = [f"✈️ *{dest}* ({curr})"]
+    lines.append(f"Check-in: {check_in} → Check-out: {check_out}")
+    if flight:
+        lines.append(f"Flight: {flight}" + (f" @ {dep_display}" if dep_display else ""))
+    if hotel != "—":
+        lines.append(f"Hotel: {hotel}")
+    lines.append("\nConfirm? (Y / cancel)")
 
-            pending = {
-                "flight_number": outbound,
-                "dep_time": flight_data["dep_time"],
-                "dep_terminal": flight_data.get("dep_terminal", ""),
-                "dep_gate": flight_data.get("dep_gate", ""),
-                "arr_time": flight_data["arr_time"],
-                "arr_airport": flight_data["arr_airport"],
-                "arr_iata": flight_data["arr_iata"],
-                "arr_city": flight_data["arr_city"],
-                "arr_terminal": flight_data.get("arr_terminal", ""),
-                "arr_gate": flight_data.get("arr_gate", ""),
-                "return_flight_data": None,
-            }
+    ts["step"] = "confirm"
+    overseas_state["_trip_setup"] = ts
+    try:
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text("\n".join(lines))
 
-            reply = f"Found {outbound} ✈️\nDeparts: {dep_fmt}\nArrives: {arr_fmt} → {arr_label}\n"
-
-            if return_flight_num:
-                ret_data = lookup_flight(return_flight_num, flight_date=ret_date)
-                if ret_data:
-                    ret_dep = format_flight_time(ret_data["dep_time"])
-                    ret_arr = format_flight_time(ret_data["arr_time"])
-                    ret_data["flight"] = return_flight_num
-
-                    # 1. Check if user expressed return intent (e.g. "returning on OD805")
-                    force_return = _has_return_intent(text, return_flight_num)
-                    # 2. Check if user named an explicit non-SG destination
-                    user_dest_hint = _extract_leg2_dest(text, return_flight_num)
-                    # 3. Determine if it's a return
-                    is_return = _is_sg_arrival(ret_data, force_return=force_return)
-                    # 4. If user explicitly named a non-SG destination, override to multi-city
-                    if user_dest_hint and not any(k in user_dest_hint.lower() for k in SG_CITY_KEYWORDS | {"sg", "sin", "home", "singapore"}):
-                        is_return = False
-
-                    if is_return:
-                        pending["return_flight_data"] = ret_data
-                        reply += f"\nReturn {return_flight_num}: {ret_dep} → {ret_arr} (SIN)\n"
-                    else:
-                        ret_arr_label = user_dest_hint or ret_data.get("arr_city") or ret_data.get("arr_airport") or ret_data.get("arr_iata", "")
-                        pending["return_flight_data"] = ret_data
-                        reply += f"\nLeg 2 {return_flight_num}: {ret_dep} → {ret_arr} ({ret_arr_label})\n"
-                        reply += f"_(Multi-city trip — {return_flight_num} logged as next leg)_\n"
-                        reply += f"\nGot a return flight to SG? Reply with the flight number or \'no\' to log as-is."
-                else:
-                    reply += f"(Couldn't find {return_flight_num} — I'll skip it)\n"
-
-                overseas_state["_pending_flight"] = pending
-                reply += "\n\nReply Y to confirm — overseas mode will activate at departure time."
-            else:
-                # Single flight — ask for return
-                overseas_state["_pending_flight"] = pending
-                overseas_state["_awaiting_return_flight"] = True
-                reply += "\n\nGot a return flight yet? Reply with the flight number or 'no' to log just the departure."
-
-            return reply
-
-        else:
-            # AviationStack returned no data — store flight numbers and dates, ask for manual details
-            overseas_state["_pending_flight"] = {
-                "flight_number": outbound,
-                "return_flight_num": return_flight_num,
-                "dep_date": dep_date.strftime("%Y-%m-%d") if dep_date else "",
-                "ret_date": ret_date.strftime("%Y-%m-%d") if ret_date else "",
-            }
-            overseas_state["_awaiting_manual_trip"] = True
-
-            dep_hint = f" (departing {dep_date.strftime('%d %b')})" if dep_date else ""
-            ret_hint = f", returning {ret_date.strftime('%d %b')}" if ret_date else ""
-            return (
-                f"Couldn't find {outbound}{dep_hint} in AviationStack — "
-                f"that's usually because the free tier only covers flights within 24hrs.\n\n"
-                f"Tell me:\n"
-                f"• Where are you flying to? (city or airport code)\n"
-                f"• What time does {outbound} depart? (e.g. 09:20)\n"
-                f"• What currency will you need? (e.g. MYR, JPY)\n"
-                f"• When are you back in SG?{ret_hint}"
-            )
-
-    # No flight number — ask for details
-    return "What\'s your departure date/time and destination? And when are you back in SG?"
 
 def parse_multi_field_edit(text, field_keywords=None):
     """Parse a multi-field edit message like 'merchant Tsukemen Fuunji category Dining'.
@@ -5794,18 +5592,17 @@ def trips_sheet():
 def generate_trip_id():
     return date.today().strftime("TRIP-%Y%m%d")
 
-def save_trip(destination, currency, dep_flight="", dep_time="", return_flight="", return_time=""):
-    """Write a new active trip row to Trips sheet."""
+def save_trip(destination, currency, check_in="", check_out="",
+              hotel_name="", hotel_local_name="", hotel_address="", notes=""):
+    """Write a new active trip row to Trips sheet (new schema)."""
     try:
         ws = trips_sheet()
         trip_id = generate_trip_id()
         ws.append_row([
             trip_id, destination, currency,
-            dep_flight, dep_time,
-            return_flight, return_time,
-            "active",
-            datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M"),
-            ""
+            check_in, check_out,
+            hotel_name, hotel_local_name, hotel_address,
+            notes, "active"
         ])
         return trip_id
     except Exception as e:
@@ -5813,14 +5610,13 @@ def save_trip(destination, currency, dep_flight="", dep_time="", return_flight="
         return None
 
 def close_trip(trip_id=None):
-    """Mark the active trip as closed."""
+    """Mark the active trip as closed. Status is col 10."""
     try:
         ws = trips_sheet()
         records = ws.get_all_records()
         for i, row in enumerate(records, start=2):
             if row.get("Status") == "active" and (trip_id is None or row.get("Trip ID") == trip_id):
-                ws.update_cell(i, 8, "closed")  # Status col
-                ws.update_cell(i, 10, datetime.now(TIMEZONE).strftime("%d/%m/%Y %H:%M"))  # Ended
+                ws.update_cell(i, 10, "closed")
                 return True
     except Exception as e:
         print(f"close_trip error: {e}")
@@ -5839,48 +5635,27 @@ def get_active_trip():
     return None
 
 def restore_overseas_from_trips():
-    """On startup — if there's an active trip in the sheet, restore overseas_state.
-    Per-field try/except: one bad value won't block the whole restore."""
+    """On startup — restore overseas_state from active trip if present."""
     try:
         trip = get_active_trip()
         if not trip:
             return False
-
         try:
             dest = trip.get("Destination", "") or ""
         except Exception:
             dest = ""
-            print("restore_overseas_from_trips: bad Destination field, skipping")
-
         try:
             curr = trip.get("Currency", "SGD") or "SGD"
         except Exception:
             curr = "SGD"
-            print("restore_overseas_from_trips: bad Currency field, defaulting to SGD")
-
         if not dest or not curr or curr == "SGD":
             return False
-
         overseas_state["active"] = True
         overseas_state["destination"] = dest
         overseas_state["currency"] = curr
         overseas_state["currencies"] = [curr]
         overseas_state["trip_destinations"] = [dest]
-
-        try:
-            dep_flight = trip.get("Dep Flight", "") or ""
-            if dep_flight:
-                overseas_state["dep_flight"] = dep_flight
-        except Exception:
-            print("restore_overseas_from_trips: bad Dep Flight field, skipping")
-
-        try:
-            return_flight = trip.get("Return Flight", "") or ""
-            if return_flight:
-                overseas_state["return_flight"] = {"flight": return_flight}
-        except Exception:
-            print("restore_overseas_from_trips: bad Return Flight field, skipping")
-
+        overseas_state["trip_start"] = trip.get("Check In", "")
         print(f"✅ Restored overseas mode: {dest} ({curr})")
         return True
     except Exception as e:
@@ -5906,19 +5681,16 @@ def format_trip_history():
         status = "✈️ Active" if t.get("Status") == "active" else "✅ Done"
         dest = t.get("Destination", "—")
         curr = t.get("Currency", "")
-        dep = t.get("Dep Flight", "")
-        ret = t.get("Return Flight", "")
-        started = t.get("Started", "")
-        ended = t.get("Ended", "")
+        check_in = t.get("Check In", "")
+        check_out = t.get("Check Out", "")
+        hotel = t.get("Hotel Name", "")
         line = f"{status} {dest} ({curr})"
-        if dep:
-            line += f" | Out: {dep}"
-        if ret:
-            line += f" | Back: {ret}"
-        if started:
-            line += f"\n{started}"
-            if ended:
-                line += f" → {ended}"
+        if check_in:
+            line += f"\n{check_in}"
+            if check_out:
+                line += f" → {check_out}"
+        if hotel:
+            line += f" | {hotel}"
         lines.append(line)
     return "\n\n".join(lines)
 
@@ -6642,62 +6414,7 @@ async def handle_statement_upload(file_bytes, fname, user_id, update):
 
 
 
-    """Return a flight context block for the system prompt if terminal/gate info is available."""
-    dep_terminal = overseas_state.get("dep_terminal", "")
-    dep_gate = overseas_state.get("dep_gate", "")
-    arr_terminal = overseas_state.get("arr_terminal", "")
-    arr_gate = overseas_state.get("arr_gate", "")
-    dep_flight = overseas_state.get("dep_flight", "")
-    dep_time = overseas_state.get("dep_time", "")
-
-    if not any([dep_terminal, dep_gate, arr_terminal, arr_gate]):
-        return ""
-
-    lines = ["\n\n## Upcoming Flight Info"]
-    if dep_flight:
-        lines.append(f"Flight: {dep_flight}")
-    if dep_time:
-        lines.append(f"Departure: {format_flight_time(dep_time)}")
-    if dep_terminal:
-        lines.append(f"Departure terminal: {dep_terminal}")
-    if dep_gate:
-        lines.append(f"Departure gate: {dep_gate}")
-    if arr_terminal:
-        lines.append(f"Arrival terminal: {arr_terminal}")
-    if arr_gate:
-        lines.append(f"Arrival gate: {arr_gate}")
-    lines.append("Use this info to answer questions about terminals and gates directly.")
-    return "\n".join(lines)
-
-
 # --- Em System Prompt Builder ---
-def _build_overseas_flight_context():
-    """Return a flight context block for the system prompt if terminal/gate info is available."""
-    dep_terminal = overseas_state.get("dep_terminal", "")
-    dep_gate = overseas_state.get("dep_gate", "")
-    arr_terminal = overseas_state.get("arr_terminal", "")
-    arr_gate = overseas_state.get("arr_gate", "")
-    dep_flight = overseas_state.get("dep_flight", "")
-    dep_time = overseas_state.get("dep_time", "")
-
-    if not any([dep_terminal, dep_gate, arr_terminal, arr_gate]):
-        return ""
-
-    lines = ["\n\n## Upcoming Flight Info"]
-    if dep_flight:
-        lines.append(f"Flight: {dep_flight}")
-    if dep_time:
-        lines.append(f"Departure: {format_flight_time(dep_time)}")
-    if dep_terminal:
-        lines.append(f"Departure terminal: {dep_terminal}")
-    if dep_gate:
-        lines.append(f"Departure gate: {dep_gate}")
-    if arr_terminal:
-        lines.append(f"Arrival terminal: {arr_terminal}")
-    if arr_gate:
-        lines.append(f"Arrival gate: {arr_gate}")
-    lines.append("Use this info to answer questions about terminals and gates directly.")
-    return "\n".join(lines)
 
 
 def build_system_prompt():
@@ -6785,7 +6502,7 @@ def build_system_prompt():
         "- Act like a typical AI assistant\n"
         "- Make small talk for the sake of it\n"
         "- Get repetitive with phrases or greetings"
-    ) + _build_overseas_flight_context() + overseas_context + expense_context
+    ) + overseas_context + expense_context
 
 # --- Safe message sender — chunks at 4096 char Telegram limit ---
 async def send_safe(target, text, parse_mode=None):
@@ -6849,8 +6566,7 @@ def get_active_session_label(user_id):
         return "contact save"
     if user_id in todo_disambig_sessions:
         return "todo action"
-    if overseas_state.get("_pending_flight"):
-        return "flight setup"
+
     return None
 
 # Words that are always session replies, never new intents
@@ -7130,7 +6846,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                           pending_restaurant_saves, pending_contact_saves,
                           todo_disambig_sessions]:
                     d.pop(user_id, None)
-                overseas_state.pop("_pending_flight", None)
+
                 session_timestamps.pop(user_id, None)
                 del interrupted_sessions[user_id]
                 # Replay by substituting the pending text and continuing
@@ -7437,195 +7153,200 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await handle_edit_session(user_id, text, update)
         return
 
-    # Pending flight confirmation — intercept the next message entirely
-    if overseas_state.get("_pending_flight"):
-        pf = overseas_state["_pending_flight"]
+    # Trip setup session — step-by-step collection
+    if overseas_state.get("_trip_setup"):
+        ts = overseas_state["_trip_setup"]
+        step = ts.get("step", "destination")
+        t = text.strip()
+        skipped = t.lower() in ("skip", "s", "-", "later", "idk", "not sure")
 
-        # Waiting for return flight number after single-flight input
-        if overseas_state.get("_awaiting_return_flight"):
-            stripped = text.strip()
-            lower_stripped = stripped.lower()
-            if lower_stripped in ["no", "n", "not yet", "skip", "none"]:
-                overseas_state.pop("_awaiting_return_flight", None)
-                # Proceed with just outbound — fall through to Y handling below
-                text = "Y"
-            elif extract_flight_number(stripped):
-                overseas_state.pop("_awaiting_return_flight", None)
-                ret_num = extract_flight_number(stripped)
-                ret_data = lookup_flight(ret_num)
-                if ret_data:
-                    ret_dep = format_flight_time(ret_data["dep_time"])
-                    ret_arr = format_flight_time(ret_data["arr_time"])
-                    ret_data["flight"] = ret_num
-                    pf["return_flight_data"] = ret_data
-                    overseas_state["_pending_flight"] = pf
-                    arr_label = pf.get("arr_city") or pf.get("arr_airport") or pf.get("arr_iata", "")
-                    dep_fmt = format_flight_time(pf.get("dep_time", ""))
-                    arr_fmt = format_flight_time(pf.get("arr_time", ""))
-                    reply = (
-                        f"Got it ✈️\n"
-                        f"Outbound: {pf['flight_number']} {dep_fmt} → {arr_fmt} ({arr_label})\n"
-                        f"Return: {ret_num} {ret_dep} → {ret_arr} (SIN)\n"
-                        f"\nReply Y to confirm."
-                    )
-                else:
-                    reply = f"Couldn't find {ret_num} on AviationStack. Reply Y to log just the departure, or try another flight number."
-                if reply:
-                    try:
-                        await update.message.reply_text(reply, parse_mode="Markdown")
-                    except Exception:
-                        await update.message.reply_text(reply)
+        if step == "destination":
+            if not t:
+                await update.message.reply_text("Where are you headed?")
                 return
-            else:
-                reply = "Reply with a return flight number (e.g. OD805) or 'no' to log just the departure."
-                await update.message.reply_text(reply)
-                return
-
-        # Handle manual trip details response (AviationStack fallback)
-        if overseas_state.get("_awaiting_manual_trip"):
-            overseas_state.pop("_awaiting_manual_trip", None)
-            # Parse destination, time, currency, return date from free-text reply
-            # Extract currency (3-letter uppercase code)
-            currency_match = re.search(r'([A-Z]{3})', text.upper())
-            currency = currency_match.group(1) if currency_match else "SGD"
-            if currency in ("THE", "AND", "FOR", "BUT", "ARE", "YOU", "SIN", "SGD"):
-                currency = "SGD"
-
-            # Extract time HH:MM
-            time_match = re.search(r'(\d{1,2}:\d{2})', text)
-            dep_time_str = time_match.group(1) if time_match else None
-
-            # Extract return date
-            ret_dates = extract_flight_dates(text)
-            ret_date_obj = ret_dates[-1] if ret_dates else None
-
-            # Extract destination — first capitalised word/phrase that isn't a time or currency
-            dest_match = re.search(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', text)
-            destination = dest_match.group(1) if dest_match else "Unknown"
-
-            # Build dep_time from dep_date in pending + user-provided time
-            dep_date_str = pf.get("dep_date", "")
-            dep_time_full = None
-            if dep_date_str and dep_time_str:
-                try:
-                    dep_dt = datetime.strptime(f"{dep_date_str} {dep_time_str}", "%Y-%m-%d %H:%M")
-                    dep_dt = TIMEZONE.localize(dep_dt)
-                    dep_time_full = dep_dt.isoformat()
-                except Exception as e:
-                    print(f"Manual trip dep_time parse error: {e}")
-
-            # Update pending with manual details
-            pf["arr_city"] = destination
-            pf["arr_iata"] = ""
-            pf["dep_time"] = dep_time_full or dep_date_str
-            pf["arr_time"] = ""
-            overseas_state["_pending_flight"] = pf
-
-            ret_str = ret_date_obj.strftime("%d %b") if ret_date_obj else "not set"
-            dep_display = f"{dep_date_str} {dep_time_str}" if dep_time_str else dep_date_str
-            reply = (
-                f"Got it ✈️\n"
-                f"{pf['flight_number']} → {destination} on {dep_display}\n"
-                f"Currency: {currency}\n"
-                f"Return: {ret_str}\n\n"
-                f"Reply Y to confirm — overseas mode will activate at departure time."
-            )
-            # Store currency in pending for Y handler
-            pf["manual_currency"] = currency
-            if ret_date_obj:
-                pf["manual_return_date"] = ret_date_obj.strftime("%d/%m/%Y")
-            overseas_state["_pending_flight"] = pf
-            try:
-                await update.message.reply_text(reply)
-            except Exception:
-                await update.message.reply_text(reply)
+            ts["destination"] = t.title()
+            ts["step"] = "check_in"
+            await update.message.reply_text(f"Got it — {ts['destination']} 🌏\nCheck-in date? (or 'skip')")
             return
 
-        if text.strip().upper() == "Y":
-            overseas_state.pop("_pending_flight")
-            info = get_dest_info_from_iata(pf.get("arr_iata", ""), pf.get("arr_city", pf.get("arr_airport", "")))
-            dest = info.get("destination") or pf.get("arr_city") or pf.get("arr_airport", "Unknown")
-            curr = info.get("currency", "SGD")
-            dep_str = pf.get("dep_time", "")
-            dep_fmt = format_flight_time(dep_str)
-            return_flight_data = pf.get("return_flight_data")
-            # Schedule activation at departure time
-            scheduled = False
-            if dep_str and _scheduler:
-                try:
-                    dep_dt = datetime.fromisoformat(dep_str.replace("Z", "+00:00"))
-                    dep_local = dep_dt.astimezone(TIMEZONE)
-                    now_local = datetime.now(TIMEZONE)
-                    if dep_local > now_local:
-                        job = _scheduler.add_job(
-                            activate_overseas_mode_scheduled,
-                            "date",
-                            run_date=dep_local,
-                            args=[dest, curr, return_flight_data]
+        elif step == "check_in":
+            if not skipped:
+                dates = _parse_trip_dates(t)
+                ts["check_in"] = dates[0].strftime("%d/%m/%Y") if dates else t
+            ts["step"] = "check_out"
+            await update.message.reply_text("Check-out date? (or 'skip')")
+            return
+
+        elif step == "check_out":
+            if not skipped:
+                dates = _parse_trip_dates(t)
+                ts["check_out"] = dates[0].strftime("%d/%m/%Y") if dates else t
+            ts["step"] = "flight"
+            await update.message.reply_text("Flight number? (or 'skip')")
+            return
+
+        elif step == "flight":
+            if not skipped:
+                fn = extract_flight_number(t.upper())
+                ts["flight_number"] = fn or t.upper()
+                ts["step"] = "dep_time"
+                if AVIATIONSTACK_API_KEY and fn:
+                    # Try AviationStack
+                    import requests as _req
+                    try:
+                        resp = _req.get(
+                            "http://api.aviationstack.com/v1/flights",
+                            params={"access_key": AVIATIONSTACK_API_KEY, "flight_iata": fn},
+                            timeout=10
                         )
-                        overseas_state["dep_job_id"] = job.id
-                        overseas_state["destination"] = dest
-                        overseas_state["currency"] = curr
-                        overseas_state["dep_flight"] = pf.get("flight_number", "")
-                        overseas_state["dep_time"] = pf.get("dep_time", "")
-                        overseas_state["dep_terminal"] = pf.get("dep_terminal", "")
-                        overseas_state["dep_gate"] = pf.get("dep_gate", "")
-                        overseas_state["arr_terminal"] = pf.get("arr_terminal", "")
-                        overseas_state["arr_gate"] = pf.get("arr_gate", "")
-                        scheduled = True
-                except Exception as e:
-                    print(f"Failed to schedule departure: {e}")
-            if scheduled:
-                ret_str = ""
-                if return_flight_data:
-                    ret_dep = format_flight_time(return_flight_data.get("dep_time", ""))
-                    ret_arr = format_flight_time(return_flight_data.get("arr_time", ""))
-                    ret_str = f"\nReturn: {return_flight_data.get('flight', '')} {ret_dep} → {ret_arr}"
-                reply = (
-                    f"Got it ✈️ Overseas mode will activate at departure: {dep_fmt}\n"
-                    f"Destination: {dest} ({curr}){ret_str}\n"
-                    f"I'll send a confirmation when it kicks in."
-                )
+                        data = resp.json()
+                        flights = data.get("data", [])
+                        if flights:
+                            dep = flights[0].get("departure", {})
+                            scheduled = dep.get("scheduled", "")
+                            if scheduled:
+                                try:
+                                    from datetime import datetime as _dt
+                                    dt = _dt.fromisoformat(scheduled.replace("Z", "+00:00"))
+                                    ts["dep_time_iso"] = scheduled
+                                    ts["dep_time_display"] = dt.astimezone(TIMEZONE).strftime("%d %b %H:%M")
+                                    ts["step"] = "currency"
+                                    await update.message.reply_text(
+                                        f"Found {fn} — departs {ts['dep_time_display']} ✅\nCurrency? (or 'skip' for SGD)"
+                                    )
+                                    return
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        print(f"AviationStack lookup error: {e}")
+                await update.message.reply_text(f"What time does {ts['flight_number']} depart? (e.g. 09:20, or 'skip')")
             else:
-                # Departure already passed or no dep time — activate now
-                # Clear any open expense sessions to prevent orphans
-                for d in [expense_sessions, receipt_confirm_sessions]:
-                    d.pop(user_id, None)
-                session_timestamps.pop(user_id, None)
-                overseas_state["active"] = True
-                overseas_state["destination"] = dest
-                overseas_state["currency"] = curr
-                overseas_state["currencies"] = [curr] if curr != "SGD" else []
-                overseas_state["trip_destinations"] = [dest]
-                overseas_state["trip_start"] = date.today().strftime("%d/%m/%Y")
-                dep_flight = pf.get("flight_number", "")
-                dep_time = pf.get("dep_time", "")
-                overseas_state["dep_flight"] = dep_flight
-                overseas_state["dep_time"] = dep_time
-                overseas_state["dep_terminal"] = pf.get("dep_terminal", "")
-                overseas_state["dep_gate"] = pf.get("dep_gate", "")
-                overseas_state["arr_terminal"] = pf.get("arr_terminal", "")
-                overseas_state["arr_gate"] = pf.get("arr_gate", "")
-                # Persist to Trips sheet so it survives restarts
-                save_trip(dest, curr, dep_flight, dep_time)
-                reply = (
-                    f"Overseas mode on ✈️\n"
-                    f"Destination: {dest}\nCurrency: {curr}\n"
-                    f"I'll log expenses in {curr} with SGD equivalent."
-                )
-        elif text.strip().upper() == "N":
-            overseas_state.pop("_pending_flight", None)
-            reply = "Got it — what's your departure date/time, destination, and when are you back in SG?"
-        else:
-            # Anything else = manual destination override
-            overseas_state.pop("_pending_flight", None)
-            reply = handle_overseas_request(text)
-        if reply:
-            try:
-                await update.message.reply_text(reply, parse_mode="Markdown")
-            except Exception:
+                ts["step"] = "currency"
+                await update.message.reply_text("Currency? (or 'skip' for SGD)")
+            return
+
+        elif step == "dep_time":
+            if not skipped:
+                time_match = re.search(r'(\d{1,2}:\d{2})', t)
+                if time_match:
+                    time_str = time_match.group(1)
+                    # Combine with check_in date if available
+                    ci = ts.get("check_in", "")
+                    dep_dt = None
+                    if ci:
+                        try:
+                            dep_dt = TIMEZONE.localize(
+                                datetime.strptime(f"{ci} {time_str}", "%d/%m/%Y %H:%M")
+                            )
+                        except Exception:
+                            pass
+                    ts["dep_time_iso"] = dep_dt.isoformat() if dep_dt else time_str
+                    ts["dep_time_display"] = dep_dt.strftime("%d %b %H:%M") if dep_dt else time_str
+                else:
+                    ts["dep_time_display"] = t
+            ts["step"] = "currency"
+            await update.message.reply_text("Currency? (or 'skip' for SGD)")
+            return
+
+        elif step == "currency":
+            if not skipped:
+                cur_match = re.search(r'([A-Z]{3})', t.upper())
+                ts["currency"] = cur_match.group(1) if cur_match else _get_currency_for_dest(ts.get("destination", ""))
+            else:
+                ts["currency"] = _get_currency_for_dest(ts.get("destination", "")) or "SGD"
+            ts["step"] = "hotel"
+            await update.message.reply_text("Hotel name? (or 'skip')")
+            return
+
+        elif step == "hotel":
+            if not skipped:
+                ts["hotel_name"] = t
+                ts["step"] = "hotel_local"
+                await update.message.reply_text("Hotel local name? (or 'skip')")
+            else:
+                ts["step"] = "confirm"
+                # Skip straight to confirm
+                ts_copy = dict(ts)
+                await _send_trip_confirm(update, ts_copy)
+            return
+
+        elif step == "hotel_local":
+            if not skipped:
+                ts["hotel_local_name"] = t
+                ts["step"] = "hotel_address"
+                await update.message.reply_text("Hotel address? (or 'skip')")
+            else:
+                ts["step"] = "confirm"
+                ts_copy = dict(ts)
+                await _send_trip_confirm(update, ts_copy)
+            return
+
+        elif step == "hotel_address":
+            if not skipped:
+                ts["hotel_address"] = t
+            ts["step"] = "confirm"
+            ts_copy = dict(ts)
+            await _send_trip_confirm(update, ts_copy)
+            return
+
+        elif step == "confirm":
+            if t.upper() == "Y":
+                overseas_state.pop("_trip_setup", None)
+                dest = ts.get("destination", "Unknown")
+                curr = ts.get("currency", "SGD")
+                check_in = ts.get("check_in", "")
+                check_out = ts.get("check_out", "")
+                dep_iso = ts.get("dep_time_iso", "")
+                # Schedule or activate
+                scheduled = False
+                if dep_iso and _scheduler:
+                    try:
+                        dep_dt = datetime.fromisoformat(dep_iso.replace("Z", "+00:00"))
+                        dep_local = dep_dt.astimezone(TIMEZONE)
+                        if dep_local > datetime.now(TIMEZONE):
+                            job = _scheduler.add_job(
+                                activate_overseas_mode_scheduled,
+                                "date",
+                                run_date=dep_local,
+                                args=[dest, curr, check_in, check_out]
+                            )
+                            overseas_state["dep_job_id"] = job.id
+                            overseas_state["destination"] = dest
+                            overseas_state["currency"] = curr
+                            scheduled = True
+                    except Exception as e:
+                        print(f"Trip schedule error: {e}")
+                if not scheduled:
+                    for d in [expense_sessions, receipt_confirm_sessions]:
+                        d.pop(user_id, None)
+                    session_timestamps.pop(user_id, None)
+                    overseas_state["active"] = True
+                    overseas_state["destination"] = dest
+                    overseas_state["currency"] = curr
+                    overseas_state["currencies"] = [curr] if curr != "SGD" else []
+                    overseas_state["trip_destinations"] = [dest]
+                    overseas_state["trip_start"] = date.today().strftime("%d/%m/%Y")
+                    save_trip(dest, curr, check_in=check_in, check_out=check_out,
+                              hotel_name=ts.get("hotel_name", ""),
+                              hotel_local_name=ts.get("hotel_local_name", ""),
+                              hotel_address=ts.get("hotel_address", ""))
+                    dep_display = ts.get("dep_time_display", "")
+                    if dep_display:
+                        reply = f"Overseas mode on ✈️\nDestination: {dest}\nCurrency: {curr}\nFlight: {ts.get('flight_number','')} {dep_display}"
+                    else:
+                        reply = f"Overseas mode on ✈️\nDestination: {dest}\nCurrency: {curr}\nI\'ll log expenses in {curr} with SGD equivalent."
+                else:
+                    dep_display = ts.get("dep_time_display", "")
+                    reply = (
+                        f"Got it ✈️ Overseas mode will activate at departure: {dep_display}\n"
+                        f"Destination: {dest} ({curr})\n"
+                        f"I\'ll send a confirmation when it kicks in."
+                    )
                 await update.message.reply_text(reply)
-        return
+            else:
+                overseas_state.pop("_trip_setup", None)
+                await update.message.reply_text("Trip setup cancelled.")
+            return
 
     reply = None
 
@@ -7886,14 +7607,10 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if overseas_state.get("active"):
             dest = overseas_state.get("destination", "Unknown")
             curr = overseas_state.get("currency", "SGD")
-            dep = overseas_state.get("dep_flight", "")
-            ret_data = overseas_state.get("return_flight")
-            ret_flight = ret_data.get("flight", "") if isinstance(ret_data, dict) else ""
+            trip_start = overseas_state.get("trip_start", "")
             reply = f"✈️ Active trip: {dest} ({curr})"
-            if dep:
-                reply += f"\nOutbound: {dep}"
-            if ret_flight:
-                reply += f"\nReturn: {ret_flight}"
+            if trip_start:
+                reply += f"\nStarted: {trip_start}"
         else:
             reply = "No active trip — you're in SG mode."
     elif lower.startswith("edit last expense ") or lower.startswith("edit expense "):
@@ -7916,9 +7633,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         # Mid-trip currency switch — "now in Korea", "arrived in Seoul"
         if overseas_state.get("active"):
             dest_text = re.sub(r"^(now in|switched to|arrived in)\s+", "", lower).strip().title()
-            dest_info = get_dest_info_from_iata("", dest_text)
-            new_curr = dest_info.get("currency", "")
-            new_dest = dest_info.get("destination", dest_text)
+            new_curr = _get_currency_for_dest(dest_text)
+            new_dest = dest_text
             if new_curr and new_curr != "SGD":
                 overseas_state["currency"] = new_curr
                 overseas_state["destination"] = new_dest
@@ -7950,19 +7666,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply, needs_session, session_data = handle_expense_text(log_text, user_id)
         if needs_session and session_data:
             expense_sessions[user_id] = session_data
-    elif re.match(r"add return flight\s+([A-Z]{1,3}\d{2,4}[A-Z]?)", text.upper()):
-        m = re.match(r"add return flight\s+([A-Z]{1,3}\d{2,4}[A-Z]?)", text.upper())
-        ret_num = m.group(1)
-        ret_data = lookup_flight(ret_num)
-        if ret_data:
-            ret_dep = format_flight_time(ret_data["dep_time"])
-            ret_arr = format_flight_time(ret_data["arr_time"])
-            ret_data["flight"] = ret_num
-            overseas_state["return_flight"] = ret_data
-            reply = f"Return flight added: {ret_num} {ret_dep} → {ret_arr} (SIN) ✅"
-        else:
-            reply = f"Couldn't find {ret_num} on AviationStack. Try again closer to the flight date."
-    # Bill Commands
+
     elif lower in ["bills", "my bills", "list bills"]:
         reply = list_bills()
     elif lower.startswith("delete bill "):
@@ -8163,20 +7867,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         elif action == "show_private":
             reply = find_contact(name, show_private=True)
 
-    # Flight — always before expense (bare flight number must never hit expense parser)
+    # Overseas / trip setup — flight number guard before expense parser
     elif is_overseas_mode_request(text) or extract_flight_number(text):
-        if not extract_flight_number(text) and user_id in conversation_histories:
-            history_text = " ".join(
-                m["content"] for m in conversation_histories[user_id][-10:]
-                if m["role"] == "user"
-            )
-            found_flights = extract_all_flight_numbers(history_text)
-            if found_flights:
-                reply = handle_overseas_request(" ".join(found_flights) + " " + text)
-            else:
-                reply = handle_overseas_request(text)
-        else:
-            reply = handle_overseas_request(text)
+        reply = handle_overseas_request(text)
 
     # Expense — flight guard already in is_expense_input, but extract_flight_number above catches first
     elif is_expense_input(text):
