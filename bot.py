@@ -5715,6 +5715,7 @@ def format_price(data, summary=None):
     lines.append(f"{currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
     if range_line:
         lines.append(range_line)
+    lines.append("")
     lines.append(f"{summary if summary else _generate_price_movement_summary(data)}")
 
     return "\n".join(lines)
