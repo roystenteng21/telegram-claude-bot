@@ -3337,7 +3337,7 @@ def format_expense_confirmation(merchant, amount, currency, category, card, sgd_
             prompt = f"yes / enter {missing_fields[0].title()} / skip"
         lines.append(f"\nLog this? ({prompt})")
     else:
-        lines.append("\nLog this? (yes / edit name · amount · category · card / skip)")
+        lines.append("\nLog this? (yes / edit / skip)")
 
     return "\n".join(lines)
 
@@ -3796,9 +3796,9 @@ async def handle_receipt_confirm_session(user_id, text, update):
         session_timestamps.pop(user_id, None)
         receipt_link = session.get("receipt_link", "")
         if receipt_link:
-            await update.message.reply_text(f"Skipped — receipt saved to Drive if you need it later.")
+            await update.message.reply_text("Entry not logged — receipt saved to Drive if you need it later.")
         else:
-            await update.message.reply_text("Skipped.")
+            await update.message.reply_text("Entry not logged.")
         return True
 
     # FX rate input
