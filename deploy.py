@@ -87,22 +87,35 @@ def git_commit_push(commit_msg):
         return False
 
 
+def _has_credentials():
+    """Return True if Google credentials are available in this environment."""
+    if os.environ.get("GOOGLE_CREDENTIALS"):
+        return True
+    if os.path.exists(os.path.join(REPO_DIR, "credentials.json")):
+        return True
+    return False
+
+
 def update_em_log_and_registry(session_name, built, fixed, pending, commit_hash):
-    """Update Em Log and Module Registry in Google Sheets."""
+    """Update Em Log and Module Registry in Google Sheets.
+    Skipped silently when credentials are not available — Railway handles this on boot.
+    """
+    if not _has_credentials():
+        print("ℹ️  No local credentials — Em Log + Module Registry will update on Railway boot.")
+        return
     try:
         sys.path.insert(0, REPO_DIR)
         from sheets import add_session_to_em_log, update_module_registry
         today = date.today().strftime("%Y-%m-%d")
         add_session_to_em_log(today, session_name, built, fixed, pending, commit_hash)
         print(f"✅ Em Log updated: {session_name}")
-        # Update Module Registry for all changed modules
         for fname in MODULE_FILES:
             mod_name = fname.replace(".py", "")
             update_module_registry(mod_name, fname, today, session_name, "✅ Active")
         print("✅ Module Registry updated")
     except Exception as e:
         print(f"⚠️  Em Log / Module Registry update failed: {e}")
-        print("    (Deploy succeeded — update manually if needed)")
+        print("    (Deploy succeeded — Railway will update on boot)")
 
 
 def get_commit_hash():

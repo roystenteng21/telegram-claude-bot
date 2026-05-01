@@ -5,6 +5,7 @@ expense_sessions = {}
 delete_sessions = {}
 portfolio_delete_sessions = {}
 confirm_sessions = {}
+receipt_confirm_sessions = {}
 edit_sessions = {}
 meeting_sessions = {}
 excel_import_sessions = {}
