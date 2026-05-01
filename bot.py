@@ -170,30 +170,30 @@ DEV_NOTES_CONTENT = [
     ["Roadmap — Session 13 (S5 Completeness)", "End-to-end feature testing across all modules. Input forgiveness: broader natural phrasing recognised. Response consistency: emoji, error format, reply length standardised across all handlers.", "2026-04-29"],
 ]
 
-EM_LOG_HEADERS_BACKLOG = ["Priority", "Item", "Stage", "Notes", "Added"]
+EM_LOG_HEADERS_BACKLOG = ["Priority", "Item", "Stage", "Notes", "Added", "Status"]
 EM_LOG_HEADERS_SESSION = ["Date", "Session", "Built", "Fixed", "Pending", "Commit"]
 
 INITIAL_BACKLOG = [
-    ["🔴", "log_expense: add error handling — financial data silently lost on sheet failure", "Step 3", "Wrap append_row in try/except, notify user if write fails, do not delete session until write confirmed", "2026-04-26"],
-    ["🔴", "Session deleted before write confirmed — expense unrecoverable on failure", "Step 3", "Move del receipt_confirm_sessions[user_id] to after log_expense succeeds", "2026-04-26"],
-    ["🔴", "save_merchant_memory silent fail — merchant never learned if sheet write fails", "Step 3", "Add error handling, log failure, do not silently swallow", "2026-04-26"],
-    ["🟠", "sheets_call_with_retry uses time.sleep(60) — blocks entire event loop", "Step 3", "Replace with asyncio.sleep(60) inside async context", "2026-04-26"],
-    ["🟠", "get_calendar uses time.sleep(3) on retry — blocks event loop on every calendar request", "Step 3", "Replace with asyncio.sleep or remove retry sleep", "2026-04-26"],
-    ["🟠", "find_row: 5 full passes over CRM records, no cache — 1000 iterations per lookup", "Step 3", "Single-pass with match tiers, add CRM cache invalidated on write", "2026-04-26"],
-    ["🟠", "check_and_fire_reminders: full sheet read every minute + find_row inside loop", "Step 3", "Cache pending reminders in memory, only re-read on write. Remove find_row from loop.", "2026-04-26"],
-    ["🟠", "Duplicate routing: is_reminder_request 3x, is_stock_request 2x, others twice", "Step 3", "Eliminate else block, merge missing handlers into primary elif chain", "2026-04-26"],
-    ["🟡", "Missing env var guard at startup — cryptic crash if TELEGRAM_TOKEN or ANTHROPIC_API_KEY unset", "Step 3", "Add explicit check and clear error message before app starts", "2026-04-26"],
-    ["🟡", "float() cast on unvalidated Claude output in parse_expense_text_v2 — unhandled exception", "Step 3", "Validate amount field before cast, return user-friendly error if invalid", "2026-04-26"],
-    ["🟡", "restore_overseas_from_trips: no fallback on corrupt data — silent bad state", "Step 3", "Wrap in try/except per field, skip row if malformed, log warning", "2026-04-26"],
-    ["🟡", "FX rates lost on Railway restart — user must re-enter manually after every redeploy", "Step 3", "Persist cached_fx_rates to Settings sheet, load on startup", "2026-04-26"],
-    ["🟡", "No timeout on RSS fetch in fetch_market_rss_headlines — indefinite hang possible", "Step 3", "Add timeout=10 to requests.get call", "2026-04-26"],
-    ["🟢", "_finalise_expense_session labelled legacy but still wired — dead code", "Step 3", "Remove function, update any callers", "2026-04-26"],
-    ["🟢", "CARD_FX_FEES dict defined but never referenced anywhere", "Step 3", "Remove or wire up to FX fee display", "2026-04-26"],
-    ["🟢", "bare except: in format_date and calculate_age swallows all exceptions", "Step 3", "Replace with except ValueError", "2026-04-26"],
-    ["🟢", "Haiku for parse_expense_text_v2 and is_calendar_request — Sonnet overkill", "Step 3", "Switch model to claude-haiku-3, verify output quality unchanged", "2026-04-26"],
-    ["🟢", "S5: End-to-end feature testing — no systematic test coverage across modules", "Step 3", "Test all features post-modularisation: expenses, CRM, trips, reminders, stocks, restaurants, calendar, todos", "2026-04-29"],
-    ["🟢", "S5: Input forgiveness — narrow phrasing recognition misses natural variants", "Step 3", "Broaden detector patterns for common commands; test with varied natural language inputs", "2026-04-29"],
-    ["🟢", "S5: Response consistency — emoji, error format, reply length vary across handlers", "Step 3", "Audit all reply strings; standardise error prefix, emoji usage, and length conventions", "2026-04-29"],
+    ["🔴", "log_expense: add error handling — financial data silently lost on sheet failure", "Step 3", "Wrap append_row in try/except, notify user if write fails, do not delete session until write confirmed", "2026-04-26", "🔲 Outstanding"],
+    ["🔴", "Session deleted before write confirmed — expense unrecoverable on failure", "Step 3", "Move del receipt_confirm_sessions[user_id] to after log_expense succeeds", "2026-04-26", "🔲 Outstanding"],
+    ["🔴", "save_merchant_memory silent fail — merchant never learned if sheet write fails", "Step 3", "Add error handling, log failure, do not silently swallow", "2026-04-26", "🔲 Outstanding"],
+    ["🟠", "sheets_call_with_retry uses time.sleep(60) — blocks entire event loop", "Step 3", "Replace with asyncio.sleep(60) inside async context", "2026-04-26", "🔲 Outstanding"],
+    ["🟠", "get_calendar uses time.sleep(3) on retry — blocks event loop on every calendar request", "Step 3", "Replace with asyncio.sleep or remove retry sleep", "2026-04-26", "🔲 Outstanding"],
+    ["🟠", "find_row: 5 full passes over CRM records, no cache — 1000 iterations per lookup", "Step 3", "Single-pass with match tiers, add CRM cache invalidated on write", "2026-04-26", "🔲 Outstanding"],
+    ["🟠", "check_and_fire_reminders: full sheet read every minute + find_row inside loop", "Step 3", "Cache pending reminders in memory, only re-read on write. Remove find_row from loop.", "2026-04-26", "🔲 Outstanding"],
+    ["🟠", "Duplicate routing: is_reminder_request 3x, is_stock_request 2x, others twice", "Step 3", "Eliminate else block, merge missing handlers into primary elif chain", "2026-04-26", "🔲 Outstanding"],
+    ["🟡", "Missing env var guard at startup — cryptic crash if TELEGRAM_TOKEN or ANTHROPIC_API_KEY unset", "Step 3", "Add explicit check and clear error message before app starts", "2026-04-26", "🔲 Outstanding"],
+    ["🟡", "float() cast on unvalidated Claude output in parse_expense_text_v2 — unhandled exception", "Step 3", "Validate amount field before cast, return user-friendly error if invalid", "2026-04-26", "🔲 Outstanding"],
+    ["🟡", "restore_overseas_from_trips: no fallback on corrupt data — silent bad state", "Step 3", "Wrap in try/except per field, skip row if malformed, log warning", "2026-04-26", "🔲 Outstanding"],
+    ["🟡", "FX rates lost on Railway restart — user must re-enter manually after every redeploy", "Step 3", "Persist cached_fx_rates to Settings sheet, load on startup", "2026-04-26", "🔲 Outstanding"],
+    ["🟡", "No timeout on RSS fetch in fetch_market_rss_headlines — indefinite hang possible", "Step 3", "Add timeout=10 to requests.get call", "2026-04-26", "🔲 Outstanding"],
+    ["🟢", "_finalise_expense_session labelled legacy but still wired — dead code", "Step 3", "Remove function, update any callers", "2026-04-26", "🔲 Outstanding"],
+    ["🟢", "CARD_FX_FEES dict defined but never referenced anywhere", "Step 3", "Remove or wire up to FX fee display", "2026-04-26", "🔲 Outstanding"],
+    ["🟢", "bare except: in format_date and calculate_age swallows all exceptions", "Step 3", "Replace with except ValueError", "2026-04-26", "🔲 Outstanding"],
+    ["🟢", "Haiku for parse_expense_text_v2 and is_calendar_request — Sonnet overkill", "Step 3", "Switch model to claude-haiku-3, verify output quality unchanged", "2026-04-26", "🔲 Outstanding"],
+    ["🟢", "S5: End-to-end feature testing — no systematic test coverage across modules", "Step 3", "Test all features post-modularisation: expenses, CRM, trips, reminders, stocks, restaurants, calendar, todos", "2026-04-29", "🔲 Outstanding"],
+    ["🟢", "S5: Input forgiveness — narrow phrasing recognition misses natural variants", "Step 3", "Broaden detector patterns for common commands; test with varied natural language inputs", "2026-04-29", "🔲 Outstanding"],
+    ["🟢", "S5: Response consistency — emoji, error format, reply length vary across handlers", "Step 3", "Audit all reply strings; standardise error prefix, emoji usage, and length conventions", "2026-04-29", "🔲 Outstanding"],
 ]
 
 INITIAL_SESSION = [
@@ -367,9 +367,9 @@ def add_backlog_item(priority, item, stage="", notes=""):
                 break
 
         if divider_row:
-            ws.insert_row([priority, item, stage, notes, today], divider_row)
+            ws.insert_row([priority, item, stage, notes, today, "🔲 Outstanding"], divider_row)
         else:
-            ws.append_row([priority, item, stage, notes, today])
+            ws.append_row([priority, item, stage, notes, today, "🔲 Outstanding"])
 
         return f"Added to backlog ✅"
     except Exception as e:
@@ -377,7 +377,7 @@ def add_backlog_item(priority, item, stage="", notes=""):
 
 
 def get_pending_backlog():
-    """Return formatted backlog from Em Log for em whats pending command."""
+    """Return formatted backlog from Em Log — Outstanding items only."""
     try:
         ws = em_log_sheet()
         if not ws:
@@ -398,13 +398,14 @@ def get_pending_backlog():
                 priority = row[0] if len(row) > 0 else ""
                 item = row[1] if len(row) > 1 else ""
                 stage = row[2] if len(row) > 2 else ""
-                if item:
+                status = row[5] if len(row) > 5 else "🔲 Outstanding"
+                if item and "Done" not in status:
                     backlog_items.append((priority, item, stage))
 
         if not backlog_items:
             return "Backlog is empty ✅"
 
-        lines = ["*Backlog*\n"]
+        lines = ["*Backlog — Outstanding*\n"]
         for priority, item, stage in backlog_items:
             stage_str = f" _[{stage}]_" if stage else ""
             lines.append(f"{priority} {item}{stage_str}")
@@ -5293,8 +5294,7 @@ def is_restaurant_search(text):
     lower = text.lower()
     triggers = ["find a restaurant", "search restaurants", "any restaurants",
                 "restaurant recommendations", "where to eat", "restaurants in",
-                "show my restaurants", "my restaurant list", "saved restaurants",
-                "restaurants", "my restaurants", "list restaurants", "show restaurants"]
+                "show my restaurants", "my restaurant list", "saved restaurants"]
     return any(t in lower for t in triggers)
 
 def infer_restaurant_location(name, country="Singapore"):
@@ -5714,7 +5714,7 @@ def _fetch_rss_headlines_for_stock(ticker, name):
     return headlines[:3], sources[:3]
 
 def _generate_price_movement_summary(data):
-    """Generate a factual range position summary — price/% already shown in header."""
+    """Generate a factual price movement summary from price data alone — no Claude needed."""
     price = data.get("price", 0)
     change_pct = data.get("change_pct", 0)
     week52_low = data.get("week52_low")
@@ -5722,6 +5722,11 @@ def _generate_price_movement_summary(data):
     currency = data.get("currency", "")
     name = data.get("name", data.get("ticker", ""))
 
+    direction = "up" if change_pct >= 0 else "down"
+    sentences = []
+    sentences.append(
+        f"{name} is {direction} {abs(change_pct):.2f}% today, currently at {currency} {price:.2f}."
+    )
     if week52_low and week52_high:
         position = (price - week52_low) / (week52_high - week52_low) * 100 if week52_high != week52_low else 50
         if position >= 75:
@@ -5730,9 +5735,10 @@ def _generate_price_movement_summary(data):
             range_desc = "trading near its 52-week low"
         else:
             range_desc = "trading in the middle of its 52-week range"
-        return f"{name} is {range_desc} ({currency} {week52_low:.2f} – {currency} {week52_high:.2f})."
-    direction = "up" if change_pct >= 0 else "down"
-    return f"{name} is {direction} {abs(change_pct):.2f}% today."
+        sentences.append(
+            f"It is {range_desc} ({currency} {week52_low:.2f} – {currency} {week52_high:.2f})."
+        )
+    return " ".join(sentences)
 
 def fetch_stock_summary(ticker, name, price_data=None):
     """Fetch RSS headlines in parallel and generate a grounded summary. Falls back to price movement analysis."""
@@ -5804,14 +5810,11 @@ def format_price(data, summary=None):
         summary, _ = fetch_stock_summary(ticker, name, price_data=data)
 
     lines = [f"{flag} {name} ({ticker})"]
-    lines.append(f"Daily: {currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
+    lines.append(f"{currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
     if range_line:
         lines.append(range_line)
     lines.append("")
-    if summary:
-        lines.append(summary)
-    elif data:
-        lines.append(_generate_price_movement_summary(data))
+    lines.append(f"{summary if summary else _generate_price_movement_summary(data)}")
 
     return "\n".join(lines)
 
@@ -6255,8 +6258,10 @@ def handle_stock_request(text):
                                 "role": "user",
                                 "content": (
                                     f"Headlines about {name} ({ticker}):\n{source_context}\n\n"
-                                    "Write 1-2 short factual sentences about recent business developments or earnings from the headlines. "
-                                    "Factual only — no timing advice, no buy/sell signals, no speculation, no phrases like 'investors should' or 'right time to buy'. "
+                                    "Write 2-3 short factual sentences as one paragraph. "
+                                    "First sentence: where the stock sits in its 52-week range (near high, near low, or mid-range). "
+                                    "Remaining sentences: recent business developments or earnings from the headlines — factual only. "
+                                    "No timing advice, no buy/sell signals, no speculation, no phrases like 'investors should' or 'right time to buy'. "
                                     "End with a single [SourceName] tag for the most relevant source. No source tag if no usable headlines."
                                 )
                             }]
@@ -7898,9 +7903,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         merchant_name = text.split(" ", 2)[2].strip()
         reply = delete_merchant(merchant_name)
     elif lower in ["expense report", "monthly report", "spending report", "expenses",
-                   "monthly summary", "monthly spend", "this month", "expense summary",
-                   "my expenses", "check my expenses", "show expenses", "show my expenses",
-                   "expenses this month", "what have i spent", "spending this month"]:
+                   "monthly summary", "monthly spend", "this month", "expense summary"]:
         reply = get_expense_report()
     elif lower in ["delete last expense", "remove last expense"]:
         reply = delete_last_expense()
