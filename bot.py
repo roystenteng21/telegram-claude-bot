@@ -2354,6 +2354,7 @@ TIMEZONE = pytz.timezone("Asia/Kuala_Lumpur")
 # Tracks the last reminder fired per user so they can say "remind me again in 2 hours"
 last_fired_reminder = {}
 _pending_reminders_cache = None  # None = stale, list = valid cache
+_pending_reminders_cache_ts = None  # datetime of last full sheet read
 
 def reminders_sheet():
     try:
@@ -2497,16 +2498,18 @@ def get_next_recurrence(scheduled_time_str, recurrence):
         return None
 
 async def check_and_fire_reminders(app):
-    """Check pending reminders every minute. Uses in-memory cache — only re-reads sheet if cache is stale."""
-    global _pending_reminders_cache
+    """Check pending reminders every minute. Uses in-memory cache — re-reads every 5 min or on invalidation."""
+    global _pending_reminders_cache, _pending_reminders_cache_ts
     try:
         now = datetime.now(TIMEZONE).replace(second=0, microsecond=0)
 
-        # Populate cache if stale
-        if _pending_reminders_cache is None:
+        # Populate cache if stale (None) or older than 5 minutes
+        cache_age = (datetime.now(TIMEZONE) - _pending_reminders_cache_ts).total_seconds() if _pending_reminders_cache_ts else 999
+        if _pending_reminders_cache is None or cache_age > 300:
             sheet = reminders_sheet()
             records = sheet.get_all_records()
             _pending_reminders_cache = [(i, r) for i, r in enumerate(records) if r.get("Status") == "pending"]
+            _pending_reminders_cache_ts = datetime.now(TIMEZONE)
 
         pending_records = _pending_reminders_cache
 
@@ -2584,7 +2587,7 @@ def is_reminder_request(text):
     'alert me if' is stock. 'alert me when/to' is reminder."""
     lower = text.lower()
     triggers = [
-        "remind me", "remind", "set a reminder", "set me a reminder",
+        "remind me", "set a reminder", "set me a reminder",
         "reminder for", "reminder at", "reminder to",
         "don't let me forget", "dont let me forget",
         "i need to remember to", "i need to remember",
@@ -2815,8 +2818,6 @@ def fuzzy_match_category(text):
     return None, False
 
 # Foreign transaction fee estimates per card (%)
-# CARD_FX_FEES removed — was defined but never referenced
-
 # Overseas mode state
 overseas_state = {
     "active": False,
@@ -3219,8 +3220,8 @@ async def refresh_fx_rates(app=None):
             if EXCHANGE_RATE_API_KEY:
                 try:
                     url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_RATE_API_KEY}/pair/{currency}/SGD"
-                    with httpx.Client(timeout=8) as hx:
-                        resp = hx.get(url)
+                    async with httpx.AsyncClient(timeout=8) as hx:
+                        resp = await hx.get(url)
                     data = resp.json()
                     if data.get("result") == "success":
                         rate = float(data["conversion_rate"])
@@ -3644,7 +3645,7 @@ def is_expense_input(text):
         return False
     triggers = ["spent", "paid", "$", "sgd", "charged", "bought", "grabbed",
                 "receipt", "bill was", "cost me", "picked up",
-                "recorded in", "will it be", "logged in", "track", "how much have i"]
+                "recorded in", "will it be", "logged in", "how much have i"]
     return any(t in lower for t in triggers)
 
 LOCATION_CONTEXT_WORDS = {
@@ -3961,7 +3962,7 @@ async def handle_receipt_confirm_session(user_id, text, update):
             return True  # Stay in session, don't drop
         num, sgd_per_unit = parsed_rate
         save_manual_fx_rate(currency, num, sgd_per_unit)
-        rate = get_fx_rate(currency)
+        rate = await asyncio.to_thread(get_fx_rate, currency)
         session["sgd_amount"] = round(session["amount"] * rate, 2)
         session["step"] = "receipt_confirm"
         session["use_manual_rate"] = True
@@ -4207,7 +4208,7 @@ async def handle_expense_session(user_id, text, update):
             return  # Stay in session, don't drop
         num, sgd_per_unit = parsed_rate
         save_manual_fx_rate(currency, num, sgd_per_unit)
-        rate = get_fx_rate(currency)
+        rate = await asyncio.to_thread(get_fx_rate, currency)
         session["sgd_amount"] = round(session["amount"] * rate, 2)
         session["use_manual_rate"] = True
 
@@ -7561,8 +7562,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 if AVIATIONSTACK_API_KEY and fn:
                     # Try AviationStack
                     try:
-                        with httpx.Client(timeout=10) as hx:
-                            resp = hx.get(
+                        async with httpx.AsyncClient(timeout=10) as hx:
+                            resp = await hx.get(
                                 "http://api.aviationstack.com/v1/flights",
                                 params={"access_key": AVIATIONSTACK_API_KEY, "flight_iata": fn}
                             )
@@ -8043,7 +8044,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 if new_dest not in overseas_state["trip_destinations"]:
                     overseas_state["trip_destinations"].append(new_dest)
                 # Pre-cache the new currency rate
-                get_fx_rate(new_curr)
+                asyncio.create_task(asyncio.to_thread(get_fx_rate, new_curr))
                 # Update Trips sheet with new destination
                 try:
                     ws = trips_sheet()
