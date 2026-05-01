@@ -174,26 +174,26 @@ EM_LOG_HEADERS_BACKLOG = ["Priority", "Item", "Stage", "Notes", "Added", "Status
 EM_LOG_HEADERS_SESSION = ["Date", "Session", "Built", "Fixed", "Pending", "Commit"]
 
 INITIAL_BACKLOG = [
-    ["🔴", "log_expense: add error handling — financial data silently lost on sheet failure", "Step 3", "Wrap append_row in try/except, notify user if write fails, do not delete session until write confirmed", "2026-04-26", "🔲 Outstanding"],
-    ["🔴", "Session deleted before write confirmed — expense unrecoverable on failure", "Step 3", "Move del receipt_confirm_sessions[user_id] to after log_expense succeeds", "2026-04-26", "🔲 Outstanding"],
-    ["🔴", "save_merchant_memory silent fail — merchant never learned if sheet write fails", "Step 3", "Add error handling, log failure, do not silently swallow", "2026-04-26", "🔲 Outstanding"],
-    ["🟠", "sheets_call_with_retry uses time.sleep(60) — blocks entire event loop", "Step 3", "Replace with asyncio.sleep(60) inside async context", "2026-04-26", "🔲 Outstanding"],
-    ["🟠", "get_calendar uses time.sleep(3) on retry — blocks event loop on every calendar request", "Step 3", "Replace with asyncio.sleep or remove retry sleep", "2026-04-26", "🔲 Outstanding"],
-    ["🟠", "find_row: 5 full passes over CRM records, no cache — 1000 iterations per lookup", "Step 3", "Single-pass with match tiers, add CRM cache invalidated on write", "2026-04-26", "🔲 Outstanding"],
-    ["🟠", "check_and_fire_reminders: full sheet read every minute + find_row inside loop", "Step 3", "Cache pending reminders in memory, only re-read on write. Remove find_row from loop.", "2026-04-26", "🔲 Outstanding"],
-    ["🟠", "Duplicate routing: is_reminder_request 3x, is_stock_request 2x, others twice", "Step 3", "Eliminate else block, merge missing handlers into primary elif chain", "2026-04-26", "🔲 Outstanding"],
-    ["🟡", "Missing env var guard at startup — cryptic crash if TELEGRAM_TOKEN or ANTHROPIC_API_KEY unset", "Step 3", "Add explicit check and clear error message before app starts", "2026-04-26", "🔲 Outstanding"],
-    ["🟡", "float() cast on unvalidated Claude output in parse_expense_text_v2 — unhandled exception", "Step 3", "Validate amount field before cast, return user-friendly error if invalid", "2026-04-26", "🔲 Outstanding"],
-    ["🟡", "restore_overseas_from_trips: no fallback on corrupt data — silent bad state", "Step 3", "Wrap in try/except per field, skip row if malformed, log warning", "2026-04-26", "🔲 Outstanding"],
-    ["🟡", "FX rates lost on Railway restart — user must re-enter manually after every redeploy", "Step 3", "Persist cached_fx_rates to Settings sheet, load on startup", "2026-04-26", "🔲 Outstanding"],
-    ["🟡", "No timeout on RSS fetch in fetch_market_rss_headlines — indefinite hang possible", "Step 3", "Add timeout=10 to requests.get call", "2026-04-26", "🔲 Outstanding"],
-    ["🟢", "_finalise_expense_session labelled legacy but still wired — dead code", "Step 3", "Remove function, update any callers", "2026-04-26", "🔲 Outstanding"],
-    ["🟢", "CARD_FX_FEES dict defined but never referenced anywhere", "Step 3", "Remove or wire up to FX fee display", "2026-04-26", "🔲 Outstanding"],
-    ["🟢", "bare except: in format_date and calculate_age swallows all exceptions", "Step 3", "Replace with except ValueError", "2026-04-26", "🔲 Outstanding"],
-    ["🟢", "Haiku for parse_expense_text_v2 and is_calendar_request — Sonnet overkill", "Step 3", "Switch model to claude-haiku-3, verify output quality unchanged", "2026-04-26", "🔲 Outstanding"],
-    ["🟢", "S5: End-to-end feature testing — no systematic test coverage across modules", "Step 3", "Test all features post-modularisation: expenses, CRM, trips, reminders, stocks, restaurants, calendar, todos", "2026-04-29", "🔲 Outstanding"],
-    ["🟢", "S5: Input forgiveness — narrow phrasing recognition misses natural variants", "Step 3", "Broaden detector patterns for common commands; test with varied natural language inputs", "2026-04-29", "🔲 Outstanding"],
-    ["🟢", "S5: Response consistency — emoji, error format, reply length vary across handlers", "Step 3", "Audit all reply strings; standardise error prefix, emoji usage, and length conventions", "2026-04-29", "🔲 Outstanding"],
+    ["🔴", "log_expense: add error handling — financial data silently lost on sheet failure", "Step 3", "Wrap append_row in try/except, notify user if write fails, do not delete session until write confirmed", "2026-04-26", "✅ Done"],
+    ["🔴", "Session deleted before write confirmed — expense unrecoverable on failure", "Step 3", "Move del receipt_confirm_sessions[user_id] to after log_expense succeeds", "2026-04-26", "✅ Done"],
+    ["🔴", "save_merchant_memory silent fail — merchant never learned if sheet write fails", "Step 3", "Add error handling, log failure, do not silently swallow", "2026-04-26", "✅ Done"],
+    ["🟠", "sheets_call_with_retry uses time.sleep(60) — blocks entire event loop", "Step 3", "Replace with asyncio.sleep(60) inside async context", "2026-04-26", "✅ Done"],
+    ["🟠", "get_calendar uses time.sleep(3) on retry — blocks event loop on every calendar request", "Step 3", "Replace with asyncio.sleep or remove retry sleep", "2026-04-26", "✅ Done"],
+    ["🟠", "find_row: 5 full passes over CRM records, no cache — 1000 iterations per lookup", "Step 3", "Single-pass with match tiers, add CRM cache invalidated on write", "2026-04-26", "✅ Done"],
+    ["🟠", "check_and_fire_reminders: full sheet read every minute + find_row inside loop", "Step 3", "Cache pending reminders in memory, only re-read on write. Remove find_row from loop.", "2026-04-26", "✅ Done"],
+    ["🟠", "Duplicate routing: is_reminder_request 3x, is_stock_request 2x, others twice", "Step 3", "Eliminate else block, merge missing handlers into primary elif chain", "2026-04-26", "✅ Done"],
+    ["🟡", "Missing env var guard at startup — cryptic crash if TELEGRAM_TOKEN or ANTHROPIC_API_KEY unset", "Step 3", "Add explicit check and clear error message before app starts", "2026-04-26", "✅ Done"],
+    ["🟡", "float() cast on unvalidated Claude output in parse_expense_text_v2 — unhandled exception", "Step 3", "Validate amount field before cast, return user-friendly error if invalid", "2026-04-26", "✅ Done"],
+    ["🟡", "restore_overseas_from_trips: no fallback on corrupt data — silent bad state", "Step 3", "Wrap in try/except per field, skip row if malformed, log warning", "2026-04-26", "✅ Done"],
+    ["🟡", "FX rates lost on Railway restart — user must re-enter manually after every redeploy", "Step 3", "Persist cached_fx_rates to Settings sheet, load on startup", "2026-04-26", "✅ Done"],
+    ["🟡", "No timeout on RSS fetch in fetch_market_rss_headlines — indefinite hang possible", "Step 3", "Add timeout=10 to requests.get call", "2026-04-26", "✅ Done"],
+    ["🟢", "_finalise_expense_session labelled legacy but still wired — dead code", "Step 3", "Remove function, update any callers", "2026-04-26", "✅ Done"],
+    ["🟢", "CARD_FX_FEES dict defined but never referenced anywhere", "Step 3", "Remove or wire up to FX fee display", "2026-04-26", "✅ Done"],
+    ["🟢", "bare except: in format_date and calculate_age swallows all exceptions", "Step 3", "Replace with except ValueError", "2026-04-26", "✅ Done"],
+    ["🟢", "Haiku for parse_expense_text_v2 and is_calendar_request — Sonnet overkill", "Step 3", "Switch model to claude-haiku-3, verify output quality unchanged", "2026-04-26", "✅ Done"],
+    ["🟢", "S5: End-to-end feature testing — no systematic test coverage across modules", "Step 3", "Test all features post-modularisation: expenses, CRM, trips, reminders, stocks, restaurants, calendar, todos", "2026-04-29", "✅ Done"],
+    ["🟢", "S5: Input forgiveness — narrow phrasing recognition misses natural variants", "Step 3", "Broaden detector patterns for common commands; test with varied natural language inputs", "2026-04-29", "✅ Done"],
+    ["🟢", "S5: Response consistency — emoji, error format, reply length vary across handlers", "Step 3", "Audit all reply strings; standardise error prefix, emoji usage, and length conventions", "2026-04-29", "✅ Done"],
 ]
 
 INITIAL_SESSION = [
@@ -333,6 +333,68 @@ def _migrate_backlog_status(ws, all_values):
             print(f"Status migration error row {sheet_row}: {e}")
     if updates:
         print(f"✅ Migrated {len(updates)} backlog rows — Status column added")
+
+
+def reconcile_backlog_status():
+    """On startup: update any Em Log backlog rows whose status is outdated relative to INITIAL_BACKLOG.
+    Compares item text (substring match) against INITIAL_BACKLOG to determine correct status.
+    Only updates rows that are currently marked Outstanding but should be Done."""
+    try:
+        ws = em_log_sheet()
+        if not ws:
+            return
+        all_values = ws.get_all_values()
+
+        # Build lookup: item text snippet -> correct status from INITIAL_BACKLOG
+        correct_status = {}
+        for row in INITIAL_BACKLOG:
+            if len(row) >= 6:
+                correct_status[row[1][:40].lower()] = row[5]  # first 40 chars -> status
+
+        in_backlog = False
+        header_passed = False
+        updates = []
+        for i, row in enumerate(all_values):
+            if not row:
+                continue
+            if "BACKLOG" in str(row[0]):
+                in_backlog = True
+                continue
+            if "SESSION HISTORY" in str(row[0]):
+                break
+            if not in_backlog:
+                continue
+            if row[0] == "Priority":
+                header_passed = True
+                continue
+            if not header_passed:
+                continue
+            item_text = row[1] if len(row) > 1 else ""
+            current_status = row[5] if len(row) > 5 else ""
+            if current_status == "✅ Done":
+                continue  # already correct
+            # Match against INITIAL_BACKLOG by substring
+            item_key = item_text[:40].lower()
+            matched_status = None
+            for key, status in correct_status.items():
+                if key and (key in item_key or item_key in key):
+                    matched_status = status
+                    break
+            if matched_status == "✅ Done":
+                updates.append((i + 1, 6, "✅ Done"))
+
+        for sheet_row, col, val in updates:
+            try:
+                ws.update_cell(sheet_row, col, val)
+            except Exception as e:
+                print(f"reconcile_backlog_status update error row {sheet_row}: {e}")
+
+        if updates:
+            print(f"✅ Backlog reconciled — marked {len(updates)} items Done")
+        else:
+            print("Backlog reconcile: no updates needed")
+    except Exception as e:
+        print(f"reconcile_backlog_status error: {e}")
 
 
 def em_log_sheet():
@@ -8486,6 +8548,12 @@ async def post_init(app):
     global _scheduler, _app_ref
     # Run infrastructure setup and capture health status
     health = run_infrastructure_setup()
+
+    # Reconcile Em Log backlog — mark items Done that are fixed in code
+    try:
+        reconcile_backlog_status()
+    except Exception as e:
+        print(f"Startup: backlog reconcile failed: {e}")
 
     # Warm card names cache on startup
     try:
