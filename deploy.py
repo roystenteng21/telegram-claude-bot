@@ -3,13 +3,14 @@
 deploy.py — Em deployment script
 Usage: python3 ~/telegram-claude-bot/deploy.py "commit msg" "Session N" "built" "fixed" "pending"
 - Copies all 20 module files from ~ to ~/telegram-claude-bot/
+- Writes session_meta.json to repo (Railway reads this on boot to update Em Log + Module Registry)
 - Commits and pushes to GitHub
 - Railway auto-deploys on push
-- Updates Em Log and Module Registry in Google Sheets
 """
 
 import os
 import sys
+import json
 import subprocess
 from datetime import date
 
@@ -38,6 +39,7 @@ MODULE_FILES = [
 ]
 
 REPO_DIR = os.path.expanduser("~/telegram-claude-bot")
+SESSION_META_PATH = os.path.join(REPO_DIR, "session_meta.json")
 
 
 def run(cmd, cwd=None):
@@ -47,18 +49,46 @@ def run(cmd, cwd=None):
         print(f"STDOUT: {result.stdout}")
         print(f"STDERR: {result.stderr}")
         if "nothing to commit" in result.stdout or "nothing to commit" in result.stderr:
-            return  # Not an error
+            return
         raise RuntimeError(f"Command failed: {cmd}")
     return result.stdout.strip()
 
 
 def copy_modules():
-    # Files are saved directly into REPO_DIR — no copy needed.
     missing = [f for f in MODULE_FILES if not os.path.exists(os.path.join(REPO_DIR, f))]
     if missing:
         print(f"⚠️  Missing from repo: {', '.join(missing)}")
     else:
         print(f"✅ All {len(MODULE_FILES)} module files present in repo")
+
+
+def _read_deploy_count():
+    """Read current deploy_count from session_meta.json, defaulting to 0."""
+    try:
+        if os.path.exists(SESSION_META_PATH):
+            with open(SESSION_META_PATH) as f:
+                data = json.load(f)
+            return data.get("deploy_count", 0)
+    except Exception:
+        pass
+    return 0
+
+
+def write_session_meta(session_name, built, fixed, pending):
+    """Write session_meta.json to repo. Railway reads this on boot."""
+    deploy_count = _read_deploy_count() + 1
+    meta = {
+        "date": date.today().strftime("%Y-%m-%d"),
+        "session": session_name,
+        "built": built,
+        "fixed": fixed,
+        "pending": pending,
+        "deploy_count": deploy_count,
+    }
+    with open(SESSION_META_PATH, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"✅ session_meta.json written (deploy #{deploy_count})")
+    return deploy_count
 
 
 def git_commit_push(commit_msg):
@@ -87,37 +117,6 @@ def git_commit_push(commit_msg):
         return False
 
 
-def _has_credentials():
-    """Return True if Google credentials are available in this environment."""
-    if os.environ.get("GOOGLE_CREDENTIALS"):
-        return True
-    if os.path.exists(os.path.join(REPO_DIR, "credentials.json")):
-        return True
-    return False
-
-
-def update_em_log_and_registry(session_name, built, fixed, pending, commit_hash):
-    """Update Em Log and Module Registry in Google Sheets.
-    Skipped silently when credentials are not available — Railway handles this on boot.
-    """
-    if not _has_credentials():
-        print("ℹ️  No local credentials — Em Log + Module Registry will update on Railway boot.")
-        return
-    try:
-        sys.path.insert(0, REPO_DIR)
-        from sheets import add_session_to_em_log, update_module_registry
-        today = date.today().strftime("%Y-%m-%d")
-        add_session_to_em_log(today, session_name, built, fixed, pending, commit_hash)
-        print(f"✅ Em Log updated: {session_name}")
-        for fname in MODULE_FILES:
-            mod_name = fname.replace(".py", "")
-            update_module_registry(mod_name, fname, today, session_name, "✅ Active")
-        print("✅ Module Registry updated")
-    except Exception as e:
-        print(f"⚠️  Em Log / Module Registry update failed: {e}")
-        print("    (Deploy succeeded — Railway will update on boot)")
-
-
 def get_commit_hash():
     try:
         result = subprocess.run(
@@ -144,13 +143,14 @@ def main():
     print(f"   Commit: {commit_msg}\n")
 
     copy_modules()
+    write_session_meta(session_name, built, fixed, pending)
     pushed = git_commit_push(commit_msg)
     commit_hash = get_commit_hash()
 
     if pushed:
-        update_em_log_and_registry(session_name, built, fixed, pending, commit_hash)
         print(f"\n✅ Deploy complete — {commit_hash}")
         print("   Railway will restart Em in ~30 seconds.")
+        print("   Em Log + Module Registry will update automatically on boot.")
     else:
         print(f"\n✅ Files copied. No new commit (files unchanged).")
 

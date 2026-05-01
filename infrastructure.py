@@ -4,7 +4,7 @@ from datetime import date
 import state
 from config import RAILWAY_DEPLOYMENT_ID, YOUR_CHAT_ID
 from clients import spreadsheet, drive_service
-from sheets import setup_sheets, get_sheet, reconcile_backlog_status
+from sheets import setup_sheets, get_sheet, reconcile_backlog_status, apply_boot_em_log
 
 def get_or_create_drive_folder(name, parent_id=None):
     query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
@@ -135,6 +135,10 @@ def run_infrastructure_setup():
         reconcile_backlog_status()
     except Exception as e:
         print(f"reconcile_backlog_status error: {e}")
+    try:
+        apply_boot_em_log()
+    except Exception as e:
+        print(f"apply_boot_em_log error: {e}")
     print("✅ Infrastructure setup complete")
     return health
 

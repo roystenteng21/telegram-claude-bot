@@ -185,6 +185,109 @@ def get_pending_backlog():
     except Exception as e:
         return f"❌ Couldn't read backlog: {e}"
 
+def clear_done_backlog_items():
+    """Delete all backlog rows where Status = ✅ Done. Called every 3 deploys."""
+    try:
+        ws = em_log_sheet()
+        if not ws:
+            return
+        all_values = ws.get_all_values()
+        in_backlog = False
+        header_passed = False
+        rows_to_delete = []
+        for i, row in enumerate(all_values):
+            if not row:
+                continue
+            if "BACKLOG" in str(row[0]):
+                in_backlog = True
+                continue
+            if "SESSION HISTORY" in str(row[0]):
+                break
+            if in_backlog:
+                if row[0] == "Priority":
+                    header_passed = True
+                    continue
+                if header_passed and row[0] not in ("── BACKLOG (max 10) ──", ""):
+                    status = row[5] if len(row) > 5 else ""
+                    if "Done" in status:
+                        rows_to_delete.append(i + 1)
+        # Delete in reverse order to preserve row indices
+        for row_num in reversed(rows_to_delete):
+            try:
+                ws.delete_rows(row_num)
+            except Exception as e:
+                print(f"clear_done_backlog_items: delete row {row_num} error: {e}")
+        if rows_to_delete:
+            print(f"✅ Cleared {len(rows_to_delete)} done backlog item(s)")
+        else:
+            print("clear_done_backlog_items: nothing to clear")
+    except Exception as e:
+        print(f"clear_done_backlog_items error: {e}")
+
+# ── Boot-time Em Log + Module Registry update ──────────────────────────────────
+
+_SESSION_META_PATH = os.path.join(os.path.dirname(__file__), "session_meta.json")
+
+def apply_boot_em_log():
+    """
+    Called once on Railway boot. Reads session_meta.json written by deploy.py,
+    updates Em Log and Module Registry, then deletes the file so it only fires once.
+    Every 3rd deploy also clears done backlog items.
+    """
+    if not os.path.exists(_SESSION_META_PATH):
+        return
+
+    try:
+        with open(_SESSION_META_PATH) as f:
+            meta = json.load(f)
+    except Exception as e:
+        print(f"apply_boot_em_log: could not read session_meta.json: {e}")
+        return
+
+    session   = meta.get("session", "Unknown session")
+    built     = meta.get("built", "")
+    fixed     = meta.get("fixed", "")
+    pending   = meta.get("pending", "")
+    date_str  = meta.get("date", date.today().strftime("%Y-%m-%d"))
+    deploy_count = meta.get("deploy_count", 0)
+
+    # Em Log
+    try:
+        add_session_to_em_log(date_str, session, built, fixed, pending, "boot")
+    except Exception as e:
+        print(f"apply_boot_em_log: add_session_to_em_log error: {e}")
+
+    # Module Registry — update Last Changed + Session for all known modules
+    try:
+        for fname in MODULE_FILES_LIST:
+            mod_name = fname.replace(".py", "")
+            update_module_registry(mod_name, fname, date_str, session, "✅ Active")
+    except Exception as e:
+        print(f"apply_boot_em_log: update_module_registry error: {e}")
+
+    # Every 3rd deploy, clear done backlog items
+    if deploy_count and deploy_count % 3 == 0:
+        try:
+            clear_done_backlog_items()
+        except Exception as e:
+            print(f"apply_boot_em_log: clear_done_backlog_items error: {e}")
+
+    # Delete session_meta.json so this only fires once per deploy
+    try:
+        os.remove(_SESSION_META_PATH)
+        print(f"✅ Boot Em Log applied: {session}")
+    except Exception as e:
+        print(f"apply_boot_em_log: could not delete session_meta.json: {e}")
+
+# ── Module file list (shared with deploy.py logic) ─────────────────────────────
+
+MODULE_FILES_LIST = [
+    "config.py", "clients.py", "state.py", "sheets.py", "helpers.py",
+    "crm.py", "expenses.py", "fx.py", "reminders.py", "cal.py",
+    "todos.py", "meetings.py", "bills.py", "restaurants.py", "stocks.py",
+    "trips.py", "sessions.py", "routing.py", "infrastructure.py", "bot.py",
+]
+
 # ── Setup functions ────────────────────────────────────────────────────────────
 
 MODULE_REGISTRY_HEADERS = ["Module", "File", "Layer", "Key Functions", "Imports From", "Last Changed", "Session", "Status"]
