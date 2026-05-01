@@ -4749,11 +4749,13 @@ def rename_category(old_name, new_name):
         print(f"rename_category merchant map error: {e}")
     # Update Cards sheet Default Category column
     try:
+        global _card_names_cache
         ws = cards_sheet()
         records = ws.get_all_records()
         for i, r in enumerate(records, start=2):
             if r.get("Default Category", "").strip().lower() == matched.lower():
                 ws.update_cell(i, 3, new_clean)  # Default Category is col 3
+        _card_names_cache = None  # invalidate on write
     except Exception as e:
         print(f"rename_category cards sheet error: {e}")
 
@@ -5142,7 +5144,7 @@ def get_restaurant_emoji(name, cuisine_hint=""):
     except Exception:
         return "🍽"
 
-def get_restaurant_review(name):
+async def get_restaurant_review(name):
     """Fetch RSS headlines and generate formatted review with emoji, 2 bullets, and plain text summary."""
     try:
         import xml.etree.ElementTree as ET
@@ -5154,8 +5156,8 @@ def get_restaurant_review(name):
             q = q_text.replace(" ", "+")
             url = f"https://news.google.com/rss/search?q={q}&hl=en-SG&gl=SG&ceid=SG:en"
             try:
-                with httpx.Client(timeout=5) as hx:
-                    resp = hx.get(url)
+                async with httpx.AsyncClient(timeout=5) as hx:
+                    resp = await hx.get(url)
                 root = ET.fromstring(resp.content)
                 for item in root.findall(".//item"):
                     if len(headlines) >= 4:
@@ -5263,7 +5265,7 @@ def is_restaurant_suggestion_request(text):
                 "restaurants like", "something like", "alternatives to", "similar places"]
     return any(t in lower for t in triggers)
 
-def get_similar_restaurants(text):
+async def get_similar_restaurants(text):
     """Suggest similar restaurants based on cuisine/vibe — grounded in RSS results for real places."""
     try:
         import xml.etree.ElementTree as ET
@@ -5301,8 +5303,8 @@ def get_similar_restaurants(text):
         try:
             query = f"best restaurants similar to {ref_name or text} Singapore".replace(" ", "+")
             url = f"https://news.google.com/rss/search?q={query}&hl=en-SG&gl=SG&ceid=SG:en"
-            with httpx.Client(timeout=3) as hx:
-                resp = hx.get(url)
+            async with httpx.AsyncClient(timeout=3) as hx:
+                resp = await hx.get(url)
             root = ET.fromstring(resp.content)
             for item in root.findall(".//item")[:5]:
                 title = item.findtext("title", "").split(" - ")[0].strip()
@@ -5587,12 +5589,12 @@ def normalise_ticker(ticker):
         return f"{upper}.HK"
     return upper
 
-def fetch_weekly_change(ticker):
+async def fetch_weekly_change(ticker):
     """Fetch weekly % change — previous completed calendar week (last Mon open → last Fri close)."""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1wk&range=1mo"
-        with httpx.Client(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as hx:
-            resp = hx.get(url)
+        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as hx:
+            resp = await hx.get(url)
         data = resp.json()
         result = data["chart"]["result"][0]
         closes = result["indicators"]["quote"][0].get("close", [])
@@ -5609,15 +5611,15 @@ def fetch_weekly_change(ticker):
         print(f"fetch_weekly_change error for {ticker}: {e}")
     return None
 
-def fetch_price(ticker):
+async def fetch_price(ticker):
     """Fetch current price — Yahoo Finance primary (full data), Alpha Vantage secondary."""
     ticker = normalise_ticker(ticker)
 
     # --- Yahoo Finance (primary) ---
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1y"
-        with httpx.Client(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as hx:
-            resp = hx.get(url)
+        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as hx:
+            resp = await hx.get(url)
         data = resp.json()
         result = data["chart"]["result"][0]
         meta = result["meta"]
@@ -5666,8 +5668,8 @@ def fetch_price(ticker):
                 f"https://www.alphavantage.co/query"
                 f"?function=GLOBAL_QUOTE&symbol={ticker}&apikey={ALPHA_VANTAGE_API_KEY}"
             )
-            with httpx.Client(timeout=10) as hx:
-                resp = hx.get(url)
+            async with httpx.AsyncClient(timeout=10) as hx:
+                resp = await hx.get(url)
             data = resp.json()
             quote = data.get("Global Quote", {})
             if quote.get("05. price"):
@@ -5725,10 +5727,9 @@ def get_source_label(source_name):
             return None
     return None  # Unknown — omit rather than show garbage
 
-def _fetch_rss_headlines_for_stock(ticker, name):
+async def _fetch_rss_headlines_for_stock(ticker, name):
     """Fetch up to 3 headlines from Google News + Yahoo Finance RSS in parallel."""
     import xml.etree.ElementTree as ET
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     # Best single query per source
     gn_query = f"{name} stock".replace(" ", "+")
@@ -5743,10 +5744,10 @@ def _fetch_rss_headlines_for_stock(ticker, name):
     sources = []
     seen = set()
 
-    def fetch_one(url):
+    async def fetch_one(url):
         try:
-            with httpx.Client(timeout=3) as hx:
-                resp = hx.get(url)
+            async with httpx.AsyncClient(timeout=3) as hx:
+                resp = await hx.get(url)
             root = ET.fromstring(resp.content)
             results = []
             for item in root.findall(".//item"):
@@ -5760,14 +5761,15 @@ def _fetch_rss_headlines_for_stock(ticker, name):
             print(f"RSS fetch error {url}: {e}")
             return []
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        futures = [ex.submit(fetch_one, url) for url in rss_sources]
-        for f in as_completed(futures):
-            for title, source in f.result():
-                if title not in seen and len(headlines) < 4:
-                    seen.add(title)
-                    headlines.append(title)
-                    sources.append(source)
+    results = await asyncio.gather(*[fetch_one(url) for url in rss_sources], return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        for title, source in result:
+            if title not in seen and len(headlines) < 4:
+                seen.add(title)
+                headlines.append(title)
+                sources.append(source)
 
     return headlines[:3], sources[:3]
 
@@ -5798,11 +5800,9 @@ def _generate_price_movement_summary(data):
         )
     return " ".join(sentences)
 
-def fetch_stock_summary(ticker, name, price_data=None):
+async def fetch_stock_summary(ticker, name, price_data=None):
     """Fetch RSS headlines in parallel and generate a grounded summary. Falls back to price movement analysis."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    headlines, sources = _fetch_rss_headlines_for_stock(ticker, name)
+    headlines, sources = await _fetch_rss_headlines_for_stock(ticker, name)
 
     # Build readable source labels — skip obscure ones
     labelled = []
@@ -5846,7 +5846,7 @@ def fetch_stock_summary(ticker, name, price_data=None):
             return _generate_price_movement_summary(price_data), []
         return None, []
 
-def format_price(data, summary=None):
+async def format_price(data, summary=None):
     """Format stock price — flag, name, price, state, 52-week range, sourced summary."""
     if not data:
         return None
@@ -5865,7 +5865,7 @@ def format_price(data, summary=None):
     range_line = f"52-week range: {currency} {week52_low:.2f} – {currency} {week52_high:.2f}" if week52_low and week52_high else ""
 
     if summary is None:
-        summary, _ = fetch_stock_summary(ticker, name, price_data=data)
+        summary, _ = await fetch_stock_summary(ticker, name, price_data=data)
 
     lines = [f"{flag} {name} ({ticker})"]
     lines.append(f"{currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
@@ -5992,9 +5992,14 @@ def format_trip_history():
 
 def log_portfolio_buy(ticker, quantity, price, buy_date=None):
     """Log a stock purchase to Portfolio sheet."""
-    sheet = portfolio_sheet()
-    today = buy_date or date.today().strftime("%d/%m/%Y")
-    sheet.append_row([ticker.upper(), str(quantity), str(price), today, ""])
+    try:
+        sheet = portfolio_sheet()
+        today = buy_date or date.today().strftime("%d/%m/%Y")
+        sheet.append_row([ticker.upper(), str(quantity), str(price), today, ""])
+        return True
+    except Exception as e:
+        print(f"log_portfolio_buy error for {ticker}: {e}")
+        return False
 
 def get_portfolio_holdings():
     """Get current holdings with average cost."""
@@ -6029,7 +6034,7 @@ def get_portfolio_holdings():
         print(f"Error getting portfolio: {e}")
         return {}
 
-def get_portfolio_performance():
+async def get_portfolio_performance():
     """Get portfolio performance — current vs average cost."""
     holdings = get_portfolio_holdings()
     if not holdings:
@@ -6040,7 +6045,7 @@ def get_portfolio_performance():
     total_value = 0
 
     for ticker, h in holdings.items():
-        data = fetch_price(ticker)
+        data = await fetch_price(ticker)
         avg = h["avg_cost"]
         qty = h["qty"]
         cost = avg * qty
@@ -6174,7 +6179,7 @@ async def check_price_alerts(app):
         for ticker, alert in list(price_alerts.items()):
             if not alert.get("active"):
                 continue
-            data = fetch_price(ticker)
+            data = await fetch_price(ticker)
             if not data:
                 continue
             current = data["price"]
@@ -6198,7 +6203,7 @@ async def check_price_alerts(app):
 async def send_weekly_market_summary(app):
     """Monday 8am — send US, China, India market summary using agreed qualitative format."""
     try:
-        msg = get_market_summary_now()
+        msg = await get_market_summary_now()
         await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
         # Persist sent date to Settings so restart doesn't re-prompt
         try:
@@ -6276,7 +6281,7 @@ def is_stock_request(text):
         return True
     return False
 
-def handle_stock_request(text):
+async def handle_stock_request(text):
     """Route a stock request to the right handler."""
     try:
         parsed = parse_stock_request(text)
@@ -6286,13 +6291,11 @@ def handle_stock_request(text):
         ticker = parsed.get("ticker", "").upper()
 
         if intent == "price_check" and ticker:
-            from concurrent.futures import ThreadPoolExecutor
             # Run price fetch and RSS fetch in parallel
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                price_future = ex.submit(fetch_price, ticker)
-                rss_future = ex.submit(_fetch_rss_headlines_for_stock, ticker, ticker)
-                data = price_future.result()
-                rss_headlines, rss_sources = rss_future.result()
+            data, (rss_headlines, rss_sources) = await asyncio.gather(
+                fetch_price(ticker),
+                _fetch_rss_headlines_for_stock(ticker, ticker)
+            )
 
             if data:
                 # OTC filter — reject no-suffix tickers resolving to OTC markets
@@ -6331,7 +6334,7 @@ def handle_stock_request(text):
                     summary = _generate_price_movement_summary(data)
 
                 # Pass pre-fetched summary into format_price to avoid duplicate output
-                return format_price(data, summary=summary)
+                return await format_price(data, summary=summary)
 
             if ALPHA_VANTAGE_API_KEY:
                 return f"Couldn't fetch {ticker} — Alpha Vantage and Yahoo Finance both failed. The ticker may be wrong, or try again in a moment."
@@ -6350,11 +6353,13 @@ def handle_stock_request(text):
             price = parsed.get("price", 0)
             if not qty or not price:
                 return "I need the quantity and price. Try: 'bought 100 AAPL at $180'"
-            log_portfolio_buy(ticker, qty, price)
-            return f"Logged — {qty:.0f} {ticker} @ ${price:.2f}."
+            ok = log_portfolio_buy(ticker, qty, price)
+            if ok:
+                return f"Logged — {qty:.0f} {ticker} @ ${price:.2f}."
+            return f"❌ Couldn't save that to the portfolio — try again."
 
         elif intent == "portfolio_view":
-            return get_portfolio_performance()
+            return await get_portfolio_performance()
 
         elif intent == "stock_suggest":
             criteria = parsed.get("criteria", text)
@@ -6367,9 +6372,9 @@ def handle_stock_request(text):
         else:
             # Fallback — try price check if ticker found
             if ticker:
-                data = fetch_price(ticker)
+                data = await fetch_price(ticker)
                 if data:
-                    return format_price(data)
+                    return await format_price(data)
                 return f"Couldn't find data for {ticker} — check the ticker and try again."
             return "Couldn't work out what stock you're asking about. Try 'price of AAPL' or 'what's DBS at'."
 
@@ -6443,7 +6448,7 @@ _HEADLINE_REJECT = [
     "here's what", "what you need", "everything you need",
 ]
 
-def fetch_market_rss_headlines(market_name):
+async def fetch_market_rss_headlines(market_name):
     """Fetch top 3 informative market headlines from Google News RSS. Filters clickbait/speculative titles."""
     try:
         queries = {
@@ -6467,8 +6472,8 @@ def fetch_market_rss_headlines(market_name):
             q = q_text.replace(" ", "+")
             url = f"https://news.google.com/rss/search?q={q}&hl=en-SG&gl=SG&ceid=SG:en"
             try:
-                with httpx.Client(timeout=5) as hx:
-                    resp = hx.get(url)
+                async with httpx.AsyncClient(timeout=5) as hx:
+                    resp = await hx.get(url)
                 root = ET.fromstring(resp.content)
                 for item in root.findall(".//item"):
                     if len(headlines) >= 3:
@@ -6489,7 +6494,7 @@ def fetch_market_rss_headlines(market_name):
         print(f"fetch_market_rss_headlines error for {market_name}: {e}")
         return []
 
-def get_market_summary_now():
+async def get_market_summary_now():
     """Generate market summary — one index per market, weekly %, filtered bullets, 2-3 sentence overall."""
     try:
         market_data_blocks = []
@@ -6500,10 +6505,10 @@ def get_market_summary_now():
             ticker, index_name = list(indices.items())[0]
 
             # Weekly % change
-            weekly_pct = fetch_weekly_change(ticker)
+            weekly_pct = await fetch_weekly_change(ticker)
             if weekly_pct is None:
                 # Fallback to daily
-                price_data = fetch_price(ticker)
+                price_data = await fetch_price(ticker)
                 weekly_pct = price_data["change_pct"] if price_data else 0
                 arrow = "▲" if weekly_pct >= 0 else "▼"
                 pct_str = f"Day {arrow} {abs(weekly_pct):.1f}%"
@@ -6511,7 +6516,7 @@ def get_market_summary_now():
                 arrow = "▲" if weekly_pct >= 0 else "▼"
                 pct_str = f"Week {arrow} {abs(weekly_pct):.1f}%"
 
-            headlines = fetch_market_rss_headlines(market)
+            headlines = await fetch_market_rss_headlines(market)
             all_headlines.extend(headlines)
 
             block = {
@@ -7848,7 +7853,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # Missed market summary response
     elif lower in ["yes", "y", "yep", "yeah", "yup"] and market_summary_pending.get(user_id):
         market_summary_pending.pop(user_id, None)
-        reply = get_market_summary_now()
+        reply = await get_market_summary_now()
 
     # Card defaults
     elif re.match(r"set default card for .+ to .+", lower):
@@ -8121,15 +8126,16 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif lower.startswith("search restaurants "):
         reply = search_restaurants(text[19:].strip())
     elif is_restaurant_suggestion_request(text):
-        reply = get_similar_restaurants(text)
+        reply = await get_similar_restaurants(text)
     elif is_restaurant_review_request(text):
         # Extract restaurant name — strip review trigger words
         name = re.sub(r"reviews? for|review of|tell me about|how is|how's|what's|what is", "", lower).strip().rstrip("?").strip()
-        reply = get_restaurant_review(name) if name else "Which restaurant are you asking about?"
+        reply = await get_restaurant_review(name) if name else "Which restaurant are you asking about?"
 
     # Stock Commands
-    elif lower in ["portfolio", "my portfolio", "holdings", "portfolio performance"]:
-        reply = get_portfolio_performance()
+    elif lower in ["portfolio", "my portfolio", "holdings", "portfolio performance",
+                   "how is my portfolio", "how are my stocks", "portfolio today", "check portfolio"]:
+        reply = await get_portfolio_performance()
     elif lower in ["delete from portfolio", "remove from portfolio", "delete holding", "remove holding",
                    "portfolio delete", "clear holding"]:
         rows = get_portfolio_rows()
@@ -8151,9 +8157,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = format_portfolio_delete_list(results)
     elif lower in ["market summary", "market today", "how is the market", "market update",
                    "weekly market summary", "how are markets"]:
-        reply = get_market_summary_now()
+        reply = await get_market_summary_now()
     elif is_stock_request(text):
-        result = handle_stock_request(text)
+        result = await handle_stock_request(text)
         if result:
             reply = result
 
@@ -8228,7 +8234,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             issues.append("• Profile: not loaded — reply 'reload profile' to retry")
         # iCloud
         try:
-            get_calendar("Personal")
+            await asyncio.to_thread(get_calendar, "Personal")
         except Exception as e:
             issues.append(f"• iCloud Calendar: unreachable — check ICLOUD_USERNAME / ICLOUD_PASSWORD in Railway")
         # Anthropic API
