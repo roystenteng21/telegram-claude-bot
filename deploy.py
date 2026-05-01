@@ -10,7 +10,6 @@ Usage: python3 ~/telegram-claude-bot/deploy.py "commit msg" "Session N" "built" 
 
 import os
 import sys
-import shutil
 import subprocess
 from datetime import date
 
@@ -39,7 +38,6 @@ MODULE_FILES = [
 ]
 
 REPO_DIR = os.path.expanduser("~/telegram-claude-bot")
-HOME_DIR = os.path.expanduser("~")
 
 
 def run(cmd, cwd=None):
@@ -55,20 +53,12 @@ def run(cmd, cwd=None):
 
 
 def copy_modules():
-    copied = []
-    missing = []
-    for fname in MODULE_FILES:
-        src = os.path.join(HOME_DIR, fname)
-        dst = os.path.join(REPO_DIR, fname)
-        if os.path.exists(src):
-            shutil.copy2(src, dst)
-            copied.append(fname)
-        else:
-            missing.append(fname)
-    if copied:
-        print(f"✅ Copied {len(copied)} module(s): {', '.join(copied)}")
+    # Files are saved directly into REPO_DIR — no copy needed.
+    missing = [f for f in MODULE_FILES if not os.path.exists(os.path.join(REPO_DIR, f))]
     if missing:
-        print(f"⚠️  Missing (not in ~): {', '.join(missing)}")
+        print(f"⚠️  Missing from repo: {', '.join(missing)}")
+    else:
+        print(f"✅ All {len(MODULE_FILES)} module files present in repo")
 
 
 def git_commit_push(commit_msg):
