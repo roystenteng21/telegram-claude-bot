@@ -159,7 +159,7 @@ DEV_NOTES_CONTENT = [
     ["Architecture — Caches", "_merchant_cache, _card_names_cache, _system_prompt_cache. Invalidate at write site only. Warm card cache on startup.", "2026-04-26"],
     ["Architecture — Models", "Haiku: is_calendar_request, parse_expense_text_v2, classification. Sonnet: conversation fallback, reasoning, market narrative.", "2026-04-26"],
     ["Architecture — Sheets", "setup_sheets() uses single worksheets() call. No repeated API reads in setup. Em Log and Dev Notes never read in routing.", "2026-04-26"],
-    ["Deploy Flow", "Download bot.py from Claude chat → python ~/deploy.py ~/Downloads/bot.py 'message' → Railway auto-deploys. deploy.py lives in repo root.", "2026-04-30"],
+    ["Deploy Flow", "Download bot.py from Claude chat → save to ~/telegram-claude-bot/bot.py → python ~/telegram-claude-bot/deploy.py 'Session N' 'commit msg' → Railway auto-deploys, Em Log auto-updated. deploy.py reads diff + backlog, calls Haiku, writes built/fixed/pending, marks resolved items Done.", "2026-05-01"],
     ["Handoff Rule", "4 lines max: (1) last deployed commit, (2) bot.py status, (3) mid-session context if hanging, (4) Read Dev Notes + Em Log before starting.", "2026-04-26"],
     ["Rule — Ship Rule", "Nothing ships until fully wired, tested, and deployed in the same session. Plan-only sessions that produce dead files are banned.", "2026-04-30"],
     ["Rule — Modularise", "Modularisation deferred until S3+S4 done. When implemented: all files deploy via single deploy.py call — no manual upload/download of multiple files.", "2026-04-30"],
@@ -241,40 +241,98 @@ def _setup_em_log(existing):
     """Create Em Log tab with Backlog and Session History sections.
     Backlog: max 10 items — enforced on every write.
     Session History: max 10 rows — oldest deleted when 11th added.
-    No archive — hard delete keeps sheet lean permanently."""
+    Idempotent — detects and repairs missing backlog section on existing sheets."""
     try:
         if "Em Log" not in existing:
             ws = spreadsheet.add_worksheet(title="Em Log", rows=200, cols=6)
             existing.append("Em Log")
             print("Created Em Log tab")
-        else:
-            ws = spreadsheet.worksheet("Em Log")
-            # Only populate if empty — don't overwrite live session data
-            if ws.row_values(1):
-                print("Em Log already populated — skipping init")
-                return
+            _write_em_log_fresh(ws)
+            return
 
-        # Section 1: Backlog
-        ws.append_row(["── BACKLOG (max 10) ──", "", "", "", "", ""])
-        ws.append_row(EM_LOG_HEADERS_BACKLOG)
-        for row in INITIAL_BACKLOG[:10]:  # enforce cap at init
-            ws.append_row(row)
+        ws = spreadsheet.worksheet("Em Log")
+        all_values = ws.get_all_values()
 
-        # Section divider
-        ws.append_row(["", "", "", "", "", ""])
-        ws.append_row(["── SESSION HISTORY (max 10) ──", "", "", "", "", ""])
-        ws.append_row(EM_LOG_HEADERS_SESSION)
-        for row in INITIAL_SESSION:
-            ws.append_row(row)
+        # Check if backlog section exists
+        has_backlog = any("BACKLOG" in str(row[0]) for row in all_values if row)
+        has_session = any("SESSION HISTORY" in str(row[0]) for row in all_values if row)
 
-        # Format section headers
-        try:
-            ws.format('A1:F1', {'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}})
-        except Exception:
-            pass
-        print("✅ Em Log populated")
+        if not all_values or not has_session:
+            # Completely empty or malformed — write fresh
+            ws.clear()
+            _write_em_log_fresh(ws)
+            return
+
+        if not has_backlog:
+            # Session history exists but backlog section is missing — prepend it
+            print("Em Log missing backlog section — injecting...")
+            backlog_rows = [
+                ["── BACKLOG (max 10) ──", "", "", "", "", ""],
+                EM_LOG_HEADERS_BACKLOG,
+            ] + [list(r) for r in INITIAL_BACKLOG[:10]] + [
+                ["", "", "", "", "", ""],
+            ]
+            # Insert before row 1 (prepend)
+            for i, row in enumerate(backlog_rows, start=1):
+                ws.insert_row(row, i)
+            print("✅ Em Log backlog section injected")
+            return
+
+        # Backlog exists — migrate any rows missing Status column (col 6)
+        _migrate_backlog_status(ws, all_values)
+        print("Em Log already populated — skipping full init")
+
     except Exception as e:
         print(f"Em Log setup error: {e}")
+
+
+def _write_em_log_fresh(ws):
+    """Write full Em Log structure from scratch."""
+    ws.append_row(["── BACKLOG (max 10) ──", "", "", "", "", ""])
+    ws.append_row(EM_LOG_HEADERS_BACKLOG)
+    for row in INITIAL_BACKLOG[:10]:
+        ws.append_row(row)
+    ws.append_row(["", "", "", "", "", ""])
+    ws.append_row(["── SESSION HISTORY (max 10) ──", "", "", "", "", ""])
+    ws.append_row(EM_LOG_HEADERS_SESSION)
+    for row in INITIAL_SESSION:
+        ws.append_row(row)
+    try:
+        ws.format('A1:F1', {'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}})
+    except Exception:
+        pass
+    print("✅ Em Log populated")
+
+
+def _migrate_backlog_status(ws, all_values):
+    """Backfill Status column (col F) for backlog rows that are missing it."""
+    in_backlog = False
+    header_passed = False
+    updates = []
+    for i, row in enumerate(all_values):
+        if not row:
+            continue
+        if "BACKLOG" in str(row[0]):
+            in_backlog = True
+            continue
+        if "SESSION HISTORY" in str(row[0]):
+            break
+        if in_backlog:
+            if row[0] == "Priority":
+                header_passed = True
+                continue
+            if header_passed and row[0] not in ("── BACKLOG (max 10) ──", ""):
+                # Col F is index 5 — if missing or empty, backfill
+                status = row[5] if len(row) > 5 else ""
+                if not status:
+                    updates.append((i + 1, 6, "🔲 Outstanding"))  # sheet row, col
+    for sheet_row, col, val in updates:
+        try:
+            ws.update_cell(sheet_row, col, val)
+        except Exception as e:
+            print(f"Status migration error row {sheet_row}: {e}")
+    if updates:
+        print(f"✅ Migrated {len(updates)} backlog rows — Status column added")
 
 
 def em_log_sheet():
