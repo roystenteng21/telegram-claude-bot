@@ -4857,8 +4857,7 @@ def is_bill_request(text):
     lower = text.lower()
     # "due on the" only counts if followed by a day number (e.g. "due on the 15th")
     has_due_on_the = bool(re.search(r"due on the \d{1,2}", lower))
-    triggers = ["bill is due", "bill due", "set up a bill", "add a bill", "add bill",
-                "new bill", "add a new bill",
+    triggers = ["bill is due", "bill due", "set up a bill", "add a bill",
                 "credit card bill", "due every", "my citi bill", "my maybank bill",
                 "my amex bill", "my uob bill", "my credit card bill"]
     return has_due_on_the or any(t in lower for t in triggers)
@@ -5039,9 +5038,6 @@ def is_restaurant_review_request(text):
     # Explicit review triggers — always match
     if any(t in lower for t in ["reviews for", "review of", "reviews of"]):
         return True
-    # Bare "review [name]" — e.g. "review Ichiran", "review that place"
-    if re.match(r"^review\s+\w", lower):
-        return True
     # "how is X" / "how's X" — only match if X looks like a place, not a person
     # Person names are typically 1-2 words with capitals; place names often have
     # food/place context words or are followed by nothing (just the name)
@@ -5204,12 +5200,6 @@ def is_restaurant_suggestion_request(text):
         return True
     if re.match(r"recommend (a )?restaurant", lower):
         return True
-    # General recommendation phrasing with restaurant context
-    general_rec = ["give me a restaurant", "restaurant recommendation", "restaurant idea",
-                   "what should i eat", "where should i eat", "what restaurant should i",
-                   "recommend somewhere to eat", "recommend a place to eat"]
-    if any(t in lower for t in general_rec):
-        return True
     triggers = ["similar to", "like ", "anything like", "places like",
                 "restaurants like", "something like", "alternatives to", "similar places"]
     return any(t in lower for t in triggers)
@@ -5303,7 +5293,8 @@ def is_restaurant_search(text):
     lower = text.lower()
     triggers = ["find a restaurant", "search restaurants", "any restaurants",
                 "restaurant recommendations", "where to eat", "restaurants in",
-                "show my restaurants", "my restaurant list", "saved restaurants"]
+                "show my restaurants", "my restaurant list", "saved restaurants",
+                "restaurants", "my restaurants", "list restaurants", "show restaurants"]
     return any(t in lower for t in triggers)
 
 def infer_restaurant_location(name, country="Singapore"):
@@ -5723,7 +5714,7 @@ def _fetch_rss_headlines_for_stock(ticker, name):
     return headlines[:3], sources[:3]
 
 def _generate_price_movement_summary(data):
-    """Generate a factual price movement summary from price data alone — no Claude needed."""
+    """Generate a factual range position summary — price/% already shown in header."""
     price = data.get("price", 0)
     change_pct = data.get("change_pct", 0)
     week52_low = data.get("week52_low")
@@ -5731,11 +5722,6 @@ def _generate_price_movement_summary(data):
     currency = data.get("currency", "")
     name = data.get("name", data.get("ticker", ""))
 
-    direction = "up" if change_pct >= 0 else "down"
-    sentences = []
-    sentences.append(
-        f"{name} is {direction} {abs(change_pct):.2f}% today, currently at {currency} {price:.2f}."
-    )
     if week52_low and week52_high:
         position = (price - week52_low) / (week52_high - week52_low) * 100 if week52_high != week52_low else 50
         if position >= 75:
@@ -5744,10 +5730,9 @@ def _generate_price_movement_summary(data):
             range_desc = "trading near its 52-week low"
         else:
             range_desc = "trading in the middle of its 52-week range"
-        sentences.append(
-            f"It is {range_desc} ({currency} {week52_low:.2f} – {currency} {week52_high:.2f})."
-        )
-    return " ".join(sentences)
+        return f"{name} is {range_desc} ({currency} {week52_low:.2f} – {currency} {week52_high:.2f})."
+    direction = "up" if change_pct >= 0 else "down"
+    return f"{name} is {direction} {abs(change_pct):.2f}% today."
 
 def fetch_stock_summary(ticker, name, price_data=None):
     """Fetch RSS headlines in parallel and generate a grounded summary. Falls back to price movement analysis."""
@@ -5819,11 +5804,14 @@ def format_price(data, summary=None):
         summary, _ = fetch_stock_summary(ticker, name, price_data=data)
 
     lines = [f"{flag} {name} ({ticker})"]
-    lines.append(f"{currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
+    lines.append(f"Daily: {currency} {price:.2f} {arrow} {abs(change_pct):.2f}%{state_label}")
     if range_line:
         lines.append(range_line)
     lines.append("")
-    lines.append(f"{summary if summary else _generate_price_movement_summary(data)}")
+    if summary:
+        lines.append(summary)
+    elif data:
+        lines.append(_generate_price_movement_summary(data))
 
     return "\n".join(lines)
 
@@ -6205,10 +6193,8 @@ def is_stock_request(text):
     # "check" only fires if not about reminders/bills AND not a reminder-style request
     reminder_prefix = any(lower.startswith(p) or p + " " in lower[:20]
                           for p in ["ping me", "notify me", "remind me", "alert me when", "alert me to"])
-    # "check AAPL" / "check on TSLA" — require ticker pattern alongside "check"
-    if "check " in lower and not any(e in lower for e in ["reminders", "reminder", "bill", "expense", "card", "calendar", "schedule", "todo"]) and not reminder_prefix:
-        if re.search(r'\b[A-Z]{2,5}\b', text) or any(w in lower for w in ["stock", "portfolio", "market", "ticker", "price", "shares"]):
-            return True
+    if "check " in lower and not any(e in lower for e in ["reminders", "reminder", "bill"]) and not reminder_prefix:
+        return True
 
     # "bought"/"sold" only fire when combined with known stock context words
     if ("bought " in lower or "sold " in lower) and any(
@@ -6269,10 +6255,8 @@ def handle_stock_request(text):
                                 "role": "user",
                                 "content": (
                                     f"Headlines about {name} ({ticker}):\n{source_context}\n\n"
-                                    "Write 2-3 short factual sentences as one paragraph. "
-                                    "First sentence: where the stock sits in its 52-week range (near high, near low, or mid-range). "
-                                    "Remaining sentences: recent business developments or earnings from the headlines — factual only. "
-                                    "No timing advice, no buy/sell signals, no speculation, no phrases like 'investors should' or 'right time to buy'. "
+                                    "Write 1-2 short factual sentences about recent business developments or earnings from the headlines. "
+                                    "Factual only — no timing advice, no buy/sell signals, no speculation, no phrases like 'investors should' or 'right time to buy'. "
                                     "End with a single [SourceName] tag for the most relevant source. No source tag if no usable headlines."
                                 )
                             }]
@@ -7824,14 +7808,11 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         "upcoming followups", "show my follow ups", "what are my followups"
     ]:
         reply = upcoming_followups()
-    elif lower in ["overdue", "show overdue", "overdue followups", "show overdue followups",
-                   "who's overdue", "whos overdue", "overdue contacts"]:
+    elif lower == "overdue":
         reply = overdue_followups()
-    elif lower in ["birthdays", "upcoming birthdays", "who has a birthday", "birthday list",
-                   "who has a birthday soon", "birthdays coming up", "show birthdays"]:
+    elif lower == "birthdays":
         reply = upcoming_birthdays(30)
-    elif lower in ["soon", "birthdays this week", "birthdays soon", "who's birthday is this week",
-                   "whos birthday is this week", "birthday this week"]:
+    elif lower == "soon":
         reply = upcoming_birthdays(7)
     elif lower.startswith("lastcontact "):
         reply = last_contact(text[12:])
@@ -7917,7 +7898,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         merchant_name = text.split(" ", 2)[2].strip()
         reply = delete_merchant(merchant_name)
     elif lower in ["expense report", "monthly report", "spending report", "expenses",
-                   "monthly summary", "monthly spend", "this month", "expense summary"]:
+                   "monthly summary", "monthly spend", "this month", "expense summary",
+                   "my expenses", "check my expenses", "show expenses", "show my expenses",
+                   "expenses this month", "what have i spent", "spending this month"]:
         reply = get_expense_report()
     elif lower in ["delete last expense", "remove last expense"]:
         reply = delete_last_expense()
