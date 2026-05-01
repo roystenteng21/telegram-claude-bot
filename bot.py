@@ -4857,7 +4857,8 @@ def is_bill_request(text):
     lower = text.lower()
     # "due on the" only counts if followed by a day number (e.g. "due on the 15th")
     has_due_on_the = bool(re.search(r"due on the \d{1,2}", lower))
-    triggers = ["bill is due", "bill due", "set up a bill", "add a bill",
+    triggers = ["bill is due", "bill due", "set up a bill", "add a bill", "add bill",
+                "new bill", "add a new bill",
                 "credit card bill", "due every", "my citi bill", "my maybank bill",
                 "my amex bill", "my uob bill", "my credit card bill"]
     return has_due_on_the or any(t in lower for t in triggers)
@@ -5038,6 +5039,9 @@ def is_restaurant_review_request(text):
     # Explicit review triggers — always match
     if any(t in lower for t in ["reviews for", "review of", "reviews of"]):
         return True
+    # Bare "review [name]" — e.g. "review Ichiran", "review that place"
+    if re.match(r"^review\s+\w", lower):
+        return True
     # "how is X" / "how's X" — only match if X looks like a place, not a person
     # Person names are typically 1-2 words with capitals; place names often have
     # food/place context words or are followed by nothing (just the name)
@@ -5199,6 +5203,12 @@ def is_restaurant_suggestion_request(text):
     if re.match(r"suggest restaurant", lower):
         return True
     if re.match(r"recommend (a )?restaurant", lower):
+        return True
+    # General recommendation phrasing with restaurant context
+    general_rec = ["give me a restaurant", "restaurant recommendation", "restaurant idea",
+                   "what should i eat", "where should i eat", "what restaurant should i",
+                   "recommend somewhere to eat", "recommend a place to eat"]
+    if any(t in lower for t in general_rec):
         return True
     triggers = ["similar to", "like ", "anything like", "places like",
                 "restaurants like", "something like", "alternatives to", "similar places"]
@@ -6195,8 +6205,10 @@ def is_stock_request(text):
     # "check" only fires if not about reminders/bills AND not a reminder-style request
     reminder_prefix = any(lower.startswith(p) or p + " " in lower[:20]
                           for p in ["ping me", "notify me", "remind me", "alert me when", "alert me to"])
-    if "check " in lower and not any(e in lower for e in ["reminders", "reminder", "bill"]) and not reminder_prefix:
-        return True
+    # "check AAPL" / "check on TSLA" — require ticker pattern alongside "check"
+    if "check " in lower and not any(e in lower for e in ["reminders", "reminder", "bill", "expense", "card", "calendar", "schedule", "todo"]) and not reminder_prefix:
+        if re.search(r'\b[A-Z]{2,5}\b', text) or any(w in lower for w in ["stock", "portfolio", "market", "ticker", "price", "shares"]):
+            return True
 
     # "bought"/"sold" only fire when combined with known stock context words
     if ("bought " in lower or "sold " in lower) and any(
@@ -7812,11 +7824,14 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         "upcoming followups", "show my follow ups", "what are my followups"
     ]:
         reply = upcoming_followups()
-    elif lower == "overdue":
+    elif lower in ["overdue", "show overdue", "overdue followups", "show overdue followups",
+                   "who's overdue", "whos overdue", "overdue contacts"]:
         reply = overdue_followups()
-    elif lower == "birthdays":
+    elif lower in ["birthdays", "upcoming birthdays", "who has a birthday", "birthday list",
+                   "who has a birthday soon", "birthdays coming up", "show birthdays"]:
         reply = upcoming_birthdays(30)
-    elif lower == "soon":
+    elif lower in ["soon", "birthdays this week", "birthdays soon", "who's birthday is this week",
+                   "whos birthday is this week", "birthday this week"]:
         reply = upcoming_birthdays(7)
     elif lower.startswith("lastcontact "):
         reply = last_contact(text[12:])
