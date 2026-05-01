@@ -141,12 +141,14 @@ def setup_sheets():
 
     _setup_dev_notes(existing)
     _setup_em_log(existing)
+    _setup_module_registry(existing)
 
     print("\u2705 Sheets setup complete")
 # ── Dev Notes & Em Log ────────────────────────────────────────────────────────
 
 DEV_NOTES_CONTENT = [
     ["Section", "Content", "Last Updated"],
+    # ── Coding Standards ──────────────────────────────────────────────────────
     ["Coding Standard — R1", "Route by cost: exact match → regex → keyword → cached lookup → live data → Claude. Never call Claude for routing decisions.", "2026-04-26"],
     ["Coding Standard — R2", "Single pass, immediate exit. Once a handler matches, execution stops. No fallback re-runs detectors. Loops exit on first match.", "2026-04-26"],
     ["Coding Standard — R3", "One sheet read per request, at the latest possible moment. Cached in memory, invalidated only on write. No sheet read during routing.", "2026-04-26"],
@@ -155,45 +157,60 @@ DEV_NOTES_CONTENT = [
     ["Coding Standard — R6", "Session messages never reach main routing chain. Session data is flat dict with explicit fields. Sessions time out cleanly.", "2026-04-26"],
     ["Coding Standard — R7", "Cache hierarchy: in-memory → cached sheet read → live sheet read → external API. Each layer reached only if above misses.", "2026-04-26"],
     ["Coding Standard — R8", "Every branch sets reply or returns. Empty reply is a bug. Claude fallback for genuine unknown intent only.", "2026-04-26"],
+    # ── Architecture ──────────────────────────────────────────────────────────
     ["Architecture — Routing", "Primary elif chain runs once. No else block re-runs detectors. Session handlers exit before reaching main router.", "2026-04-26"],
     ["Architecture — Caches", "_merchant_cache, _card_names_cache, _system_prompt_cache. Invalidate at write site only. Warm card cache on startup.", "2026-04-26"],
     ["Architecture — Models", "Haiku: is_calendar_request, parse_expense_text_v2, classification. Sonnet: conversation fallback, reasoning, market narrative.", "2026-04-26"],
     ["Architecture — Sheets", "setup_sheets() uses single worksheets() call. No repeated API reads in setup. Em Log and Dev Notes never read in routing.", "2026-04-26"],
-    ["Deploy Flow", "Download bot.py from Claude chat → save to ~/telegram-claude-bot/bot.py → python ~/telegram-claude-bot/deploy.py 'Session N' 'commit msg' → Railway auto-deploys, Em Log auto-updated. deploy.py reads diff + backlog, calls Haiku, writes built/fixed/pending, marks resolved items Done.", "2026-05-01"],
-    ["Handoff Rule", "4 lines max: (1) last deployed commit, (2) bot.py status, (3) mid-session context if hanging, (4) Read Dev Notes + Em Log before starting.", "2026-04-26"],
+    ["Architecture — Module Layers", "Import order (no reverse imports ever): config → clients → state → sheets → helpers → feature modules → sessions → routing → infrastructure → bot.py. Feature modules never import each other except meetings→crm (one-way). routing.py is the only file that imports everything.", "2026-05-01"],
+    ["Architecture — Module Registry", "Module Registry tab in this sheet is the live index of all modules. Columns: Module · File · Layer · Key Functions · Imports From · Last Changed · Session · Status. Updated automatically by deploy.py on every deploy. Claude reads this tab at session start to know which file to request for any given task.", "2026-05-01"],
+    # ── Rules ─────────────────────────────────────────────────────────────────
     ["Rule — Ship Rule", "Nothing ships until fully wired, tested, and deployed in the same session. Plan-only sessions that produce dead files are banned.", "2026-04-30"],
-    ["Rule — Modularise", "Modularisation deferred until S3+S4 done. When implemented: all files deploy via single deploy.py call — no manual upload/download of multiple files.", "2026-04-30"],
-    ["Roadmap — Session 9", "DONE. Trips schema migration (new schema: Trip ID · Destination · Currency · Check In · Check Out · Hotel Name · Hotel Local Name · Hotel Address · Notes · Status) + AviationStack strip (−307 lines).", "2026-04-30"],
-    ["Roadmap — Session 10", "DONE. deploy.py built — runs locally, copies bot.py into repo, commits and pushes. One-time setup: git clone repo to ~/telegram-claude-bot, place deploy.py in ~/. Repo: roystenteng21/telegram-claude-bot. Token: 90-day ghp_ (no daily reset).", "2026-04-30"],
-    ["Roadmap — Session 11 (S3 Reliability)", "Error boundaries: wrap all sheet writes, notify user on failure, never delete session before write confirmed (3x 🔴). Asyncio fixes: replace time.sleep with asyncio.sleep (2x 🟠). Error logging to Em Log at runtime. Persist sessions + price alerts across Railway restarts.", "2026-04-29"],
-    ["Roadmap — Session 12 (S4 Efficiency)", "CRM cache + single-pass find_row (currently 1000 iterations/lookup). Reminder cache (currently full sheet read every minute). Routing deduplication: eliminate duplicate detectors, clean elif chain. Claude call audit: Haiku vs Sonnet, min max_tokens everywhere.", "2026-04-29"],
-    ["Roadmap — Session 13 (S5 Completeness)", "End-to-end feature testing across all modules. Input forgiveness: broader natural phrasing recognised. Response consistency: emoji, error format, reply length standardised across all handlers.", "2026-04-29"],
+    ["Rule — Em Log Documentation", "Every session MUST produce a complete Em Log entry before closing. Built, Fixed, and Pending fields must be specific — not 'various fixes'. Any architectural decision, new pattern, or deviation from standards must be documented in Dev Notes in the same session it is made. Future Claude instances rely on this as the sole source of truth.", "2026-05-01"],
+    ["Rule — No Silent Changes", "Any change to module boundaries, import structure, coding standards, or deploy flow must be logged to Dev Notes immediately. Never leave a session with undocumented architectural changes. The sheet is the memory — if it's not in the sheet, it didn't happen.", "2026-05-01"],
+    ["Rule — Circular Import Zero Tolerance", "Imports flow strictly downward through layers. If adding an import would create a cycle, restructure — move the shared function to a lower layer or pass it as a parameter. Never work around a circular import with lazy imports or importlib.", "2026-05-01"],
+    # ── Session Handoff Protocol ──────────────────────────────────────────────
+    ["Handoff Rule", "Start of every session: (1) Read Dev Notes tab fully. (2) Read Em Log — last session entry and all Outstanding backlog items. (3) Read Module Registry — identifies which file to request for the task. (4) Ask Roysten to upload only the relevant module file(s). Never start building without completing steps 1–3.", "2026-05-01"],
+    ["Handoff — What To Upload", "Pre-modularisation: upload bot.py. Post-modularisation: upload only the module file(s) relevant to the session task. Claude identifies the right module(s) from the Module Registry. If a session touches routing logic, also upload routing.py.", "2026-05-01"],
+    ["Handoff — Mid-Session Context", "If a session ends mid-build (not deployed): log exactly what was completed, what is half-built, and what the next step is in the Em Log Pending field. The next session picks up from that exact point — no re-explaining required.", "2026-05-01"],
+    # ── Deploy Flow ───────────────────────────────────────────────────────────
+    ["Deploy Flow — Pre-Modularisation", "Download bot.py from Claude chat → save to ~/telegram-claude-bot/bot.py → python ~/telegram-claude-bot/deploy.py 'commit msg' 'Session N' 'built' 'fixed' 'pending' → Railway auto-deploys, Em Log + Module Registry auto-updated.", "2026-05-01"],
+    ["Deploy Flow — Post-Modularisation", "Download changed module file(s) from Claude chat → save to ~/telegram-claude-bot/ → python ~/telegram-claude-bot/deploy.py 'commit msg' 'Session N' 'built' 'fixed' 'pending' → deploy.py copies all 20 module files, commits, pushes → Railway auto-deploys, Em Log + Module Registry auto-updated.", "2026-05-01"],
+    # ── Modularisation ────────────────────────────────────────────────────────
+    ["Modularisation — Status", "S22 — in progress. 20 modules planned. Import layer hierarchy defined and locked. Module Registry tab created. See S22_modularisation_plan.md in repo for full dependency map.", "2026-05-01"],
+    ["Modularisation — Files", "config.py · clients.py · state.py · sheets.py · helpers.py · crm.py · expenses.py · fx.py · reminders.py · calendar.py · todos.py · meetings.py · bills.py · restaurants.py · stocks.py · trips.py · sessions.py · routing.py · infrastructure.py · bot.py", "2026-05-01"],
+    ["Modularisation — Cross-Feature Rule", "Only permitted cross-feature import: meetings.py → crm.find_row (one-way). All other cross-feature calls go through routing.py dispatch. No feature module calls another feature module's handler functions.", "2026-05-01"],
+    # ── Roadmap ───────────────────────────────────────────────────────────────
+    ["Roadmap — Session 9", "DONE. Trips schema migration + AviationStack strip (−307 lines).", "2026-04-30"],
+    ["Roadmap — Session 10", "DONE. deploy.py built. Repo: roystenteng21/telegram-claude-bot. Token: 90-day ghp_ (no daily reset).", "2026-04-30"],
+    ["Roadmap — Sessions 11–21", "DONE. All reliability, efficiency, and completeness work completed. All backlog items resolved. Full audit passed S22a.", "2026-05-01"],
+    ["Roadmap — Session 22", "S22: Modularisation. Split bot.py into 20 modules. Update deploy.py to copy all files. Update test_em.py imports. All 91 tests must pass before deploy.", "2026-05-01"],
 ]
 
 EM_LOG_HEADERS_BACKLOG = ["Priority", "Item", "Stage", "Notes", "Added", "Status"]
 EM_LOG_HEADERS_SESSION = ["Date", "Session", "Built", "Fixed", "Pending", "Commit"]
 
 INITIAL_BACKLOG = [
-    ["🔴", "log_expense: add error handling — financial data silently lost on sheet failure", "Step 3", "Wrap append_row in try/except, notify user if write fails, do not delete session until write confirmed", "2026-04-26", "✅ Done"],
-    ["🔴", "Session deleted before write confirmed — expense unrecoverable on failure", "Step 3", "Move del receipt_confirm_sessions[user_id] to after log_expense succeeds", "2026-04-26", "✅ Done"],
-    ["🔴", "save_merchant_memory silent fail — merchant never learned if sheet write fails", "Step 3", "Add error handling, log failure, do not silently swallow", "2026-04-26", "✅ Done"],
-    ["🟠", "sheets_call_with_retry uses time.sleep(60) — blocks entire event loop", "Step 3", "Replace with asyncio.sleep(60) inside async context", "2026-04-26", "✅ Done"],
-    ["🟠", "get_calendar uses time.sleep(3) on retry — blocks event loop on every calendar request", "Step 3", "Replace with asyncio.sleep or remove retry sleep", "2026-04-26", "✅ Done"],
-    ["🟠", "find_row: 5 full passes over CRM records, no cache — 1000 iterations per lookup", "Step 3", "Single-pass with match tiers, add CRM cache invalidated on write", "2026-04-26", "✅ Done"],
-    ["🟠", "check_and_fire_reminders: full sheet read every minute + find_row inside loop", "Step 3", "Cache pending reminders in memory, only re-read on write. Remove find_row from loop.", "2026-04-26", "✅ Done"],
-    ["🟠", "Duplicate routing: is_reminder_request 3x, is_stock_request 2x, others twice", "Step 3", "Eliminate else block, merge missing handlers into primary elif chain", "2026-04-26", "✅ Done"],
-    ["🟡", "Missing env var guard at startup — cryptic crash if TELEGRAM_TOKEN or ANTHROPIC_API_KEY unset", "Step 3", "Add explicit check and clear error message before app starts", "2026-04-26", "✅ Done"],
-    ["🟡", "float() cast on unvalidated Claude output in parse_expense_text_v2 — unhandled exception", "Step 3", "Validate amount field before cast, return user-friendly error if invalid", "2026-04-26", "✅ Done"],
-    ["🟡", "restore_overseas_from_trips: no fallback on corrupt data — silent bad state", "Step 3", "Wrap in try/except per field, skip row if malformed, log warning", "2026-04-26", "✅ Done"],
-    ["🟡", "FX rates lost on Railway restart — user must re-enter manually after every redeploy", "Step 3", "Persist cached_fx_rates to Settings sheet, load on startup", "2026-04-26", "✅ Done"],
-    ["🟡", "No timeout on RSS fetch in fetch_market_rss_headlines — indefinite hang possible", "Step 3", "Add timeout=10 to requests.get call", "2026-04-26", "✅ Done"],
-    ["🟢", "_finalise_expense_session labelled legacy but still wired — dead code", "Step 3", "Remove function, update any callers", "2026-04-26", "✅ Done"],
-    ["🟢", "CARD_FX_FEES dict defined but never referenced anywhere", "Step 3", "Remove or wire up to FX fee display", "2026-04-26", "✅ Done"],
-    ["🟢", "bare except: in format_date and calculate_age swallows all exceptions", "Step 3", "Replace with except ValueError", "2026-04-26", "✅ Done"],
-    ["🟢", "Haiku for parse_expense_text_v2 and is_calendar_request — Sonnet overkill", "Step 3", "Switch model to claude-haiku-3, verify output quality unchanged", "2026-04-26", "✅ Done"],
-    ["🟢", "S5: End-to-end feature testing — no systematic test coverage across modules", "Step 3", "Test all features post-modularisation: expenses, CRM, trips, reminders, stocks, restaurants, calendar, todos", "2026-04-29", "✅ Done"],
-    ["🟢", "S5: Input forgiveness — narrow phrasing recognition misses natural variants", "Step 3", "Broaden detector patterns for common commands; test with varied natural language inputs", "2026-04-29", "✅ Done"],
-    ["🟢", "S5: Response consistency — emoji, error format, reply length vary across handlers", "Step 3", "Audit all reply strings; standardise error prefix, emoji usage, and length conventions", "2026-04-29", "✅ Done"],
+    ["🔴", "log_expense: add error handling — financial data silently lost on sheet failure", "Step 3", "Wrap append_row in try/except, notify user if write fails, do not delete session until write confirmed", "2026-04-26", "🔲 Outstanding"],
+    ["🔴", "Session deleted before write confirmed — expense unrecoverable on failure", "Step 3", "Move del receipt_confirm_sessions[user_id] to after log_expense succeeds", "2026-04-26", "🔲 Outstanding"],
+    ["🔴", "save_merchant_memory silent fail — merchant never learned if sheet write fails", "Step 3", "Add error handling, log failure, do not silently swallow", "2026-04-26", "🔲 Outstanding"],
+    ["🟠", "sheets_call_with_retry uses time.sleep(60) — blocks entire event loop", "Step 3", "Replace with asyncio.sleep(60) inside async context", "2026-04-26", "🔲 Outstanding"],
+    ["🟠", "get_calendar uses time.sleep(3) on retry — blocks event loop on every calendar request", "Step 3", "Replace with asyncio.sleep or remove retry sleep", "2026-04-26", "🔲 Outstanding"],
+    ["🟠", "find_row: 5 full passes over CRM records, no cache — 1000 iterations per lookup", "Step 3", "Single-pass with match tiers, add CRM cache invalidated on write", "2026-04-26", "🔲 Outstanding"],
+    ["🟠", "check_and_fire_reminders: full sheet read every minute + find_row inside loop", "Step 3", "Cache pending reminders in memory, only re-read on write. Remove find_row from loop.", "2026-04-26", "🔲 Outstanding"],
+    ["🟠", "Duplicate routing: is_reminder_request 3x, is_stock_request 2x, others twice", "Step 3", "Eliminate else block, merge missing handlers into primary elif chain", "2026-04-26", "🔲 Outstanding"],
+    ["🟡", "Missing env var guard at startup — cryptic crash if TELEGRAM_TOKEN or ANTHROPIC_API_KEY unset", "Step 3", "Add explicit check and clear error message before app starts", "2026-04-26", "🔲 Outstanding"],
+    ["🟡", "float() cast on unvalidated Claude output in parse_expense_text_v2 — unhandled exception", "Step 3", "Validate amount field before cast, return user-friendly error if invalid", "2026-04-26", "🔲 Outstanding"],
+    ["🟡", "restore_overseas_from_trips: no fallback on corrupt data — silent bad state", "Step 3", "Wrap in try/except per field, skip row if malformed, log warning", "2026-04-26", "🔲 Outstanding"],
+    ["🟡", "FX rates lost on Railway restart — user must re-enter manually after every redeploy", "Step 3", "Persist cached_fx_rates to Settings sheet, load on startup", "2026-04-26", "🔲 Outstanding"],
+    ["🟡", "No timeout on RSS fetch in fetch_market_rss_headlines — indefinite hang possible", "Step 3", "Add timeout=10 to requests.get call", "2026-04-26", "🔲 Outstanding"],
+    ["🟢", "_finalise_expense_session labelled legacy but still wired — dead code", "Step 3", "Remove function, update any callers", "2026-04-26", "🔲 Outstanding"],
+    ["🟢", "CARD_FX_FEES dict defined but never referenced anywhere", "Step 3", "Remove or wire up to FX fee display", "2026-04-26", "🔲 Outstanding"],
+    ["🟢", "bare except: in format_date and calculate_age swallows all exceptions", "Step 3", "Replace with except ValueError", "2026-04-26", "🔲 Outstanding"],
+    ["🟢", "Haiku for parse_expense_text_v2 and is_calendar_request — Sonnet overkill", "Step 3", "Switch model to claude-haiku-3, verify output quality unchanged", "2026-04-26", "🔲 Outstanding"],
+    ["🟢", "S5: End-to-end feature testing — no systematic test coverage across modules", "Step 3", "Test all features post-modularisation: expenses, CRM, trips, reminders, stocks, restaurants, calendar, todos", "2026-04-29", "🔲 Outstanding"],
+    ["🟢", "S5: Input forgiveness — narrow phrasing recognition misses natural variants", "Step 3", "Broaden detector patterns for common commands; test with varied natural language inputs", "2026-04-29", "🔲 Outstanding"],
+    ["🟢", "S5: Response consistency — emoji, error format, reply length vary across handlers", "Step 3", "Audit all reply strings; standardise error prefix, emoji usage, and length conventions", "2026-04-29", "🔲 Outstanding"],
 ]
 
 INITIAL_SESSION = [
@@ -335,66 +352,112 @@ def _migrate_backlog_status(ws, all_values):
         print(f"✅ Migrated {len(updates)} backlog rows — Status column added")
 
 
-def reconcile_backlog_status():
-    """On startup: update any Em Log backlog rows whose status is outdated relative to INITIAL_BACKLOG.
-    Compares item text (substring match) against INITIAL_BACKLOG to determine correct status.
-    Only updates rows that are currently marked Outstanding but should be Done."""
+# ── Module Registry ───────────────────────────────────────────────────────────
+
+MODULE_REGISTRY_HEADERS = ["Module", "File", "Layer", "Key Functions", "Imports From", "Last Changed", "Session", "Status"]
+
+# Pre-modularisation: single-file architecture. Updated to module entries by S22 deploy.
+MODULE_REGISTRY_INITIAL = [
+    ["bot (monolith)", "bot.py", "0–8 (all)", "all functions", "none", "2026-05-01", "S22a", "⚙️ Pre-modularisation"],
+]
+
+# Post-modularisation registry — populated by deploy.py after S22.
+# Each row: [module, file, layer, key_functions, imports_from, last_changed, session, status]
+MODULE_REGISTRY_MODULAR = [
+    ["config",         "config.py",         "0", "all constants, env vars, TIMEZONE, EXPENSE_CATEGORIES", "none", "2026-05-01", "S22", "📋 Planned"],
+    ["clients",        "clients.py",         "1", "gc, spreadsheet, drive_service, client (Anthropic)", "config", "2026-05-01", "S22", "📋 Planned"],
+    ["state",          "state.py",           "1", "overseas_state, expense_sessions, receipt_confirm_sessions, em_profile, all session dicts, all caches", "config", "2026-05-01", "S22", "📋 Planned"],
+    ["sheets",         "sheets.py",          "2", "get_sheet, all sheet accessors, setup_sheets, em log ops, reconcile_backlog_status", "config, clients, state", "2026-05-01", "S22", "📋 Planned"],
+    ["helpers",        "helpers.py",         "3", "format_date, calculate_age, format_contact, send_safe, looks_like_new_intent, parse_date_flexible", "config", "2026-05-01", "S22", "📋 Planned"],
+    ["crm",            "crm.py",             "4", "find_row, save_contact, find_contact, add_note, upcoming_birthdays, detect_crm_natural_update", "config, clients, state, sheets, helpers", "2026-05-01", "S22", "📋 Planned"],
+    ["expenses",       "expenses.py",        "4", "log_expense, parse_expense_text_v2, handle_expense_text, is_expense_input, get_merchant_memory, cards", "config, clients, state, sheets, helpers", "2026-05-01", "S22", "📋 Planned"],
+    ["fx",             "fx.py",              "4", "get_fx_rate, refresh_fx_rates, parse_manual_fx_input, persist_fx_rates_to_sheet", "config, clients, state, sheets", "2026-05-01", "S22", "📋 Planned"],
+    ["reminders",      "reminders.py",       "4", "add_reminder, check_and_fire_reminders, is_reminder_request, handle_new_reminder", "config, clients, state, sheets", "2026-05-01", "S22", "📋 Planned"],
+    ["calendar",       "calendar.py",        "4", "get_calendar, smart_add_event, is_calendar_request, get_events", "config, clients, state, sheets, helpers", "2026-05-01", "S22", "📋 Planned"],
+    ["todos",          "todos.py",           "4", "add_todo, complete_todo, delete_todo, list_todos", "config, clients, sheets, helpers", "2026-05-01", "S22", "📋 Planned"],
+    ["meetings",       "meetings.py",        "4", "handle_meeting_session, process_meeting_notes, save_meeting_recap, is_meeting_start", "config, clients, state, sheets, helpers, crm", "2026-05-01", "S22", "📋 Planned"],
+    ["bills",          "bills.py",           "4", "add_bill, list_bills, send_bill_reminders, is_bill_request", "config, clients, state, sheets", "2026-05-01", "S22", "📋 Planned"],
+    ["restaurants",    "restaurants.py",     "4", "save_restaurant, search_restaurants, get_restaurant_review, is_restaurant_suggestion_request", "config, clients, state, sheets", "2026-05-01", "S22", "📋 Planned"],
+    ["stocks",         "stocks.py",          "4", "handle_stock_request, is_stock_request, check_price_alerts, get_market_summary_now, fetch_stock_summary", "config, clients, state, sheets", "2026-05-01", "S22", "📋 Planned"],
+    ["trips",          "trips.py",           "4", "save_trip, handle_overseas_request, is_overseas_mode_request, restore_overseas_from_trips", "config, clients, state, sheets", "2026-05-01", "S22", "📋 Planned"],
+    ["sessions",       "sessions.py",        "5", "touch_session, check_session_timeouts, get_active_session_label, persist_sessions_to_sheet", "config, clients, state, sheets", "2026-05-01", "S22", "📋 Planned"],
+    ["routing",        "routing.py",         "6", "handle_message, _handle_message_inner, build_system_prompt", "all modules", "2026-05-01", "S22", "📋 Planned"],
+    ["infrastructure", "infrastructure.py",  "7", "run_infrastructure_setup, setup_drive, setup_em_profile, send_startup_message", "config, clients, state, sheets", "2026-05-01", "S22", "📋 Planned"],
+    ["bot",            "bot.py",             "8", "post_init, main, scheduler wiring", "routing, infrastructure, sessions, config", "2026-05-01", "S22", "📋 Planned"],
+]
+
+
+def _setup_module_registry(existing):
+    """Create Module Registry tab if missing. Never overwrites existing data — deploy.py owns updates."""
     try:
-        ws = em_log_sheet()
+        if "Module Registry" not in existing:
+            ws = spreadsheet.add_worksheet(title="Module Registry", rows=50, cols=8)
+            existing.append("Module Registry")
+            ws.append_row(MODULE_REGISTRY_HEADERS)
+            # Start with monolith entry; S22 deploy.py will replace with modular entries
+            for row in MODULE_REGISTRY_INITIAL:
+                ws.append_row(row)
+            try:
+                ws.format('A1:H1', {'textFormat': {'bold': True},
+                                    'backgroundColor': {'red': 0.85, 'green': 0.92, 'blue': 0.98}})
+            except Exception:
+                pass
+            print("✅ Module Registry tab created")
+        else:
+            print("Module Registry already exists — skipping init")
+    except Exception as e:
+        print(f"Module Registry setup error: {e}")
+
+
+def update_module_registry(module_name, file_name, last_changed, session, status="✅ Active"):
+    """Update a single module's row in the Module Registry. Called by deploy.py after each deploy.
+    Matches on File column — upserts (updates if exists, appends if new)."""
+    try:
+        ws = get_sheet("Module Registry")
         if not ws:
             return
         all_values = ws.get_all_values()
+        if len(all_values) <= 1:
+            return
 
-        # Build lookup: item text snippet -> correct status from INITIAL_BACKLOG
-        correct_status = {}
-        for row in INITIAL_BACKLOG:
-            if len(row) >= 6:
-                correct_status[row[1][:40].lower()] = row[5]  # first 40 chars -> status
-
-        in_backlog = False
-        header_passed = False
-        updates = []
-        for i, row in enumerate(all_values):
-            if not row:
-                continue
-            if "BACKLOG" in str(row[0]):
-                in_backlog = True
-                continue
-            if "SESSION HISTORY" in str(row[0]):
+        # Find row by file name (col B = index 1)
+        target_row = None
+        for i, row in enumerate(all_values[1:], start=2):
+            if row and row[1] == file_name:
+                target_row = i
                 break
-            if not in_backlog:
-                continue
-            if row[0] == "Priority":
-                header_passed = True
-                continue
-            if not header_passed:
-                continue
-            item_text = row[1] if len(row) > 1 else ""
-            current_status = row[5] if len(row) > 5 else ""
-            if current_status == "✅ Done":
-                continue  # already correct
-            # Match against INITIAL_BACKLOG by substring
-            item_key = item_text[:40].lower()
-            matched_status = None
-            for key, status in correct_status.items():
-                if key and (key in item_key or item_key in key):
-                    matched_status = status
-                    break
-            if matched_status == "✅ Done":
-                updates.append((i + 1, 6, "✅ Done"))
 
-        for sheet_row, col, val in updates:
-            try:
-                ws.update_cell(sheet_row, col, val)
-            except Exception as e:
-                print(f"reconcile_backlog_status update error row {sheet_row}: {e}")
-
-        if updates:
-            print(f"✅ Backlog reconciled — marked {len(updates)} items Done")
+        if target_row:
+            # Update Last Changed (col F=6), Session (col G=7), Status (col H=8)
+            ws.update_cell(target_row, 6, last_changed)
+            ws.update_cell(target_row, 7, session)
+            ws.update_cell(target_row, 8, status)
         else:
-            print("Backlog reconcile: no updates needed")
+            # Find the full planned entry if available
+            planned = next((r for r in MODULE_REGISTRY_MODULAR if r[1] == file_name), None)
+            if planned:
+                row_data = list(planned)
+                row_data[5] = last_changed
+                row_data[6] = session
+                row_data[7] = status
+                ws.append_row(row_data)
+            else:
+                ws.append_row([module_name, file_name, "?", "", "", last_changed, session, status])
+        print(f"Module Registry updated: {file_name}")
     except Exception as e:
-        print(f"reconcile_backlog_status error: {e}")
+        print(f"update_module_registry error for {file_name}: {e}")
+
+
+def get_module_registry():
+    """Return Module Registry as list of dicts. Used by deploy.py to read current state."""
+    try:
+        ws = get_sheet("Module Registry")
+        if not ws:
+            return []
+        return ws.get_all_records()
+    except Exception as e:
+        print(f"get_module_registry error: {e}")
+        return []
 
 
 def em_log_sheet():
@@ -8548,12 +8611,6 @@ async def post_init(app):
     global _scheduler, _app_ref
     # Run infrastructure setup and capture health status
     health = run_infrastructure_setup()
-
-    # Reconcile Em Log backlog — mark items Done that are fixed in code
-    try:
-        reconcile_backlog_status()
-    except Exception as e:
-        print(f"Startup: backlog reconcile failed: {e}")
 
     # Warm card names cache on startup
     try:
