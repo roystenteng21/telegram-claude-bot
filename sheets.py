@@ -257,11 +257,24 @@ def apply_boot_em_log():
     except Exception as e:
         print(f"apply_boot_em_log: add_session_to_em_log error: {e}")
 
-    # Module Registry — update Last Changed + Session for all known modules
+    # Module Registry — batch update Last Changed + Session in one API call
     try:
-        for fname in MODULE_FILES_LIST:
-            mod_name = fname.replace(".py", "")
-            update_module_registry(mod_name, fname, date_str, session, "✅ Active")
+        ws = get_sheet("Module Registry")
+        if ws:
+            all_values = ws.get_all_values()
+            if len(all_values) > 1:
+                file_to_row = {row[1]: i + 2 for i, row in enumerate(all_values[1:]) if row}
+                updates = []
+                for fname in MODULE_FILES_LIST:
+                    sheet_row = file_to_row.get(fname)
+                    if sheet_row:
+                        updates.append({
+                            "range": f"F{sheet_row}:H{sheet_row}",
+                            "values": [[date_str, session, "✅ Active"]]
+                        })
+                if updates:
+                    ws.batch_update(updates)
+                    print(f"✅ Module Registry batch updated ({len(updates)} modules)")
     except Exception as e:
         print(f"apply_boot_em_log: update_module_registry error: {e}")
 

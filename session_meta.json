@@ -1,8 +1,8 @@
 {
   "date": "2026-05-02",
-  "session": "Session N",
-  "built": "built",
-  "fixed": "fixed",
-  "pending": "pending",
+  "session": "Session 24",
+  "built": "apply_boot_em_log on Railway boot, clear_done_backlog every 3 deploys",
+  "fixed": "Em Log + Module Registry not updating on Railway boot",
+  "pending": "None",
   "deploy_count": 1
 }
