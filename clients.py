@@ -17,6 +17,14 @@ _creds = None
 _client = None
 
 
+def _has_google_credentials():
+    """Return True if Google credentials are available in this environment."""
+    if os.getenv("GOOGLE_CREDENTIALS"):
+        return True
+    if os.path.exists("credentials.json"):
+        return True
+    return False
+
 def _get_creds():
     global _creds
     if _creds is None:
@@ -50,20 +58,34 @@ class _LazySpreadsheet:
     def _get(self):
         global _spreadsheet
         if _spreadsheet is None:
+            if not _has_google_credentials():
+                return None
             _spreadsheet = gc.open_by_key(SHEET_ID)
         return _spreadsheet
 
     def __getattr__(self, name):
-        return getattr(self._get(), name)
+        s = self._get()
+        if s is None:
+            return None
+        return getattr(s, name)
 
     def worksheet(self, *args, **kwargs):
-        return self._get().worksheet(*args, **kwargs)
+        s = self._get()
+        if s is None:
+            return None
+        return s.worksheet(*args, **kwargs)
 
     def worksheets(self, *args, **kwargs):
-        return self._get().worksheets(*args, **kwargs)
+        s = self._get()
+        if s is None:
+            return []
+        return s.worksheets(*args, **kwargs)
 
     def add_worksheet(self, *args, **kwargs):
-        return self._get().add_worksheet(*args, **kwargs)
+        s = self._get()
+        if s is None:
+            return None
+        return s.add_worksheet(*args, **kwargs)
 
 
 class _LazyDrive:
