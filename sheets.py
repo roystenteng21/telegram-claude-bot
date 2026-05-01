@@ -12,6 +12,8 @@ import state
 # ── Sheet accessors ────────────────────────────────────────────────────────────
 
 def get_sheet(name):
+    if spreadsheet is None:
+        return None
     try:
         return spreadsheet.worksheet(name)
     except Exception as e:
