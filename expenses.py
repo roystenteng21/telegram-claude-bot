@@ -514,6 +514,8 @@ def handle_expense_text(text, user_id, receipt_link="", last4=None):
             "is_new_merchant": is_new_merchant
         }
         state.receipt_confirm_sessions[user_id] = session
+        from sessions import touch_session
+        touch_session(user_id)
         confirmation = format_expense_confirmation(
             merchant, amount, currency, category, card, sgd_amount,
             receipt_saved=bool(receipt_link), last4=last4,
