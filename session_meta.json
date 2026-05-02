@@ -1,8 +1,8 @@
 {
   "date": "2026-05-02",
   "session": "Session 25",
-  "built": "log bug command with priority inference; expense summary natural phrasing fix",
-  "fixed": "session timeout on expense confirmation (expenses.py)",
-  "pending": "clear_done_backlog threshold 3\u21922 pending infrastructure.py upload",
-  "deploy_count": 3
+  "built": "clear_done_backlog threshold changed to every 2 deploys; Em_Session_Brief created in Drive",
+  "fixed": "none",
+  "pending": "Update Handoff Rule in Dev Notes (needs config.py)",
+  "deploy_count": 4
 }

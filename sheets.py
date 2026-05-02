@@ -292,7 +292,7 @@ def apply_boot_em_log():
         print(f"apply_boot_em_log: update_module_registry error: {e}")
 
     # Every 3rd deploy, clear done backlog items
-    if deploy_count and deploy_count % 3 == 0:
+    if deploy_count and deploy_count % 2 == 0:
         try:
             clear_done_backlog_items()
         except Exception as e:
