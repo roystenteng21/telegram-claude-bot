@@ -1,8 +1,8 @@
 {
   "date": "2026-05-02",
   "session": "Session 25",
-  "built": "touch_session called on receipt_confirm_sessions creation",
-  "fixed": "session immediately expiring before user could reply yes/edit",
-  "pending": "none",
-  "deploy_count": 2
+  "built": "log bug command with priority inference; expense summary natural phrasing fix",
+  "fixed": "session timeout on expense confirmation (expenses.py)",
+  "pending": "clear_done_backlog threshold 3\u21922 pending infrastructure.py upload",
+  "deploy_count": 3
 }

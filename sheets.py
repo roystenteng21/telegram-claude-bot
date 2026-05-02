@@ -151,6 +151,19 @@ def add_backlog_item(priority, item, stage="", notes=""):
     except Exception as e:
         return f"add_backlog_item error: {e}"
 
+def append_bug_to_backlog(description):
+    """Log a bug from Em directly to the backlog. Infers priority from description."""
+    lower = description.lower()
+    high_keywords = ["crash", "broken", "lost", "fail", "error", "not working", "silent", "unrecoverable", "exception", "missing"]
+    low_keywords = ["cosmetic", "wording", "minor", "typo", "formatting"]
+    if any(k in lower for k in high_keywords):
+        priority = "🔴"
+    elif any(k in lower for k in low_keywords):
+        priority = "🟢"
+    else:
+        priority = "🟡"
+    return add_backlog_item(priority, description, stage="", notes="")
+
 def get_pending_backlog():
     """Return formatted backlog from Em Log — Outstanding items only."""
     try:

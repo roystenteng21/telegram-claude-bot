@@ -12,7 +12,7 @@ from config import (
     AVIATIONSTACK_API_KEY
 )
 from clients import client, drive_service
-from sheets import get_sheet, get_pending_backlog
+from sheets import get_sheet, get_pending_backlog, append_bug_to_backlog
 from helpers import send_safe, looks_like_new_intent, format_date
 from crm import (
     find_row, find_all_rows, save_contact, find_contact, add_note, set_followup,
@@ -1120,8 +1120,12 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif lower.startswith("delete merchant ") or lower.startswith("remove merchant ") or lower.startswith("forget merchant "):
         merchant_name = text.split(" ", 2)[2].strip()
         reply = delete_merchant(merchant_name)
-    elif lower in ["expense report", "monthly report", "spending report", "expenses",
-                   "monthly summary", "monthly spend", "this month", "expense summary"]:
+    elif lower.startswith("log bug "):
+        description = text[8:].strip()
+        reply = append_bug_to_backlog(description)
+    elif (lower in ["expense report", "monthly report", "spending report", "expenses",
+                   "monthly summary", "monthly spend", "this month", "expense summary"]
+          or (re.search(r"\b(expense|spend|spent|spending)\b", lower) and re.search(r"\b(month|monthly|this month)\b", lower))):
         reply = get_expense_report()
     elif lower in ["delete last expense", "remove last expense"]:
         reply = delete_last_expense()
