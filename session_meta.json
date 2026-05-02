@@ -1,8 +1,8 @@
 {
   "date": "2026-05-02",
   "session": "Session 25",
-  "built": "clear_done_backlog threshold changed to every 2 deploys; Em_Session_Brief created in Drive",
-  "fixed": "none",
+  "built": "touch_session on receipt_confirm_sessions creation; log bug command with priority inference; expense summary natural phrasing fix; clear_done_backlog threshold 3\u21922",
+  "fixed": "session immediately expiring before user could reply; expense summary misrouting",
   "pending": "Update Handoff Rule in Dev Notes (needs config.py)",
-  "deploy_count": 4
+  "deploy_count": 5
 }

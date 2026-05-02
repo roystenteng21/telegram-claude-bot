@@ -199,7 +199,7 @@ def get_pending_backlog():
         return f"❌ Couldn't read backlog: {e}"
 
 def clear_done_backlog_items():
-    """Delete all backlog rows where Status = ✅ Done. Called every 3 deploys."""
+    """Delete all backlog rows where Status = ✅ Done. Called every 2 deploys."""
     try:
         ws = em_log_sheet()
         if not ws:
