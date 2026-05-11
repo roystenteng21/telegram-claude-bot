@@ -22,7 +22,8 @@ from crm import (
     get_all_referrals, get_top_referrers, parse_excel_column_order,
     handle_excel_import, check_birthday_acknowledgement, detect_crm_natural_update,
     send_followup_reminders, send_birthday_reminders, send_birthday_followups,
-    persist_birthday_pending, load_birthday_pending_from_sheet
+    persist_birthday_pending, load_birthday_pending_from_sheet,
+    auto_clear_birthday_pending, mark_birthday_not_sent
 )
 from expenses import (
     get_cards_live, get_card_names_live, set_card_default_category,
@@ -610,7 +611,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         cs = state.confirm_sessions[user_id]
         action = cs.get("action")
         args = cs.get("args", [])
-        if lower in ["yes", "y"]:
+        if lower in ["yes", "y", "yep", "yeah", "yup", "sure", "ok", "okay"]:
             del state.confirm_sessions[user_id]
             state.session_timestamps.pop(user_id, None)
             if action == "delete_contact":
@@ -626,7 +627,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             else:
                 reply = "Done."
             await send_safe(update.message, reply, parse_mode="Markdown")
-        elif lower in ["no", "n", "cancel"]:
+        elif lower in ["no", "n", "cancel", "nope", "nah"]:
             del state.confirm_sessions[user_id]
             state.session_timestamps.pop(user_id, None)
             await update.message.reply_text("Cancelled.")
@@ -859,7 +860,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await _send_trip_confirm(update, dict(ts))
             return
         elif step == "confirm":
-            if t.upper() == "Y":
+            if t.upper() in ["Y", "YES", "CONFIRM", "YEP", "YEAH", "YUP", "SURE", "OK", "OKAY", "LOOKS GOOD"]:
                 state.overseas_state.pop("_trip_setup", None)
                 persist_trip_setup()
                 dest = ts.get("destination", "Unknown")
@@ -939,7 +940,20 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif lower.startswith("find ") or lower.startswith("pull up "):
         name = text[5:] if lower.startswith("find ") else text[8:]
-        reply = find_contact(name)
+        name_lower = name.strip().lower()
+        # Route pull up to correct handler before defaulting to CRM
+        if name_lower in ["todo list", "todos", "my todos", "my todo list", "tasks", "my tasks"]:
+            reply = list_todos()
+        elif name_lower in ["bills", "my bills", "bill list"]:
+            reply = list_bills()
+        elif name_lower in ["reminders", "my reminders", "reminder list"]:
+            reply = list_reminders()
+        elif name_lower in ["followups", "follow ups", "my followups", "my follow ups"]:
+            reply = upcoming_followups()
+        elif name_lower in ["contacts", "my contacts"]:
+            reply = list_contacts()
+        else:
+            reply = find_contact(name)
 
     elif lower.startswith("note "):
         reply = add_note(text[5:])
@@ -1021,7 +1035,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif lower in ["skip missed bills", "dismiss missed bills"]:
         reply = "Missed bill reminders dismissed ✅"
 
-    elif lower in ["yes", "y", "yep", "yeah", "yup"] and state.market_summary_pending.get(user_id):
+    elif lower in ["yes", "y", "yep", "yeah", "yup", "sure"] and state.market_summary_pending.get(user_id):
         state.market_summary_pending.pop(user_id, None)
         reply = await get_market_summary_now()
 
@@ -1160,7 +1174,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             closed = close_trip()
             reply = "Trip closed ✅" if closed else "No active trip to close."
-    elif lower in ["current trip", "active trip", "am i overseas", "overseas status"]:
+    elif lower in ["current trip", "active trip", "am i overseas", "overseas status",
+                   "am i in overseas mode", "is overseas mode on", "overseas mode status",
+                   "am i in overseas", "what's my overseas status"]:
         if state.overseas_state.get("active"):
             dest = state.overseas_state.get("destination", "Unknown")
             curr = state.overseas_state.get("currency", "SGD")
@@ -1170,6 +1186,15 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 reply += f"\nStarted: {trip_start}"
         else:
             reply = "No active trip — you're in SG mode."
+    elif lower in ["show me my bills", "show my bills", "show me my reminders",
+                   "show my reminders", "show me my tasks", "show my tasks",
+                   "show me my todos", "show my todos", "show me my todo list"]:
+        if "bill" in lower:
+            reply = list_bills()
+        elif "reminder" in lower:
+            reply = list_reminders()
+        else:
+            reply = list_todos()
     elif lower.startswith("edit last expense ") or lower.startswith("edit expense "):
         edit_text = re.sub(r"^edit (?:last )?expense\s+", "", text, flags=re.IGNORECASE).strip()
         if edit_text:
@@ -1185,7 +1210,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = f"Rename category *{old_cat}* to *{new_cat}*? This will update all expense rows and Merchant Map. (yes / no)"
         else:
             reply = "Try: 'rename category FnB to Food'"
-    elif lower.startswith("now in ") or lower.startswith("switched to ") or lower.startswith("arrived in "):
+    elif lower.startswith("now in ") or lower.startswith("switched to ") or lower.startswith("arrived in ") \
+            or re.search(r"\bi'?m in\b|\bi am in\b", lower) or re.search(r"\bcoming back\b|\bheading back\b|\bon my way back\b", lower):
         if state.overseas_state.get("active"):
             dest_text = re.sub(r"^(now in|switched to|arrived in)\s+", "", lower).strip().title()
             new_curr = _get_currency_for_dest(dest_text)
@@ -1311,7 +1337,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = "\n".join(lines)
         else:
             reply = result
-    elif lower == "todos":
+    elif lower in ["todos", "my todos", "todo list", "my todo list", "show todos",
+                   "show my todos", "list todos", "what's on my list", "my tasks",
+                   "show my tasks", "list my tasks", "pending tasks"]:
         reply = list_todos()
 
     elif lower.startswith("add event") or lower.startswith("schedule ") or lower.startswith("create event"):
@@ -1417,7 +1445,21 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if needs_session and session_data:
             state.expense_sessions[user_id] = session_data
 
-    # Calendar
+    # Calendar queries (read — what's on, do I have anything)
+    elif any(t in lower for t in [
+        "what's on today", "whats on today", "what is on today",
+        "what's on tomorrow", "whats on tomorrow",
+        "do i have anything today", "do i have anything tomorrow",
+        "any events today", "any events tomorrow",
+        "what have i got today", "what have i got tomorrow",
+        "what do i have today", "what do i have tomorrow",
+        "calendar today", "calendar tomorrow",
+        "show my calendar", "what's happening today", "what's happening tomorrow",
+    ]):
+        days = 7 if "week" in lower else 1
+        reply = get_events(days)
+
+    # Calendar (create)
     elif is_calendar_request(text):
         reply = smart_add_event(text, user_id)
 
@@ -1529,8 +1571,17 @@ async def check_missed_items_on_startup(app):
             ws = bills_sheet()
             records = ws.get_all_records()
             for r in records:
-                due_day = int(r.get("Due Date", 0) or 0)
-                if due_day and yesterday.day == due_day:
+                due_str = r.get("Due Date", "")
+                if not due_str:
+                    continue
+                due_date = None
+                for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y"]:
+                    try:
+                        due_date = datetime.strptime(due_str, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+                if due_date and due_date == yesterday:
                     missed_bills.append(r.get("Name", "?"))
         except Exception as e:
             print(f"Missed bills check error: {e}")

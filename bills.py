@@ -7,12 +7,14 @@ from clients import client
 from sheets import bills_sheet, expenses_sheet
 
 def parse_bill_request(text):
+    from datetime import date
+    today = date.today().strftime("%d %b %Y")
     prompt = (
-        f"Extract bill details from: '{text}'\n\n"
+        f"Today is {today}. Extract bill details from: '{text}'\n\n"
         f"Return ONLY a JSON object with:\n"
         f"- name: string (bill name, e.g. 'Citi Credit Card', 'Netflix', 'Electricity')\n"
         f"- bank: string (bank or provider name, or empty)\n"
-        f"- due_day: number (day of month the bill is due, e.g. 15)\n"
+        f"- due_date: string (full due date in DD/MM/YYYY format, e.g. '18/05/2026'. If only day+month given, assume current or next occurrence. If no date, empty string.)\n"
         f"- estimated_amount: number (estimated amount in SGD, or 0 if not mentioned)\n"
         f"- notes: string (any extra notes, or empty)\n\n"
         f"Return ONLY the JSON."
@@ -29,9 +31,9 @@ def parse_bill_request(text):
         print(f"parse_bill_request JSON error: {e} | raw: {raw[:100]}")
         return None
 
-def add_bill(name, bank, due_day, estimated_amount, notes=""):
+def add_bill(name, bank, due_date, estimated_amount, notes=""):
     sheet = bills_sheet()
-    sheet.append_row([name, bank, str(due_day), str(estimated_amount), notes])
+    sheet.append_row([name, bank, due_date, str(estimated_amount), notes])
 
 def list_bills():
     try:
@@ -43,7 +45,8 @@ def list_bills():
         for r in records:
             amt = r.get("Estimated Amount", "")
             amt_str = f" — ~${amt}" if amt and str(amt) != "0" else ""
-            lines.append(f"• {r.get('Name', '')} (due day {r.get('Due Date', '')}){amt_str}")
+            due = r.get("Due Date", "")
+            lines.append(f"• {r.get('Name', '')} (due {due}){amt_str}")
         return "\n".join(lines)
     except Exception as e:
         return f"❌ Error listing bills: {str(e)}"
@@ -94,27 +97,44 @@ async def send_bill_reminders(app):
         today = date.today()
         for r in records:
             try:
-                due_day = int(r.get("Due Date", 0))
-                if not due_day:
+                due_str = r.get("Due Date", "")
+                if not due_str:
                     continue
-                if today.day <= due_day:
-                    next_due = today.replace(day=due_day)
-                else:
-                    if today.month == 12:
-                        next_due = today.replace(year=today.year + 1, month=1, day=due_day)
-                    else:
-                        next_due = today.replace(month=today.month + 1, day=due_day)
-                days_away = (next_due - today).days
+                due_date = None
+                for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y"]:
+                    try:
+                        due_date = datetime.strptime(due_str, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+                if not due_date:
+                    continue
+                days_away = (due_date - today).days
                 if days_away == 7:
                     name = r.get("Name", "")
                     estimated = r.get("Estimated Amount", "")
-                    cycle_total = get_cycle_expenses(name, due_day)
-                    amount_str = f"${cycle_total:.2f} logged this cycle" if cycle_total > 0 else (f"~${estimated}" if estimated and str(estimated) != "0" else "amount unknown")
+                    amount_str = f"~${estimated}" if estimated and str(estimated) != "0" else "amount unknown"
                     greeting = random.choice(BILL_REMINDER_GREETINGS)
                     msg = (
-                        f"{greeting} — your {name} bill is due in 7 days ({next_due.strftime('%d %b')}).\n"
+                        f"{greeting} — your {name} bill is due in 7 days ({due_date.strftime('%d %b')}).\n"
                         f"{amount_str}."
                     )
+                    await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
+                elif days_away == 3:
+                    name = r.get("Name", "")
+                    estimated = r.get("Estimated Amount", "")
+                    amount_str = f"~${estimated}" if estimated and str(estimated) != "0" else "amount unknown"
+                    greeting = random.choice(BILL_REMINDER_GREETINGS)
+                    msg = (
+                        f"{greeting} — your {name} bill is due in 3 days ({due_date.strftime('%d %b')}).\n"
+                        f"{amount_str}."
+                    )
+                    await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
+                elif days_away == 0:
+                    name = r.get("Name", "")
+                    estimated = r.get("Estimated Amount", "")
+                    amount_str = f"~${estimated}" if estimated and str(estimated) != "0" else "amount unknown"
+                    msg = f"📅 Your {name} bill is due today. {amount_str}."
                     await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
             except Exception as e:
                 print(f"Bill reminder error for {r.get('Name', '?')}: {e}")
@@ -123,6 +143,12 @@ async def send_bill_reminders(app):
 
 def is_bill_request(text):
     lower = text.lower()
+    if re.search(r"\bnew\s+bill\b", lower):
+        return True
+    if re.search(r"\bbills?\b", lower) and re.search(r"\$[\d,.]+|\d+[\d,.]*\s*(sgd|myr|usd)?", lower):
+        return True
+    if re.search(r"\bbills?\b", lower) and re.search(r"\bdue\b", lower):
+        return True
     has_due_on_the = bool(re.search(r"due on the \d{1,2}", lower))
     triggers = ["bill is due", "bill due", "set up a bill", "add a bill",
                 "credit card bill", "due every", "my citi bill", "my maybank bill",
@@ -134,13 +160,37 @@ def handle_new_bill(text):
         parsed = parse_bill_request(text)
         name = parsed.get("name", "")
         bank = parsed.get("bank", "")
-        due_day = parsed.get("due_day", 0)
+        due_date_str = parsed.get("due_date", "")
         estimated_amount = parsed.get("estimated_amount", 0)
         notes = parsed.get("notes", "")
-        if not name or not due_day:
-            return "Couldn't get the bill details. Try: 'my Citi bill is due on the 15th, usually around $800'."
-        add_bill(name, bank, due_day, estimated_amount, notes)
-        amt_str = f", estimated ~${estimated_amount}" if estimated_amount else ""
-        return f"Got it, I'll remind you about your {name} bill 7 days before it's due (day {due_day} of each month{amt_str})."
+        if not name or not due_date_str:
+            return "Couldn't get the bill details. Try: 'new bill Citi $800 due 25 May'."
+        add_bill(name, bank, due_date_str, estimated_amount, notes)
+        amt_str = f", ~${estimated_amount}" if estimated_amount else ""
+        # Check days away for immediate reminder
+        try:
+            due_date = None
+            for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y"]:
+                try:
+                    due_date = datetime.strptime(due_date_str, fmt).date()
+                    break
+                except ValueError:
+                    continue
+            if due_date:
+                days_away = (due_date - date.today()).days
+                reminder_note = ""
+                if days_away <= 0:
+                    reminder_note = "\n⚠️ This bill is due today or overdue."
+                elif days_away <= 3:
+                    reminder_note = f"\n📅 Due in {days_away} day(s) — I'll remind you on the due date."
+                elif days_away <= 7:
+                    reminder_note = f"\n📅 Due in {days_away} day(s) — I'll remind you 3 days before."
+                else:
+                    reminder_note = f"\n📅 Due in {days_away} day(s) — I'll remind you 7 days before."
+            else:
+                reminder_note = ""
+        except Exception:
+            reminder_note = ""
+        return f"Got it — {name} bill logged for {due_date_str}{amt_str}.{reminder_note}"
     except Exception as e:
         return f"❌ Couldn't save that bill: {str(e)}"

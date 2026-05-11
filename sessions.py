@@ -87,6 +87,8 @@ def get_active_session_label(user_id):
         return "contact save"
     if user_id in state.todo_disambig_sessions:
         return "todo action"
+    if state.birthday_pending:
+        return "birthday acknowledgement"
     return None
 
 def get_active_session(user_id):

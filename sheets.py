@@ -4,7 +4,7 @@ import pytz
 from datetime import date, datetime
 from config import (
     CARDS_SCHEMA, INITIAL_CARDS, DEV_NOTES_CONTENT, EM_LOG_HEADERS_BACKLOG,
-    EM_LOG_HEADERS_SESSION, INITIAL_BACKLOG, INITIAL_SESSION
+    EM_LOG_HEADERS_SESSION
 )
 from clients import spreadsheet, drive_service
 import state
@@ -384,18 +384,6 @@ def _setup_em_log(existing):
             ws.clear()
             _write_em_log_fresh(ws)
             return
-        if not has_backlog:
-            print("Em Log missing backlog section — injecting...")
-            backlog_rows = [
-                ["── BACKLOG (max 10) ──", "", "", "", "", ""],
-                EM_LOG_HEADERS_BACKLOG,
-            ] + [list(r) for r in INITIAL_BACKLOG[:10]] + [
-                ["", "", "", "", "", ""],
-            ]
-            for i, row in enumerate(backlog_rows, start=1):
-                ws.insert_row(row, i)
-            print("✅ Em Log backlog section injected")
-            return
         _migrate_backlog_status(ws, all_values)
         print("Em Log already populated — skipping full init")
     except Exception as e:
@@ -405,13 +393,9 @@ def _write_em_log_fresh(ws):
     """Write full Em Log structure from scratch."""
     ws.append_row(["── BACKLOG (max 10) ──", "", "", "", "", ""])
     ws.append_row(EM_LOG_HEADERS_BACKLOG)
-    for row in INITIAL_BACKLOG[:10]:
-        ws.append_row(row)
     ws.append_row(["", "", "", "", "", ""])
     ws.append_row(["── SESSION HISTORY (max 10) ──", "", "", "", "", ""])
     ws.append_row(EM_LOG_HEADERS_SESSION)
-    for row in INITIAL_SESSION:
-        ws.append_row(row)
     try:
         ws.format('A1:F1', {'textFormat': {'bold': True}, 'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}})
     except Exception:

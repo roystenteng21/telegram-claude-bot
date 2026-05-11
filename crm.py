@@ -125,8 +125,10 @@ def find_contact(name, show_private=False):
 def add_note(data):
     try:
         sheet = crm_sheet()
-        parts = data.split("-", 1)
-        if len(parts) < 2:
+        # Split on first " - " (space-hyphen-space) to avoid splitting hyphenated names
+        if " - " in data:
+            parts = data.split(" - ", 1)
+        else:
             return "❌ Format: note Name - your note here"
         name = parts[0].strip()
         note = parts[1].strip()
@@ -592,10 +594,23 @@ def get_birthday_greeted_col():
 
 def generate_birthday_greeting(name, age, relationship, context, notes):
     context_str = f"Relationship: {relationship}. Context: {context}. Notes: {notes or 'none'}."
+    style_ref = ""
+    try:
+        from sheets import get_sheet
+        sheet = get_sheet("Settings")
+        if sheet:
+            records = sheet.get_all_records()
+            for r in records:
+                if r.get("Key") == "birthday_message_style":
+                    style_ref = r.get("Value", "")
+                    break
+    except Exception:
+        pass
+    style_note = f"\n\nStyle reference (match this tone and length):\n{style_ref}" if style_ref else ""
     greeting_prompt = (
         f"Write a warm, casual birthday greeting that someone could copy and paste to send to {name}, "
         f"who is turning {age} today.\n\n"
-        f"Context: {context_str}\n\n"
+        f"Context: {context_str}{style_note}\n\n"
         f"Rules:\n"
         f"- Must open with Happy birthday\n"
         f"- Casual and warm throughout, never stiff or corporate\n"
@@ -667,13 +682,13 @@ async def send_birthday_followups(app):
                 msg = (
                     f"Did you get a chance to wish {name} happy birthday? 🎂\n\n"
                     f"Here's that message again:\n\n"
-                    f"{data['greeting']}"
+                    f"{data['greeting']}\n\n"
+                    f"Reply 'sent' when you've wished them, or 'skip' to dismiss."
                 )
                 await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg)
             except Exception as e:
                 print(f"Error sending 2pm follow-up for {name}: {e}")
-        state.birthday_pending = {}
-        persist_birthday_pending()
+        # Do NOT clear birthday_pending here — wait for explicit sent/skip
     except Exception as e:
         print(f"Error in send_birthday_followups: {e}")
 
@@ -689,28 +704,88 @@ def mark_birthday_greeted(name):
     except Exception as e:
         print(f"Error marking birthday greeted for {name}: {e}")
 
+def mark_birthday_not_sent(name):
+    try:
+        col = get_birthday_greeted_col()
+        if not col:
+            return
+        row_num, record = find_row(name)
+        if record and row_num != "disambig":
+            sheet = crm_sheet()
+            sheet.update_cell(row_num, col, "not sent")
+    except Exception as e:
+        print(f"Error marking birthday not sent for {name}: {e}")
+
+async def auto_clear_birthday_pending(app):
+    """Called at midnight — marks any ungreeted birthday contacts as not sent."""
+    from config import YOUR_CHAT_ID
+    try:
+        ungreeted = {k: v for k, v in state.birthday_pending.items() if not v.get("greeted")}
+        for name in ungreeted:
+            mark_birthday_not_sent(name)
+        state.birthday_pending = {}
+        persist_birthday_pending()
+    except Exception as e:
+        print(f"auto_clear_birthday_pending error: {e}")
+
 def check_birthday_acknowledgement(text):
     if not state.birthday_pending:
         return False, None
     lower = text.strip().lower()
-    if lower not in ["sent", "done", "skip", "skipped", "sent it", "sent!",
-                     "yeah sent it", "already sent", "ok done", "yep sent",
-                     "yup sent", "sent already", "done already", "ok skip",
-                     "yeah skip", "just sent", "just sent it"]:
+    # Birthday message paste detection — birthday keywords present
+    birthday_keywords = ["happy birthday", "birthday", "celebrate", "wishing you", "bday"]
+    if any(kw in lower for kw in birthday_keywords) and len(text) > 40:
+        # Store as style reference in Settings
+        try:
+            from sheets import get_sheet
+            sheet = get_sheet("Settings")
+            if sheet:
+                records = sheet.get_all_records()
+                for i, r in enumerate(records):
+                    if r.get("Key") == "birthday_message_style":
+                        sheet.update_cell(i + 2, 2, text)
+                        return True, "Noted 👍"
+                sheet.append_row(["birthday_message_style", text])
+            return True, "Noted 👍"
+        except Exception as e:
+            print(f"birthday style save error: {e}")
+            return True, "Noted 👍"
+
+    sent_variants = [
+        "sent", "done", "skip", "skipped", "sent it", "sent!",
+        "yeah sent it", "already sent", "ok done", "yep sent",
+        "yup sent", "sent already", "done already", "ok skip",
+        "yeah skip", "just sent", "just sent it", "i sent it",
+        "birthday message sent", "birthday text sent", "bday text sent",
+    ]
+    # Also catch "sent [name] birthday" or "[name] sent" patterns
+    is_sent = lower in sent_variants
+    if not is_sent:
+        if re.search(r"\bsent\b", lower) and re.search(r"\bbirthday|bday|text|message\b", lower):
+            is_sent = True
+        elif re.search(r"\bsent\b", lower):
+            # "sent jolyn" or "jolyn sent" — check if name matches pending
+            for name in state.birthday_pending:
+                if name.lower().split()[0] in lower:
+                    is_sent = True
+                    break
+    if not is_sent:
         return False, None
+
+    skip = lower in ["skip", "skipped", "ok skip", "yeah skip"]
     acknowledged = []
     for name, data in list(state.birthday_pending.items()):
         if not data.get("greeted"):
-            if lower in ["skip", "skipped"]:
-                data["greeted"] = True
-                acknowledged.append(f"Skipped {name}")
+            data["greeted"] = True
+            if skip:
+                mark_birthday_not_sent(name)
+                acknowledged.append(name)
             else:
-                data["greeted"] = True
                 mark_birthday_greeted(name)
-                acknowledged.append(f"Marked {name} as greeted ✅")
+                acknowledged.append(name)
     if acknowledged:
         persist_birthday_pending()
-        return True, "\n".join(acknowledged)
+        return True, "Got it ✅"
     return False, None
 
 async def send_followup_reminders(app):

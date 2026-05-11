@@ -1,8 +1,8 @@
 {
-  "date": "2026-05-02",
-  "session": "Session 25",
-  "built": "touch_session on receipt_confirm_sessions creation; log bug command with priority inference; expense summary natural phrasing fix; clear_done_backlog threshold 3\u21922",
-  "fixed": "session immediately expiring before user could reply; expense summary misrouting",
-  "pending": "Update Handoff Rule in Dev Notes (needs config.py)",
-  "deploy_count": 5
+  "date": "2026-05-11",
+  "session": "Session 26",
+  "built": "Bills full date storage + smart reminders; birthday pending survives 2pm followup + midnight auto-clear + style reference + broadened sent detection; overseas i'm in [country] now + coming back patterns; confirm flows accept yep/yeah/sure/nope/nah; pull up routes to correct handler; show me my [x] handlers; natural calendar queries; todos broader triggers; is_log_prefix excludes CRM/bills; is_expense_input removes bill was trigger; reminders alert me if trigger; sessions birthday in interrupt guard; trips setup confirm accepts yes/confirm",
+  "fixed": "Bills misrouting; birthday pending wiped at 2pm; sent not recognised; pasted message misidentified as CRM log; overseas status check too narrow; check_missed_items_on_startup bills int parse",
+  "pending": "None",
+  "deploy_count": 6
 }

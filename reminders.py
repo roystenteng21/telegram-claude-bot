@@ -173,7 +173,7 @@ def is_reminder_request(text):
         "don't let me forget", "dont let me forget",
         "i need to remember to", "i need to remember",
         "don't let me forget to", "dont let me forget to",
-        "alert me when", "alert me to",
+        "alert me when", "alert me to", "alert me if",
         "notify me when", "notify me about", "notify me to",
         "ping me at", "ping me when", "ping me to",
         "drop me a reminder", "drop a reminder", "send me a reminder"

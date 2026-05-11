@@ -276,14 +276,21 @@ async def deactivate_and_notify(app):
 
 def handle_overseas_request(text):
     lower = text.lower()
-    if any(p in lower for p in ["back home", "returned", "i'm back", "landed back", "home now"]):
+    if any(p in lower for p in ["back home", "returned", "i'm back", "landed back", "home now",
+                                  "coming back", "heading back", "on my way back"]):
         import random
         greeting = random.choice(["Welcome back!", "Good to have you back!", "Hope the trip was great!"])
         deactivate_overseas_mode()
         return f"{greeting} Switching back to SGD. 🏠"
     flight_num = extract_flight_number(text)
-    dest_match = re.search(r'(?:to|in|flying to|going to|headed to|heading to|trip to)\s+([A-Za-z][A-Za-z\s]{2,25}?)(?:\s+on|\s+\d|$|[,.])', text, re.IGNORECASE)
-    dest_hint = dest_match.group(1).strip().title() if dest_match else None
+    # Extract destination from "i'm in [country]" pattern
+    im_in_match = re.search(r"i'?m in ([A-Za-z][A-Za-z\s]{2,20}?)(?:\s+now|\s+currently|[,.]|$)", text, re.IGNORECASE)
+    dest_hint = None
+    if im_in_match:
+        dest_hint = im_in_match.group(1).strip().title()
+    else:
+        dest_match = re.search(r'(?:to|in|flying to|going to|headed to|heading to|trip to)\s+([A-Za-z][A-Za-z\s]{2,25}?)(?:\s+on|\s+\d|$|[,.])', text, re.IGNORECASE)
+        dest_hint = dest_match.group(1).strip().title() if dest_match else None
     state.overseas_state["_trip_setup"] = {
         "step": "destination",
         "flight_number": flight_num or "",

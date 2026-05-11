@@ -14,7 +14,8 @@ from fx import load_fx_rates_from_sheet
 from stocks import load_price_alerts_from_sheet
 from expenses import get_cards_live
 from crm import (
-    send_followup_reminders, send_birthday_reminders, send_birthday_followups
+    send_followup_reminders, send_birthday_reminders, send_birthday_followups,
+    auto_clear_birthday_pending
 )
 from reminders import check_and_fire_reminders
 from bills import send_bill_reminders
@@ -47,6 +48,7 @@ async def post_init(app):
     scheduler.add_job(send_followup_reminders, "cron", hour=9, minute=0, args=[app])
     scheduler.add_job(send_birthday_reminders, "cron", hour=12, minute=0, args=[app])
     scheduler.add_job(send_birthday_followups, "cron", hour=14, minute=0, args=[app])
+    scheduler.add_job(auto_clear_birthday_pending, "cron", hour=0, minute=0, args=[app])
     scheduler.add_job(check_and_fire_reminders, "interval", minutes=1, args=[app], misfire_grace_time=30)
     scheduler.add_job(send_bill_reminders, "cron", hour=9, minute=0, args=[app])
     scheduler.add_job(check_icloud_daily, "cron", hour=9, minute=5, args=[app])

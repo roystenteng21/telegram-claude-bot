@@ -211,7 +211,7 @@ DEV_NOTES_CONTENT = [
     ["Rule — Em Log Documentation", "Every session MUST produce a complete Em Log entry before closing. Built, Fixed, and Pending fields must be specific — not 'various fixes'. Any architectural decision, new pattern, or deviation from standards must be documented in Dev Notes in the same session it is made. Future Claude instances rely on this as the sole source of truth.", "2026-05-01"],
     ["Rule — No Silent Changes", "Any change to module boundaries, import structure, coding standards, or deploy flow must be logged to Dev Notes immediately. Never leave a session with undocumented architectural changes. The sheet is the memory — if it's not in the sheet, it didn't happen.", "2026-05-01"],
     ["Rule — Circular Import Zero Tolerance", "Imports flow strictly downward through layers. If adding an import would create a cycle, restructure — move the shared function to a lower layer or pass it as a parameter. Never work around a circular import with lazy imports or importlib.", "2026-05-01"],
-    ["Handoff Rule", "Start of every session: (1) Read Dev Notes tab fully. (2) Read Em Log — last session entry and all Outstanding backlog items. (3) Read Module Registry — identifies which file to request for the task. (4) Ask Roysten to upload only the relevant module file(s). Never start building without completing steps 1–3.", "2026-05-01"],
+    ["Handoff Rule", "Start of every session: (1) Read the Em Session Brief uploaded by Roysten — this is the sole source of truth. Do not read the Em Management Sheet or Google Drive. (2) Identify the relevant module(s) from the brief's architecture section. (3) Ask Roysten to upload only those module file(s). Never request files beyond what the task requires. Never start building without completing steps 1–2 and receiving Roysten's explicit go-ahead. Session is not closed and no brief is generated until Roysten confirms the deploy succeeded.", "2026-05-02"],
     ["Handoff — What To Upload", "Pre-modularisation: upload bot.py. Post-modularisation: upload only the module file(s) relevant to the session task. Claude identifies the right module(s) from the Module Registry. If a session touches routing logic, also upload routing.py.", "2026-05-01"],
     ["Handoff — Mid-Session Context", "If a session ends mid-build (not deployed): log exactly what was completed, what is half-built, and what the next step is in the Em Log Pending field. The next session picks up from that exact point — no re-explaining required.", "2026-05-01"],
     ["Deploy Flow — Pre-Modularisation", "Download bot.py from Claude chat → save to ~/telegram-claude-bot/bot.py → python ~/telegram-claude-bot/deploy.py 'commit msg' 'Session N' 'built' 'fixed' 'pending' → Railway auto-deploys, Em Log + Module Registry auto-updated.", "2026-05-01"],
@@ -228,33 +228,3 @@ DEV_NOTES_CONTENT = [
 EM_LOG_HEADERS_BACKLOG = ["Priority", "Item", "Stage", "Notes", "Added", "Status"]
 EM_LOG_HEADERS_SESSION = ["Date", "Session", "Built", "Fixed", "Pending", "Commit"]
 
-INITIAL_BACKLOG = [
-    ["🔴", "log_expense: add error handling — financial data silently lost on sheet failure", "Step 3", "Wrap append_row in try/except, notify user if write fails, do not delete session until write confirmed", "2026-04-26", "✅ Done"],
-    ["🔴", "Session deleted before write confirmed — expense unrecoverable on failure", "Step 3", "Move del receipt_confirm_sessions[user_id] to after log_expense succeeds", "2026-04-26", "✅ Done"],
-    ["🔴", "save_merchant_memory silent fail — merchant never learned if sheet write fails", "Step 3", "Add error handling, log failure, do not silently swallow", "2026-04-26", "✅ Done"],
-    ["🟠", "sheets_call_with_retry uses time.sleep(60) — blocks entire event loop", "Step 3", "Replace with asyncio.sleep(60) inside async context", "2026-04-26", "✅ Done"],
-    ["🟠", "get_calendar uses time.sleep(3) on retry — blocks event loop on every calendar request", "Step 3", "Replace with asyncio.sleep or remove retry sleep", "2026-04-26", "✅ Done"],
-    ["🟠", "find_row: 5 full passes over CRM records, no cache — 1000 iterations per lookup", "Step 3", "Single-pass with match tiers, add CRM cache invalidated on write", "2026-04-26", "✅ Done"],
-    ["🟠", "check_and_fire_reminders: full sheet read every minute + find_row inside loop", "Step 3", "Cache pending reminders in memory, only re-read on write. Remove find_row from loop.", "2026-04-26", "✅ Done"],
-    ["🟠", "Duplicate routing: is_reminder_request 3x, is_stock_request 2x, others twice", "Step 3", "Eliminate else block, merge missing handlers into primary elif chain", "2026-04-26", "✅ Done"],
-    ["🟡", "Missing env var guard at startup — cryptic crash if TELEGRAM_TOKEN or ANTHROPIC_API_KEY unset", "Step 3", "Add explicit check and clear error message before app starts", "2026-04-26", "✅ Done"],
-    ["🟡", "float() cast on unvalidated Claude output in parse_expense_text_v2 — unhandled exception", "Step 3", "Validate amount field before cast, return user-friendly error if invalid", "2026-04-26", "✅ Done"],
-    ["🟡", "restore_overseas_from_trips: no fallback on corrupt data — silent bad state", "Step 3", "Wrap in try/except per field, skip row if malformed, log warning", "2026-04-26", "✅ Done"],
-    ["🟡", "FX rates lost on Railway restart — user must re-enter manually after every redeploy", "Step 3", "Persist cached_fx_rates to Settings sheet, load on startup", "2026-04-26", "✅ Done"],
-    ["🟡", "No timeout on RSS fetch in fetch_market_rss_headlines — indefinite hang possible", "Step 3", "Add timeout=10 to requests.get call", "2026-04-26", "✅ Done"],
-    ["🟢", "_finalise_expense_session labelled legacy but still wired — dead code", "Step 3", "Remove function, update any callers", "2026-04-26", "✅ Done"],
-    ["🟢", "CARD_FX_FEES dict defined but never referenced anywhere", "Step 3", "Remove or wire up to FX fee display", "2026-04-26", "✅ Done"],
-    ["🟢", "bare except: in format_date and calculate_age swallows all exceptions", "Step 3", "Replace with except ValueError", "2026-04-26", "✅ Done"],
-    ["🟢", "Haiku for parse_expense_text_v2 and is_calendar_request — Sonnet overkill", "Step 3", "Switch model to claude-haiku-3, verify output quality unchanged", "2026-04-26", "✅ Done"],
-    ["🟢", "S5: End-to-end feature testing — no systematic test coverage across modules", "Step 3", "Test all features post-modularisation: expenses, CRM, trips, reminders, stocks, restaurants, calendar, todos", "2026-04-29", "✅ Done"],
-    ["🟢", "S5: Input forgiveness — narrow phrasing recognition misses natural variants", "Step 3", "Broaden detector patterns for common commands; test with varied natural language inputs", "2026-04-29", "✅ Done"],
-    ["🟢", "S5: Response consistency — emoji, error format, reply length vary across handlers", "Step 3", "Audit all reply strings; standardise error prefix, emoji usage, and length conventions", "2026-04-29", "✅ Done"],
-]
-
-INITIAL_SESSION = [
-    ["2026-04-26", "Session 6",
-     "Flight date fix (extract_flight_dates + AviationStack date param); Perf fixes (merchant cache, card cache, system prompt cache, history cap 20); AviationStack fallback; Dev Notes + Em Log tabs; em whats pending; setup_sheets single API call",
-     "Flight dates ignored (now passed to AviationStack); Merchant map re-read every expense; Card names re-read every parse; System prompt rebuilt every Claude call; setup_sheets called worksheets() 4x",
-     "All 19 issues (Step 3); Stage 3 trip features",
-     "TBD"],
-]

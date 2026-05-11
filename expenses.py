@@ -1094,7 +1094,15 @@ def get_expense_report(report_type="monthly"):
 # ── Detectors ──────────────────────────────────────────────────────────────────
 
 def is_log_prefix_input(text):
-    return text.lower().startswith("log ") and len(text) > 4
+    lower = text.lower()
+    if not lower.startswith("log ") or len(text) <= 4:
+        return False
+    # Exclude non-expense log intents
+    exclusions = ["log into crm", "log that", "log it", "log the message",
+                  "log bills", "log bill", "log this"]
+    if any(lower.startswith(e) for e in exclusions):
+        return False
+    return True
 
 def is_bare_merchant_input(text):
     if not re.search(r"\$[\d,.]+", text):
@@ -1124,6 +1132,6 @@ def is_expense_input(text):
     if any(lower.startswith(e) or lower == e for e in exclusions):
         return False
     triggers = ["spent", "paid", "$", "sgd", "charged", "bought", "grabbed",
-                "receipt", "bill was", "cost me", "picked up",
+                "receipt", "cost me", "picked up",
                 "recorded in", "will it be", "logged in", "how much have i"]
     return any(t in lower for t in triggers)

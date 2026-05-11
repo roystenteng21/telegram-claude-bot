@@ -1,0 +1,148 @@
+# Em Session Brief
+_Paste contents at the start of every dev session._
+
+**Last updated: 02/05/2026 — Session 25**
+
+---
+
+## Architecture
+- **State:** 20-module architecture. bot.py is the active monolith until S22 modularisation completes.
+- **Modules:** config · clients · state · sheets · helpers · crm · expenses · fx · reminders · cal · todos · meetings · bills · restaurants · stocks · trips · sessions · routing · infrastructure · bot.py
+- **Import order:** config → clients → state → sheets → helpers → feature modules → sessions → routing → infrastructure → bot.py. No reverse imports. Feature modules never import each other except meetings→crm (one-way). routing.py is the sole omnimporter.
+- **Repo:** roystenteng21/telegram-claude-bot
+- **Runtime:** Railway. Deploy via deploy.py.
+
+---
+
+## Coding Standards (locked)
+- **R1:** Route by cost — exact match → regex → keyword → cached lookup → live data → Claude. Never call Claude for routing decisions.
+- **R2:** Single pass, immediate exit. Once a handler matches, execution stops. No fallback re-runs detectors. Loops exit on first match.
+- **R3:** One sheet read per request, at the latest possible moment. Cached in memory, invalidated only on write. No sheet read during routing.
+- **R4:** Haiku for classification/extraction/JSON under 200 tokens. Sonnet for reasoning/conversation/multi-step only. Set min max_tokens.
+- **R5:** Typing indicator before every external API call. Parallel calls use asyncio.gather(). Nothing blocks the event loop.
+- **R6:** Session messages never reach main routing chain. Session data is flat dict with explicit fields. Sessions time out cleanly.
+- **R7:** Cache hierarchy: in-memory → cached sheet read → live sheet read → external API. Each layer reached only if above misses.
+- **R8:** Every branch sets reply or returns. Empty reply is a bug. Claude fallback for genuine unknown intent only.
+
+---
+
+## Architecture Notes
+- **Routing:** Primary elif chain runs once. No else block re-runs detectors. Session handlers exit before reaching main router.
+- **Caches:** _merchant_cache, _card_names_cache, _system_prompt_cache. Invalidate at write site only. Warm card cache on startup.
+- **Models:** Haiku: is_calendar_request, parse_expense_text_v2, classification. Sonnet: conversation fallback, reasoning, market narrative.
+- **Sheets:** setup_sheets() uses single worksheets() call. No repeated API reads in setup. Em Log and Dev Notes never read in routing.
+- **Module Layers:** Import order strictly enforced (no reverse imports ever): config → clients → state → sheets → helpers → feature modules → sessions → routing → infrastructure → bot.py. Feature modules never import each other except meetings→crm (one-way). routing.py is the only file that imports everything.
+- **Module Registry:** Module Registry tab in the Em Management Sheet is the live index of all modules. Columns: Module · File · Layer · Key Functions · Imports From · Last Changed · Session · Status. Updated automatically by deploy.py on every deploy.
+
+---
+
+## Rules
+- **Ship Rule:** Nothing ships until fully wired, tested, and deployed in the same session.
+- **Feasibility Rule:** Never suggest a solution without certainty it is feasible — applies to code, claims, and performance predictions alike.
+- **No Silent Changes:** Any change to module boundaries, import structure, coding standards, or deploy flow must be logged to Dev Notes immediately.
+- **Circular Import Zero Tolerance:** Never work around a circular import. Restructure instead.
+- **Em Log Rule:** Every session must produce a complete Em Log entry. Built/Fixed/Pending must be specific.
+- **Cross-Feature Rule:** Only permitted cross-feature import: meetings.py → crm.find_row (one-way). All other cross-feature calls go through routing.py dispatch. No feature module calls another feature module's handler functions.
+
+---
+
+## Handoff Protocol
+- **Session start:** Read this brief only — sole source of truth. Do NOT read the Em Management Sheet or Google Drive at session start.
+- **Em Management Sheet** (ID: 1uoLlnBrgogkWgVnirA4WtlZafwpprWk_epZy9NPLSQc) may be read mid-session only when explicitly needed. It is a read-only archive updated post-deploy for record keeping.
+- **What to upload:** Pre-modularisation: upload bot.py. Post-modularisation: upload only the module file(s) relevant to the session task. Use the Module Index below to identify the right file(s). If routing logic is touched, also upload routing.py.
+- **Mid-session context:** If a session ends mid-build (not deployed): log exactly what was completed, what is half-built, and what the next step is in the Em Log Pending field. Next session picks up from that exact point.
+- Explicit go-ahead required before building anything, no matter the size.
+- During planning: be thorough. During building: no narration, execute and deliver.
+- Session is not closed and no brief is generated until Roysten confirms the deploy succeeded.
+- Brief is delivered as a downloadable Em_Session_Brief.txt in chat. Replace previous file on download.
+
+---
+
+## Deploy Command Format
+```
+python3 ~/telegram-claude-bot/deploy.py "commit msg" "Session N" "built" "fixed" "pending"
+```
+
+---
+
+## Deploy Flow
+- **Pre-modularisation:** Download bot.py from Claude chat → save to ~/telegram-claude-bot/bot.py → run deploy command → Railway auto-deploys, Em Log + Module Registry auto-updated.
+- **Post-modularisation:** Download changed module file(s) from Claude chat → save to ~/telegram-claude-bot/ → run deploy command → deploy.py copies all 20 module files, commits, pushes → Railway auto-deploys, Em Log + Module Registry auto-updated.
+
+---
+
+## Modularisation
+- **Status:** S22 — in progress. 20 modules planned. Import layer hierarchy defined and locked. Module Registry tab created. See S22_modularisation_plan.md in repo for full dependency map.
+- **Files:** config.py · clients.py · state.py · sheets.py · helpers.py · crm.py · expenses.py · fx.py · reminders.py · cal.py · todos.py · meetings.py · bills.py · restaurants.py · stocks.py · trips.py · sessions.py · routing.py · infrastructure.py · bot.py
+
+---
+
+## Module Index
+| Module | File | Layer | Key Functions |
+|---|---|---|---|
+| config | config.py | 0 | All constants, env vars, TIMEZONE, EXPENSE_CATEGORIES |
+| clients | clients.py | 1 | gc, spreadsheet, drive_service, Anthropic client |
+| state | state.py | 1 | overseas_state, expense_sessions, receipt_confirm_sessions, em_profile, all session dicts, all caches |
+| sheets | sheets.py | 2 | get_sheet, all sheet accessors, setup_sheets, em log ops |
+| helpers | helpers.py | 3 | format_date, calculate_age, format_contact, send_safe, looks_like_new_intent, parse_date_flexible |
+| crm | crm.py | 4 | find_row, save_contact, find_contact, add_note, upcoming_birthdays, detect_crm_natural_update |
+| expenses | expenses.py | 4 | log_expense, parse_expense_text_v2, handle_expense_text, is_expense_input, get_merchant_memory, cards |
+| fx | fx.py | 4 | get_fx_rate, refresh_fx_rates, parse_manual_fx_input, persist_fx_rates_to_sheet |
+| reminders | reminders.py | 4 | add_reminder, check_and_fire_reminders, is_reminder_request, handle_new_reminder |
+| calendar | cal.py | 4 | get_calendar, smart_add_event, is_calendar_request, get_events |
+| todos | todos.py | 4 | add_todo, complete_todo, delete_todo, list_todos |
+| meetings | meetings.py | 4 | handle_meeting_session, process_meeting_notes, save_meeting_recap, is_meeting_start |
+| bills | bills.py | 4 | add_bill, list_bills, send_bill_reminders, is_bill_request |
+| restaurants | restaurants.py | 4 | save_restaurant, search_restaurants, get_restaurant_review, is_restaurant_suggestion_request |
+| stocks | stocks.py | 4 | handle_stock_request, is_stock_request, check_price_alerts, get_market_summary_now, fetch_stock_summary |
+| trips | trips.py | 4 | save_trip, handle_overseas_request, is_overseas_mode_request, restore_overseas_from_trips |
+| sessions | sessions.py | 5 | touch_session, check_session_timeouts, get_active_session_label, persist_sessions_to_sheet |
+| routing | routing.py | 6 | handle_message, _handle_message_inner, build_system_prompt |
+| infrastructure | infrastructure.py | 7 | run_infrastructure_setup, setup_drive, setup_em_profile, send_startup_message |
+| bot | bot.py | 0–8 (monolith) | All functions (pre-modularisation active file) |
+
+---
+
+## Last Session (S25 — 02/05/2026)
+- **Built:** `log bug` command with priority inference (routing.py + sheets.py); expense summary natural phrasing fix (routing.py); `clear_done_backlog` threshold 3→2 (sheets.py); Handoff Rule updated to brief-as-file workflow (config.py); removed INITIAL_BACKLOG + INITIAL_SESSION dead code (config.py + sheets.py)
+- **Fixed:** Session immediately expiring before user could reply — `touch_session` now called on `receipt_confirm_sessions` creation (expenses.py); stale comment in sheets.py
+- **Pending:** None
+- **Commit:** S25 deployed ✅
+
+---
+
+## Open Backlog
+- **Fix todos module** — `pull up todo list` misroutes to stocks handler (returns "No holdings logged yet"); Em falls back to Claude conversation instead of reading Todos sheet; todo list must function as a living list (add, complete, pull up) not a registry. Upload: todos.py + routing.py.
+
+- added by Roysten cant log any bills, bills function not working
+Bills $170, Amex, due 18th May
+
+
+🪞 Bills
+$170.00 | Personal | Amex
+
+Log this? (yes / edit / skip)
+
+
+Yes
+
+
+🪞 Bills
+$170.00 | Personal | Amex
+
+Logged ✅
+
+
+Log bills
+
+
+Wasn't sure what to do with that — did you mean to log an expense, or were you asking something else?
+
+
+---
+
+## Expense Categories
+FnB · Transport · Entertainment · Personal · Family · Work · Shopping · Household · Travel
+
+## Cards
+Maybank (4002, default FnB) · Citi (1176, default General) · UOB (5372) · Amex (1008)

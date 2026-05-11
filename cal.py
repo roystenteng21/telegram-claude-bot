@@ -103,6 +103,15 @@ def delete_calendar_event(title):
 
 def is_calendar_request(text):
     lower = text.lower().strip()
+    # Natural calendar query triggers (read, not create)
+    QUERY_TRIGGERS = [
+        "what's on", "whats on", "what is on", "do i have anything",
+        "any events", "what have i got", "what do i have",
+        "calendar today", "calendar tomorrow", "calendar this week",
+        "show my calendar", "what's happening", "whats happening",
+    ]
+    if any(t in lower for t in QUERY_TRIGGERS):
+        return True
     CALENDAR_TRIGGERS = [
         "schedule ", "add event", "create event", "new event",
         "book ", "set up a meeting", "set up meeting",
