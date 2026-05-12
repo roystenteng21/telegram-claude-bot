@@ -186,6 +186,9 @@ def expire_stale_trip_setup():
             print("Cleared stale _trip_setup on boot")
     except Exception as e:
         print(f"expire_stale_trip_setup error: {e}")
+
+
+class _AutoPersistDict(dict):
     """Dict subclass that auto-persists to Settings sheet on write/delete."""
     _timer = None
 

@@ -1,8 +1,8 @@
 {
   "date": "2026-05-12",
   "session": "Session 27",
-  "built": "single-parse trip setup with immediate activate, trip setup cancel+silent-terminate, routing guards (bill/overseas/crm), todo complete MarkdownV2 struck+list, stale _trip_setup expiry on boot",
-  "fixed": "stale _trip_setup misrouting messages, no cancel escape in trip setup, now-in block colliding with bills, extract_flight_number false-match, crm natural update intercepting bills/overseas, multi-step trip wizard",
-  "pending": "receipt_confirm_sessions age check (debug, uncomment to enable)",
-  "deploy_count": 7
+  "built": "restored _AutoPersistDict class definition lost in previous edit",
+  "fixed": "NameError on boot: _AutoPersistDict not defined",
+  "pending": "none",
+  "deploy_count": 8
 }
