@@ -136,9 +136,35 @@ def load_trip_setup_from_sheet():
                     ts = json.loads(raw)
                     state.overseas_state["_trip_setup"] = ts
                     print(f"Restored _trip_setup from sheet: step={ts.get('step')}")
+                    # Immediately expire if stale
+                    _expire_stale_trip_setup_inline()
                 return
     except Exception as e:
         print(f"load_trip_setup_from_sheet error: {e}")
+
+
+def _expire_stale_trip_setup_inline():
+    """Clear _trip_setup if stale (>6h old or no timestamp) and overseas not active."""
+    from datetime import datetime as _dt
+    ts = state.overseas_state.get("_trip_setup")
+    if not ts or state.overseas_state.get("active"):
+        return
+    started = ts.get("started_at", "")
+    stale = True
+    if started:
+        try:
+            from config import TIMEZONE
+            age_hours = (_dt.now(TIMEZONE) - _dt.fromisoformat(started)).total_seconds() / 3600
+            stale = age_hours > 6
+        except Exception:
+            stale = True
+    if stale:
+        state.overseas_state.pop("_trip_setup", None)
+        try:
+            persist_trip_setup()
+        except Exception as e:
+            print(f"_expire_stale_trip_setup_inline persist error: {e}")
+        print("Cleared stale _trip_setup on boot")
 
 def extract_flight_number(text):
     matches = re.findall(r'\b([A-Z]{1,3}\d{2,4}[A-Z]?)\b', text.upper())
@@ -274,41 +300,133 @@ async def deactivate_and_notify(app):
     except Exception as e:
         print(f"Failed to send return notification: {e}")
 
-def handle_overseas_request(text):
+def handle_overseas_request(text, _partial=None):
+    import json as _json
+    from datetime import datetime as _dt
     lower = text.lower()
+
+    # Return home
     if any(p in lower for p in ["back home", "returned", "i'm back", "landed back", "home now",
                                   "coming back", "heading back", "on my way back"]):
         import random
         greeting = random.choice(["Welcome back!", "Good to have you back!", "Hope the trip was great!"])
         deactivate_overseas_mode()
         return f"{greeting} Switching back to SGD. 🏠"
-    flight_num = extract_flight_number(text)
-    # Extract destination from "i'm in [country]" pattern
-    im_in_match = re.search(r"i'?m in ([A-Za-z][A-Za-z\s]{2,20}?)(?:\s+now|\s+currently|[,.]|$)", text, re.IGNORECASE)
-    dest_hint = None
-    if im_in_match:
-        dest_hint = im_in_match.group(1).strip().title()
-    else:
-        dest_match = re.search(r'(?:to|in|flying to|going to|headed to|heading to|trip to)\s+([A-Za-z][A-Za-z\s]{2,25}?)(?:\s+on|\s+\d|$|[,.])', text, re.IGNORECASE)
-        dest_hint = dest_match.group(1).strip().title() if dest_match else None
-    state.overseas_state["_trip_setup"] = {
-        "step": "destination",
-        "flight_number": flight_num or "",
-        "destination": dest_hint or "",
-        "check_in": "",
-        "check_out": "",
-        "currency": "",
-        "hotel_name": "",
-        "hotel_local_name": "",
-        "hotel_address": "",
-        "notes": "",
-    }
-    if dest_hint:
-        state.overseas_state["_trip_setup"]["step"] = "check_in"
+
+    # One follow-up path — partial data was stored, user is supplying missing fields
+    if _partial:
+        ts = _partial
+        combined = f"{ts.get('_original_text', '')} {text}"
+        dest = ts.get("destination", "")
+        dates = _parse_trip_dates(text) if not ts.get("check_in") else []
+        if not dest:
+            dest_match = re.search(r'(?:to|in|flying to|going to|headed to|heading to|trip to)\s+([A-Za-z][A-Za-z\s]{2,25}?)(?:\s+on|\s+\d|$|[,.])', text, re.IGNORECASE)
+            im_in = re.search(r"i'?m in ([A-Za-z][A-Za-z\s]{2,20}?)(?:\s+now|\s+currently|[,.]|$)", text, re.IGNORECASE)
+            if dest_match:
+                dest = dest_match.group(1).strip().title()
+            elif im_in:
+                dest = im_in.group(1).strip().title()
+            else:
+                dest = text.strip().title()
+        if not dest:
+            state.overseas_state.pop("_trip_setup", None)
+            persist_trip_setup()
+            return "Couldn't work out the destination — trip setup cancelled."
+        check_in = ts.get("check_in", "")
+        check_out = ts.get("check_out", "")
+        if dates and not check_in:
+            check_in = dates[0].strftime("%d/%m/%Y")
+        if len(dates) > 1 and not check_out:
+            check_out = dates[1].strftime("%d/%m/%Y")
+        if not check_in:
+            state.overseas_state.pop("_trip_setup", None)
+            persist_trip_setup()
+            return "Couldn't work out the dates — trip setup cancelled."
+        curr = _get_currency_for_dest(dest)
+        flight_num = ts.get("flight_number", "") or extract_flight_number(text.upper()) or ""
+        state.overseas_state.pop("_trip_setup", None)
         persist_trip_setup()
-        return f"Got it — {dest_hint} 🌏\nCheck-in date? (or 'skip')"
-    persist_trip_setup()
-    return "Where are you headed?"
+        return _activate_overseas(dest, curr, check_in, check_out, flight_num)
+
+    # Single-parse path
+    today = date.today()
+    prompt = (
+        f"Today is {today.strftime('%d %b %Y')}. Extract trip details from: '{text}'\n"
+        "Return ONLY JSON with:\n"
+        "- destination: string (city or country name, title case, or empty)\n"
+        "- check_in: string (DD/MM/YYYY or empty)\n"
+        "- check_out: string (DD/MM/YYYY or empty)\n"
+        "- flight_number: string (IATA code or empty)\n"
+        "Return ONLY the JSON."
+    )
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        parsed = _json.loads(raw)
+    except Exception as e:
+        print(f"handle_overseas_request parse error: {e}")
+        parsed = {}
+
+    dest = parsed.get("destination", "").strip()
+    check_in = parsed.get("check_in", "").strip()
+    check_out = parsed.get("check_out", "").strip()
+    flight_num = parsed.get("flight_number", "").strip()
+
+    # Also try regex for flight if Haiku missed it
+    if not flight_num:
+        flight_num = extract_flight_number(text.upper()) or ""
+
+    # Check critical fields
+    missing = []
+    if not dest:
+        missing.append("destination")
+    if not check_in:
+        missing.append("dates")
+
+    if missing:
+        missing_str = " and ".join(missing)
+        ask = f"Where to, and what dates?" if len(missing) == 2 else (
+            "Where to?" if "destination" in missing else "What dates?"
+        )
+        state.overseas_state["_trip_setup"] = {
+            "step": "awaiting_missing",
+            "destination": dest,
+            "check_in": check_in,
+            "check_out": check_out,
+            "flight_number": flight_num,
+            "started_at": _dt.now(TIMEZONE).isoformat(),
+            "_original_text": text,
+        }
+        persist_trip_setup()
+        return ask
+
+    curr = _get_currency_for_dest(dest)
+    return _activate_overseas(dest, curr, check_in, check_out, flight_num)
+
+
+def _activate_overseas(dest, curr, check_in, check_out, flight_num=""):
+    """Activate overseas mode immediately and return confirmation message."""
+    state.overseas_state["active"] = True
+    state.overseas_state["destination"] = dest
+    state.overseas_state["currency"] = curr
+    state.overseas_state["currencies"] = [curr] if curr != "SGD" else []
+    state.overseas_state["trip_destinations"] = [dest]
+    state.overseas_state["trip_start"] = date.today().strftime("%d/%m/%Y")
+    save_trip(dest, curr, check_in=check_in, check_out=check_out)
+    lines = [f"✈️ Overseas mode on\nDestination: {dest} ({curr})"]
+    if check_in:
+        line = f"Check-in: {check_in}"
+        if check_out:
+            line += f" → {check_out}"
+        lines.append(line)
+    if flight_num:
+        lines.append(f"Flight: {flight_num}")
+    lines.append(f"Expenses will be logged in {curr} with SGD equivalent.")
+    return "\n".join(lines)
 
 async def _send_trip_confirm(update, ts):
     dest = ts.get("destination", "—")

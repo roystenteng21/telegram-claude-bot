@@ -1,12 +1,12 @@
 # Em Session Brief
 _Paste contents at the start of every dev session._
 
-**Last updated: 02/05/2026 — Session 25**
+**Last updated: 11/05/2026 — Session 27**
 
 ---
 
 ## Architecture
-- **State:** 20-module architecture. bot.py is the active monolith until S22 modularisation completes.
+- **State:** 20-module architecture. Modularisation complete (S22).
 - **Modules:** config · clients · state · sheets · helpers · crm · expenses · fx · reminders · cal · todos · meetings · bills · restaurants · stocks · trips · sessions · routing · infrastructure · bot.py
 - **Import order:** config → clients → state → sheets → helpers → feature modules → sessions → routing → infrastructure → bot.py. No reverse imports. Feature modules never import each other except meetings→crm (one-way). routing.py is the sole omnimporter.
 - **Repo:** roystenteng21/telegram-claude-bot
@@ -29,10 +29,16 @@ _Paste contents at the start of every dev session._
 ## Architecture Notes
 - **Routing:** Primary elif chain runs once. No else block re-runs detectors. Session handlers exit before reaching main router.
 - **Caches:** _merchant_cache, _card_names_cache, _system_prompt_cache. Invalidate at write site only. Warm card cache on startup.
-- **Models:** Haiku: is_calendar_request, parse_expense_text_v2, classification. Sonnet: conversation fallback, reasoning, market narrative.
+- **Models:** Haiku: is_calendar_request, parse_expense_text_v2, classification, parse_bill_request, parse_overseas_request. Sonnet: conversation fallback, reasoning, market narrative.
 - **Sheets:** setup_sheets() uses single worksheets() call. No repeated API reads in setup. Em Log and Dev Notes never read in routing.
 - **Module Layers:** Import order strictly enforced (no reverse imports ever): config → clients → state → sheets → helpers → feature modules → sessions → routing → infrastructure → bot.py. Feature modules never import each other except meetings→crm (one-way). routing.py is the only file that imports everything.
 - **Module Registry:** Module Registry tab in the Em Management Sheet is the live index of all modules. Columns: Module · File · Layer · Key Functions · Imports From · Last Changed · Session · Status. Updated automatically by deploy.py on every deploy.
+- **Bills:** As of S26, bills store a full due date (DD/MM/YYYY), not a day-of-month integer. send_bill_reminders compares against specific dates. check_missed_items_on_startup parses full date strings.
+- **Birthday pending:** As of S26, birthday_pending is never wiped by the 2pm followup job. Only cleared on explicit sent/skip reply or at midnight by auto_clear_birthday_pending. Skip and midnight clear both write "not sent" to CRM.
+- **Birthday style reference:** Pasted birthday messages stored to Settings sheet under key `birthday_message_style`. generate_birthday_greeting reads this at call time for style matching.
+- **Trip setup:** As of S27, trip setup is single-message parse via Haiku — no multi-step wizard. Destination and dates are critical fields; currency is auto-derived from destination. Overseas mode activates immediately on parse. If critical fields are missing, Em asks once (all missing fields in one message). `_trip_setup` is only used for the one follow-up state (`step: awaiting_missing`). `_trip_setup` is expired on boot if older than 6 hours or missing `started_at` timestamp (via `_expire_stale_trip_setup_inline` called from `load_trip_setup_from_sheet`). `looks_like_new_intent` silently clears `_trip_setup` mid-session. Cancel/nevermind/stop/abort exits trip setup at any point.
+- **Todos:** As of S27, completing a todo replies with struck task (MarkdownV2 ~strikethrough~) + remaining pending list in one message. Struck task does not persist after that message.
+- **Session expiry:** receipt_confirm_sessions age check on restore is implemented but commented out (debug flag) — enable once confirmed stable.
 
 ---
 
@@ -72,7 +78,7 @@ python3 ~/telegram-claude-bot/deploy.py "commit msg" "Session N" "built" "fixed"
 ---
 
 ## Modularisation
-- **Status:** S22 — in progress. 20 modules planned. Import layer hierarchy defined and locked. Module Registry tab created. See S22_modularisation_plan.md in repo for full dependency map.
+- **Status:** S22 — COMPLETE. 20 modules deployed.
 - **Files:** config.py · clients.py · state.py · sheets.py · helpers.py · crm.py · expenses.py · fx.py · reminders.py · cal.py · todos.py · meetings.py · bills.py · restaurants.py · stocks.py · trips.py · sessions.py · routing.py · infrastructure.py · bot.py
 
 ---
@@ -85,59 +91,66 @@ python3 ~/telegram-claude-bot/deploy.py "commit msg" "Session N" "built" "fixed"
 | state | state.py | 1 | overseas_state, expense_sessions, receipt_confirm_sessions, em_profile, all session dicts, all caches |
 | sheets | sheets.py | 2 | get_sheet, all sheet accessors, setup_sheets, em log ops |
 | helpers | helpers.py | 3 | format_date, calculate_age, format_contact, send_safe, looks_like_new_intent, parse_date_flexible |
-| crm | crm.py | 4 | find_row, save_contact, find_contact, add_note, upcoming_birthdays, detect_crm_natural_update |
+| crm | crm.py | 4 | find_row, save_contact, find_contact, add_note, upcoming_birthdays, detect_crm_natural_update, mark_birthday_greeted, mark_birthday_not_sent, auto_clear_birthday_pending |
 | expenses | expenses.py | 4 | log_expense, parse_expense_text_v2, handle_expense_text, is_expense_input, get_merchant_memory, cards |
 | fx | fx.py | 4 | get_fx_rate, refresh_fx_rates, parse_manual_fx_input, persist_fx_rates_to_sheet |
 | reminders | reminders.py | 4 | add_reminder, check_and_fire_reminders, is_reminder_request, handle_new_reminder |
 | calendar | cal.py | 4 | get_calendar, smart_add_event, is_calendar_request, get_events |
 | todos | todos.py | 4 | add_todo, complete_todo, delete_todo, list_todos |
 | meetings | meetings.py | 4 | handle_meeting_session, process_meeting_notes, save_meeting_recap, is_meeting_start |
-| bills | bills.py | 4 | add_bill, list_bills, send_bill_reminders, is_bill_request |
+| bills | bills.py | 4 | add_bill, list_bills, send_bill_reminders, is_bill_request, handle_new_bill |
 | restaurants | restaurants.py | 4 | save_restaurant, search_restaurants, get_restaurant_review, is_restaurant_suggestion_request |
 | stocks | stocks.py | 4 | handle_stock_request, is_stock_request, check_price_alerts, get_market_summary_now, fetch_stock_summary |
-| trips | trips.py | 4 | save_trip, handle_overseas_request, is_overseas_mode_request, restore_overseas_from_trips |
-| sessions | sessions.py | 5 | touch_session, check_session_timeouts, get_active_session_label, persist_sessions_to_sheet |
+| trips | trips.py | 4 | save_trip, handle_overseas_request, _activate_overseas, is_overseas_mode_request, restore_overseas_from_trips, _expire_stale_trip_setup_inline |
+| sessions | sessions.py | 5 | touch_session, check_session_timeouts, get_active_session_label, persist_sessions_to_sheet, expire_stale_trip_setup |
 | routing | routing.py | 6 | handle_message, _handle_message_inner, build_system_prompt |
 | infrastructure | infrastructure.py | 7 | run_infrastructure_setup, setup_drive, setup_em_profile, send_startup_message |
-| bot | bot.py | 0–8 (monolith) | All functions (pre-modularisation active file) |
+| bot | bot.py | 8 | post_init, scheduler setup, main |
 
 ---
 
-## Last Session (S25 — 02/05/2026)
-- **Built:** `log bug` command with priority inference (routing.py + sheets.py); expense summary natural phrasing fix (routing.py); `clear_done_backlog` threshold 3→2 (sheets.py); Handoff Rule updated to brief-as-file workflow (config.py); removed INITIAL_BACKLOG + INITIAL_SESSION dead code (config.py + sheets.py)
-- **Fixed:** Session immediately expiring before user could reply — `touch_session` now called on `receipt_confirm_sessions` creation (expenses.py); stale comment in sheets.py
-- **Pending:** None
-- **Commit:** S25 deployed ✅
+## Last Session (S27 — 11/05/2026)
+- **Built:**
+  - routing.py: trip setup session block replaced — cancel/stop/abort escape at any step; looks_like_new_intent silently clears _trip_setup and falls through to main routing; awaiting_missing step handles one follow-up; removed multi-step wizard entirely
+  - routing.py: not is_bill_request(text) guard added to "now in"/"i'm in" routing block
+  - routing.py: extract_flight_number removed from overseas elif condition (was redundant and collision-prone)
+  - routing.py: detect_crm_natural_update guarded with not is_bill_request and not is_overseas_mode_request
+  - routing.py: complete_todo replies sent with MarkdownV2 parse mode; disambig complete path uses complete_todo helper
+  - routing.py: _send_trip_confirm removed from trips import (no longer used)
+  - trips.py: handle_overseas_request rewritten — single Haiku parse, immediate activate via _activate_overseas; one follow-up if destination or dates missing; started_at timestamp on _trip_setup
+  - trips.py: _activate_overseas() new helper — activates state, saves trip, returns confirmation string
+  - trips.py: load_trip_setup_from_sheet calls _expire_stale_trip_setup_inline after restore
+  - trips.py: _expire_stale_trip_setup_inline() — clears _trip_setup if >6h old or no timestamp and overseas not active
+  - sessions.py: expire_stale_trip_setup() utility added (callable standalone)
+  - sessions.py: receipt_confirm_sessions age check on restore implemented and commented out (debug flag)
+  - todos.py: complete_todo returns MarkdownV2 struck task + remaining pending list in one message
+- **Fixed:** stale _trip_setup persisting across restarts causing misroutes; no cancel escape in trip setup; "now in"/"i'm in" colliding with bill inputs; extract_flight_number false-matching non-trip text; detect_crm_natural_update intercepting bill/overseas intents; multi-step trip wizard (replaced with single-parse); todo complete gave no visual feedback
+- **Pending:** Run S27 test checklist after deploy; receipt_confirm_sessions age check — enable in prod once stable (uncomment in sessions.py load_sessions_from_sheet)
+
+---
+
+## S27 Test Checklist
+**Trip setup**
+- [ ] "flying to KL 15 May to 18 May SQ123" → activates immediately, shows summary
+- [ ] "flying tomorrow" → asks "Where to, and what dates?" → reply with details → activates
+- [ ] "flying to KL" → asks "What dates?" → reply → activates
+- [ ] Mid-setup send "new bill Citi $500 due 20 May" → trips silently dropped, bill logged
+- [ ] "cancel" during awaiting_missing → "Trip setup cancelled."
+- [ ] Restart bot with stale _trip_setup in sheet → cleared silently on boot
+
+**Routing guards**
+- [ ] "new bill" → bills handler (not overseas)
+- [ ] "I'm in debt $500" → does not trigger overseas
+- [ ] Bill input does not hit detect_crm_natural_update
+
+**Todos**
+- [ ] "done [task]" → struck task + remaining list in one message
+- [ ] Complete via disambig → same struck + list format
 
 ---
 
 ## Open Backlog
-- **Fix todos module** — `pull up todo list` misroutes to stocks handler (returns "No holdings logged yet"); Em falls back to Claude conversation instead of reading Todos sheet; todo list must function as a living list (add, complete, pull up) not a registry. Upload: todos.py + routing.py.
-
-- added by Roysten cant log any bills, bills function not working
-Bills $170, Amex, due 18th May
-
-
-🪞 Bills
-$170.00 | Personal | Amex
-
-Log this? (yes / edit / skip)
-
-
-Yes
-
-
-🪞 Bills
-$170.00 | Personal | Amex
-
-Logged ✅
-
-
-Log bills
-
-
-Wasn't sure what to do with that — did you mean to log an expense, or were you asking something else?
-
+- receipt_confirm_sessions age check — enable in prod once stable (uncomment in sessions.py)
 
 ---
 

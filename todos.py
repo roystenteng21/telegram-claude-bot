@@ -23,8 +23,25 @@ def complete_todo(task):
         if len(matches) > 1:
             return "_DISAMBIG_TODO_COMPLETE_:" + "|".join(r.get("Task", "") for _, r in matches)
         row_idx, r = matches[0]
+        done_task = r.get("Task", "")
         sheet.update_cell(row_idx, 2, "Done")
-        return f"✅ Marked as done: _{r.get('Task')}_"
+        # Reload records to get updated list
+        updated_records = sheet.get_all_records()
+        pending = [rec for rec in updated_records if rec.get("Status") == "Pending"]
+        def _escape(s):
+            for ch in r"\_*[]()~`>#+=|{}.!-":
+                s = s.replace(ch, f"\\{ch}")
+            return s
+        struck = f"~{_escape(done_task)}~"
+        if not pending:
+            return f"✅ {struck}\n\nNo more pending tasks\\!"
+        lines = [f"✅ {struck}\n"]
+        lines.append(f"📝 *{len(pending)} pending task\\(s\\):*\n")
+        for rec in pending:
+            t = _escape(rec.get("Task", ""))
+            d = _escape(format_date(rec.get("Added", "")))
+            lines.append(f"• {t} _\\(added {d}\\)_")
+        return "\n".join(lines)
     except Exception as e:
         return f"❌ Error completing task: {str(e)}"
 

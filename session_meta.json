@@ -1,8 +1,8 @@
 {
-  "date": "2026-05-11",
-  "session": "Session 26",
-  "built": "Bills full date storage + smart reminders; birthday pending survives 2pm followup + midnight auto-clear + style reference + broadened sent detection; overseas i'm in [country] now + coming back patterns; confirm flows accept yep/yeah/sure/nope/nah; pull up routes to correct handler; show me my [x] handlers; natural calendar queries; todos broader triggers; is_log_prefix excludes CRM/bills; is_expense_input removes bill was trigger; reminders alert me if trigger; sessions birthday in interrupt guard; trips setup confirm accepts yes/confirm",
-  "fixed": "Bills misrouting; birthday pending wiped at 2pm; sent not recognised; pasted message misidentified as CRM log; overseas status check too narrow; check_missed_items_on_startup bills int parse",
-  "pending": "None",
-  "deploy_count": 6
+  "date": "2026-05-12",
+  "session": "Session 27",
+  "built": "single-parse trip setup with immediate activate, trip setup cancel+silent-terminate, routing guards (bill/overseas/crm), todo complete MarkdownV2 struck+list, stale _trip_setup expiry on boot",
+  "fixed": "stale _trip_setup misrouting messages, no cancel escape in trip setup, now-in block colliding with bills, extract_flight_number false-match, crm natural update intercepting bills/overseas, multi-step trip wizard",
+  "pending": "receipt_confirm_sessions age check (debug, uncomment to enable)",
+  "deploy_count": 7
 }

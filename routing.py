@@ -75,7 +75,7 @@ from trips import (
     format_trip_history, extract_flight_number, _parse_trip_dates,
     _get_currency_for_dest, is_overseas_mode_request, deactivate_overseas_mode,
     activate_overseas_mode_scheduled, deactivate_and_notify, handle_overseas_request,
-    _send_trip_confirm, persist_trip_setup, load_trip_setup_from_sheet
+    persist_trip_setup, load_trip_setup_from_sheet
 )
 from sessions import (
     touch_session, is_session_expired, check_session_timeouts,
@@ -526,13 +526,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 del state.todo_disambig_sessions[user_id]
                 from sheets import todo_sheet
                 if action == "complete":
-                    sheet = todo_sheet()
-                    records = sheet.get_all_records()
-                    for i, r in enumerate(records):
-                        if r.get("Task", "") == task_name and r.get("Status") == "Pending":
-                            sheet.update_cell(i + 2, 2, "Done")
-                            await update.message.reply_text(f"✅ Marked as done: _{task_name}_")
-                            return
+                    result = complete_todo(task_name)
+                    await send_safe(update.message, result, parse_mode="MarkdownV2")
+                    return
                 elif action == "delete":
                     sheet = todo_sheet()
                     records = sheet.get_all_records()
@@ -739,184 +735,29 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 await update.message.reply_text("All unmatched items reviewed ✅")
         return
 
-    # ── Trip setup session ────────────────────────────────────────────────────
+    # ── Trip setup session (awaiting missing fields only) ─────────────────────
     if state.overseas_state.get("_trip_setup"):
         ts = state.overseas_state["_trip_setup"]
-        step = ts.get("step", "destination")
         t = text.strip()
-        skipped = t.lower() in ("skip", "s", "-", "later", "idk", "not sure")
-        state.overseas_state["_trip_setup"] = ts
-        persist_trip_setup()
-        if step == "destination":
-            if not t:
-                await update.message.reply_text("Where are you headed?")
-                return
-            ts["destination"] = t.title()
-            ts["step"] = "check_in"
-            await update.message.reply_text(f"Got it — {ts['destination']} 🌏\nCheck-in date? (or 'skip')")
+
+        # Cancel escape
+        if t.lower() in ("cancel", "nevermind", "nvm", "stop", "abort"):
+            state.overseas_state.pop("_trip_setup", None)
+            persist_trip_setup()
+            await update.message.reply_text("Trip setup cancelled.")
             return
-        elif step == "check_in":
-            if not skipped:
-                dates = _parse_trip_dates(t)
-                ts["check_in"] = dates[0].strftime("%d/%m/%Y") if dates else t
-            ts["step"] = "check_out"
-            await update.message.reply_text("Check-out date? (or 'skip')")
-            return
-        elif step == "check_out":
-            if not skipped:
-                dates = _parse_trip_dates(t)
-                ts["check_out"] = dates[0].strftime("%d/%m/%Y") if dates else t
-            ts["step"] = "flight"
-            await update.message.reply_text("Flight number? (or 'skip')")
-            return
-        elif step == "flight":
-            if not skipped:
-                fn = extract_flight_number(t.upper())
-                ts["flight_number"] = fn or t.upper()
-                ts["step"] = "dep_time"
-                if AVIATIONSTACK_API_KEY and fn:
-                    try:
-                        import httpx
-                        async with httpx.AsyncClient(timeout=10) as hx:
-                            resp = await hx.get(
-                                "http://api.aviationstack.com/v1/flights",
-                                params={"access_key": AVIATIONSTACK_API_KEY, "flight_iata": fn}
-                            )
-                        data = resp.json()
-                        flights = data.get("data", [])
-                        if flights:
-                            dep = flights[0].get("departure", {})
-                            scheduled = dep.get("scheduled", "")
-                            if scheduled:
-                                try:
-                                    from datetime import datetime as _dt
-                                    dt = _dt.fromisoformat(scheduled.replace("Z", "+00:00"))
-                                    ts["dep_time_iso"] = scheduled
-                                    ts["dep_time_display"] = dt.astimezone(TIMEZONE).strftime("%d %b %H:%M")
-                                    ts["step"] = "currency"
-                                    await update.message.reply_text(
-                                        f"Found {fn} — departs {ts['dep_time_display']} ✅\nCurrency? (or 'skip' for SGD)"
-                                    )
-                                    return
-                                except Exception:
-                                    pass
-                    except Exception as e:
-                        print(f"AviationStack lookup error: {e}")
-                await update.message.reply_text(f"What time does {ts['flight_number']} depart? (e.g. 09:20, or 'skip')")
-            else:
-                ts["step"] = "currency"
-                await update.message.reply_text("Currency? (or 'skip' for SGD)")
-            return
-        elif step == "dep_time":
-            if not skipped:
-                time_match = re.search(r'\b(\d{1,2}:\d{2})\b', t)
-                if time_match:
-                    time_str = time_match.group(1)
-                    ci = ts.get("check_in", "")
-                    dep_dt = None
-                    if ci:
-                        try:
-                            dep_dt = TIMEZONE.localize(datetime.strptime(f"{ci} {time_str}", "%d/%m/%Y %H:%M"))
-                        except Exception:
-                            pass
-                    ts["dep_time_iso"] = dep_dt.isoformat() if dep_dt else time_str
-                    ts["dep_time_display"] = dep_dt.strftime("%d %b %H:%M") if dep_dt else time_str
-                else:
-                    ts["dep_time_display"] = t
-            ts["step"] = "currency"
-            await update.message.reply_text("Currency? (or 'skip' for SGD)")
-            return
-        elif step == "currency":
-            if not skipped:
-                cur_match = re.search(r'\b([A-Z]{3})\b', t.upper())
-                ts["currency"] = cur_match.group(1) if cur_match else _get_currency_for_dest(ts.get("destination", ""))
-            else:
-                ts["currency"] = _get_currency_for_dest(ts.get("destination", "")) or "SGD"
-            ts["step"] = "hotel"
-            await update.message.reply_text("Hotel name? (or 'skip')")
-            return
-        elif step == "hotel":
-            if not skipped:
-                ts["hotel_name"] = t
-                ts["step"] = "hotel_local"
-                await update.message.reply_text("Hotel local name? (or 'skip')")
-            else:
-                ts["step"] = "confirm"
-                await _send_trip_confirm(update, dict(ts))
-            return
-        elif step == "hotel_local":
-            if not skipped:
-                ts["hotel_local_name"] = t
-                ts["step"] = "hotel_address"
-                await update.message.reply_text("Hotel address? (or 'skip')")
-            else:
-                ts["step"] = "confirm"
-                await _send_trip_confirm(update, dict(ts))
-            return
-        elif step == "hotel_address":
-            if not skipped:
-                ts["hotel_address"] = t
-            ts["step"] = "confirm"
-            await _send_trip_confirm(update, dict(ts))
-            return
-        elif step == "confirm":
-            if t.upper() in ["Y", "YES", "CONFIRM", "YEP", "YEAH", "YUP", "SURE", "OK", "OKAY", "LOOKS GOOD"]:
-                state.overseas_state.pop("_trip_setup", None)
-                persist_trip_setup()
-                dest = ts.get("destination", "Unknown")
-                curr = ts.get("currency", "SGD")
-                check_in = ts.get("check_in", "")
-                check_out = ts.get("check_out", "")
-                dep_iso = ts.get("dep_time_iso", "")
-                scheduled = False
-                if dep_iso and state._scheduler:
-                    try:
-                        dep_dt = datetime.fromisoformat(dep_iso.replace("Z", "+00:00"))
-                        dep_local = dep_dt.astimezone(TIMEZONE)
-                        if dep_local > datetime.now(TIMEZONE):
-                            job = state._scheduler.add_job(
-                                activate_overseas_mode_scheduled,
-                                "date",
-                                run_date=dep_local,
-                                args=[dest, curr, check_in, check_out]
-                            )
-                            state.overseas_state["dep_job_id"] = job.id
-                            state.overseas_state["destination"] = dest
-                            state.overseas_state["currency"] = curr
-                            scheduled = True
-                    except Exception as e:
-                        print(f"Trip schedule error: {e}")
-                if not scheduled:
-                    for d in [state.expense_sessions, state.receipt_confirm_sessions]:
-                        d.pop(user_id, None)
-                    state.session_timestamps.pop(user_id, None)
-                    state.overseas_state["active"] = True
-                    state.overseas_state["destination"] = dest
-                    state.overseas_state["currency"] = curr
-                    state.overseas_state["currencies"] = [curr] if curr != "SGD" else []
-                    state.overseas_state["trip_destinations"] = [dest]
-                    state.overseas_state["trip_start"] = date.today().strftime("%d/%m/%Y")
-                    save_trip(dest, curr, check_in=check_in, check_out=check_out,
-                              hotel_name=ts.get("hotel_name", ""),
-                              hotel_local_name=ts.get("hotel_local_name", ""),
-                              hotel_address=ts.get("hotel_address", ""))
-                    dep_display = ts.get("dep_time_display", "")
-                    if dep_display:
-                        reply = f"Overseas mode on ✈️\nDestination: {dest}\nCurrency: {curr}\nFlight: {ts.get('flight_number','')} {dep_display}"
-                    else:
-                        reply = f"Overseas mode on ✈️\nDestination: {dest}\nCurrency: {curr}\nI'll log expenses in {curr} with SGD equivalent."
-                else:
-                    dep_display = ts.get("dep_time_display", "")
-                    reply = (
-                        f"Got it ✈️ Overseas mode will activate at departure: {dep_display}\n"
-                        f"Destination: {dest} ({curr})\n"
-                        f"I'll send a confirmation when it kicks in."
-                    )
-                await send_safe(update.message, reply, parse_mode="Markdown")
-            else:
-                state.overseas_state.pop("_trip_setup", None)
-                persist_trip_setup()
-                await update.message.reply_text("Trip setup cancelled.")
+
+        # Silent termination on new intent — fall through to main routing
+        if looks_like_new_intent(text):
+            state.overseas_state.pop("_trip_setup", None)
+            persist_trip_setup()
+            # Fall through — do not return
+
+        elif ts.get("step") == "awaiting_missing":
+            # One follow-up to supply missing destination and/or dates
+            result = handle_overseas_request(text, _partial=ts)
+            if result:
+                await send_safe(update.message, result, parse_mode="Markdown")
             return
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1210,8 +1051,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = f"Rename category *{old_cat}* to *{new_cat}*? This will update all expense rows and Merchant Map. (yes / no)"
         else:
             reply = "Try: 'rename category FnB to Food'"
-    elif lower.startswith("now in ") or lower.startswith("switched to ") or lower.startswith("arrived in ") \
-            or re.search(r"\bi'?m in\b|\bi am in\b", lower) or re.search(r"\bcoming back\b|\bheading back\b|\bon my way back\b", lower):
+    elif (lower.startswith("now in ") or lower.startswith("switched to ") or lower.startswith("arrived in ")
+            or re.search(r"\bi'?m in\b|\bi am in\b", lower) or re.search(r"\bcoming back\b|\bheading back\b|\bon my way back\b", lower)) \
+            and not is_bill_request(text):
         if state.overseas_state.get("active"):
             dest_text = re.sub(r"^(now in|switched to|arrived in)\s+", "", lower).strip().title()
             new_curr = _get_currency_for_dest(dest_text)
@@ -1323,7 +1165,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             lines.append("\nReply with the number.")
             reply = "\n".join(lines)
         else:
-            reply = result
+            await send_safe(update.message, result, parse_mode="MarkdownV2")
+            return
     elif lower.startswith("delete todo ") or lower.startswith("remove todo "):
         task_name = re.sub(r"^(delete|remove) todo\s+", "", lower).strip()
         result = delete_todo(task_name)
@@ -1422,7 +1265,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     # Natural language CRM updates
-    elif (crm_action := detect_crm_natural_update(text)):
+    elif (crm_action := detect_crm_natural_update(text)) and not is_bill_request(text) and not is_overseas_mode_request(text):
         action, name, field_or_referred, value = crm_action
         if action == "referral":
             reply = set_referral(name, field_or_referred)
@@ -1432,7 +1275,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = find_contact(name, show_private=True)
 
     # Overseas / trip setup
-    elif is_overseas_mode_request(text) or extract_flight_number(text):
+    elif is_overseas_mode_request(text):
         reply = handle_overseas_request(text)
 
     # Expense

@@ -136,14 +136,56 @@ def load_sessions_from_sheet():
                 raw = r.get("Value", "")
                 if raw:
                     loaded = json.loads(raw)
-                    state.receipt_confirm_sessions.update({int(k): v for k, v in loaded.items()})
-                    if loaded:
-                        print(f"Restored {len(loaded)} receipt confirm session(s) from sheet")
+                    now = datetime.now(TIMEZONE)
+                    valid = {}
+                    for k, v in loaded.items():
+                        # DEBUG: age check — skip sessions older than 6 hours
+                        # TODO: enable once confirmed stable in prod
+                        # started = v.get("started_at", "")
+                        # if started:
+                        #     try:
+                        #         age = (now - datetime.fromisoformat(started)).total_seconds() / 3600
+                        #         if age > 6:
+                        #             print(f"Dropped stale receipt_confirm_session (age {age:.1f}h)")
+                        #             continue
+                        #     except Exception:
+                        #         pass
+                        valid[k] = v
+                    state.receipt_confirm_sessions.update({int(k): v for k, v in valid.items()})
+                    if valid:
+                        print(f"Restored {len(valid)} receipt confirm session(s) from sheet")
                 return
     except Exception as e:
         print(f"load_sessions_from_sheet error: {e}")
 
-class _AutoPersistDict(dict):
+
+def expire_stale_trip_setup():
+    """Clear _trip_setup from state and Settings sheet if stale (>6h) or missing timestamp."""
+    try:
+        ts = state.overseas_state.get("_trip_setup")
+        if not ts:
+            return
+        if state.overseas_state.get("active"):
+            # Overseas mode is live — leave it alone
+            return
+        started = ts.get("started_at", "")
+        stale = True
+        if started:
+            try:
+                age_hours = (datetime.now(TIMEZONE) - datetime.fromisoformat(started)).total_seconds() / 3600
+                stale = age_hours > 6
+            except Exception:
+                stale = True
+        if stale:
+            state.overseas_state.pop("_trip_setup", None)
+            try:
+                from trips import persist_trip_setup
+                persist_trip_setup()
+            except Exception as e:
+                print(f"expire_stale_trip_setup persist error: {e}")
+            print("Cleared stale _trip_setup on boot")
+    except Exception as e:
+        print(f"expire_stale_trip_setup error: {e}")
     """Dict subclass that auto-persists to Settings sheet on write/delete."""
     _timer = None
 
