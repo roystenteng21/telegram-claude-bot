@@ -1,8 +1,8 @@
 {
   "date": "2026-05-14",
   "session": "Session 29",
-  "built": "expenses.py: receipt photos always show confirmation step regardless of merchant memory",
+  "built": "infrastructure.py: setup_drive uses EM_RECEIPTS_FOLDER_ID; expenses.py: force confirmation for receipt photos; sessions.py: age check enabled; routing.py: receipt filename DD-MM-YYYY",
   "fixed": "n/a",
   "pending": "test receipt upload to Drive subfolder",
-  "deploy_count": 14
+  "deploy_count": 15
 }
