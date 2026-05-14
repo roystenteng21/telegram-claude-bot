@@ -1,8 +1,8 @@
 {
   "date": "2026-05-14",
   "session": "Session 30",
-  "built": "receipt save only, split expense",
+  "built": "receipt save only split",
   "fixed": "bills boot strptime fix",
   "pending": "S27 test checklist",
-  "deploy_count": 18
+  "deploy_count": 19
 }
