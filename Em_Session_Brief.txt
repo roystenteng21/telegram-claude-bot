@@ -1,161 +1,123 @@
 # Em Session Brief
 _Session start: send "start session" — Claude pulls brief from Drive automatically._
-
 **Last updated: 14/05/2026 — Session 29**
 
 ---
 
 ## Architecture
-- **State:** 20-module architecture. Modularisation complete (S22).
-- **Modules:** config · clients · state · sheets · helpers · crm · expenses · fx · reminders · cal · todos · meetings · bills · restaurants · stocks · trips · sessions · routing · infrastructure · bot.py
-- **Import order:** config → clients → state → sheets → helpers → feature modules → sessions → routing → infrastructure → bot.py. No reverse imports. Feature modules never import each other except meetings→crm (one-way). routing.py is the sole omnimporter.
-- **Repo:** roystenteng21/telegram-claude-bot (public)
-- **Runtime:** Railway. Deploy via deploy.py.
+20-module flat architecture. Import order (strict, no reverse): config → clients → state → sheets → helpers → feature modules → sessions → routing → infrastructure → bot.py. Only permitted cross-feature import: meetings→crm (one-way). routing.py is sole omnimporter.
+**Repo:** roystenteng21/telegram-claude-bot (public) · **Runtime:** Railway · **Deploy:** deploy.py
 
 ---
 
-## Coding Standards (locked)
-- **R1:** Route by cost — exact match → regex → keyword → cached lookup → live data → Claude. Never call Claude for routing decisions.
-- **R2:** Single pass, immediate exit. Once a handler matches, execution stops. No fallback re-runs detectors. Loops exit on first match.
-- **R3:** One sheet read per request, at the latest possible moment. Cached in memory, invalidated only on write. No sheet read during routing.
-- **R4:** Haiku for classification/extraction/JSON under 200 tokens. Sonnet for reasoning/conversation/multi-step only. Set min max_tokens.
-- **R5:** Typing indicator before every external API call. Parallel calls use asyncio.gather(). Nothing blocks the event loop.
-- **R6:** Session messages never reach main routing chain. Session data is flat dict with explicit fields. Sessions time out cleanly.
-- **R7:** Cache hierarchy: in-memory → cached sheet read → live sheet read → external API. Each layer reached only if above misses.
-- **R8:** Every branch sets reply or returns. Empty reply is a bug. Claude fallback for genuine unknown intent only.
-- **R9:** After every file edit, verify with `python3 -c "import <module>"` — not just `ast.parse`. This catches NameErrors, missing class definitions, and module-level execution failures that syntax checks miss.
-- **R10:** After any str_replace touching a class or function boundary, view the surrounding lines of the output file before proceeding to the next edit.
+## Coding Standards
+R1: Route by cost — exact→regex→keyword→cache→live→Claude. Never Claude for routing.
+R2: Single pass, immediate exit on first match.
+R3: One sheet read per request, cached, invalidated on write only.
+R4: Haiku for classification/extraction <200 tokens. Sonnet for reasoning/conversation only.
+R5: Typing indicator before every external API call. asyncio.gather() for parallel calls.
+R6: Session messages never reach main routing chain. Sessions time out cleanly.
+R7: Cache hierarchy: in-memory → cached sheet → live sheet → external API.
+R8: Every branch sets reply or returns. Empty reply is a bug.
+R9: Verify with `python3 -c "import <module>"` after edits, not just ast.parse.
+R10: View surrounding lines after any str_replace touching class/function boundaries.
 
 ---
 
-## Architecture Notes
-- **Routing:** Primary elif chain runs once. No else block re-runs detectors. Session handlers exit before reaching main router.
-- **Caches:** \_merchant\_cache, \_card\_names\_cache, \_system\_prompt\_cache. Invalidate at write site only. Warm card cache on startup.
-- **Models:** Haiku: is\_calendar\_request, parse\_expense\_text\_v2, classification, parse\_bill\_request, parse\_overseas\_request. Sonnet: conversation fallback, reasoning, market narrative.
-- **Sheets:** setup\_sheets() uses single worksheets() call. No repeated API reads in setup. Em Log and Dev Notes never read in routing.
-- **Module Layers:** Import order strictly enforced (no reverse imports ever): config → clients → state → sheets → helpers → feature modules → sessions → routing → infrastructure → bot.py. Feature modules never import each other except meetings→crm (one-way). routing.py is the only file that imports everything.
-- **Module Registry:** Module Registry tab in the Em Management Sheet is the live index of all modules. Columns: Module · File · Layer · Key Functions · Imports From · Last Changed · Session · Status. Updated automatically by deploy.py on every deploy.
-- **Bills:** As of S26, bills store a full due date (DD/MM/YYYY), not a day-of-month integer. send\_bill\_reminders compares against specific dates. check\_missed\_items\_on\_startup parses full date strings.
-- **Birthday pending:** As of S26, birthday\_pending is never wiped by the 2pm followup job. Only cleared on explicit sent/skip reply or at midnight by auto\_clear\_birthday\_pending. Skip and midnight clear both write "not sent" to CRM.
-- **Birthday style reference:** Pasted birthday messages stored to Settings sheet under key `birthday_message_style`. generate\_birthday\_greeting reads this at call time for style matching.
-- **Trip setup:** As of S27, trip setup is single-message parse via Haiku — no multi-step wizard. Destination and dates are critical fields; currency is auto-derived from destination. Overseas mode activates immediately on parse. If critical fields are missing, Em asks once (all missing fields in one message). `\_trip\_setup` is only used for the one follow-up state (`step: awaiting\_missing`). `\_trip\_setup` is expired on boot if older than 6 hours or missing `started\_at` timestamp (via `\_expire\_stale\_trip\_setup\_inline` called from `load\_trip\_setup\_from\_sheet`). `looks\_like\_new\_intent` silently clears `\_trip\_setup` mid-session. Cancel/nevermind/stop/abort exits trip setup at any point.
-- **Todos:** As of S27, completing a todo replies with struck task (MarkdownV2 ~strikethrough~) + remaining pending list in one message. Struck task does not persist after that message.
-- **Session expiry:** receipt\_confirm\_sessions age check on restore is implemented but commented out (debug flag) — enable once confirmed stable.
+## Key Architecture Decisions
+- **Bills:** Full due date DD/MM/YYYY stored (not day integer). S26+.
+- **Birthday pending:** Never wiped by 2pm job. Only cleared on explicit sent/skip or midnight.
+- **Trip setup:** Single-message Haiku parse. Stale \_trip\_setup expired on boot (>6h).
+- **Todos:** Complete → struck task + remaining list in one message (MarkdownV2).
+- **Sessions age check:** receipt\_confirm\_sessions drops sessions >6h old on restore. Enabled S29.
+- **Receipt uploads:** Personal OAuth2 via personal\_drive\_service (clients.py). Service account has no storage quota on personal Drive. state.OAUTH\_DRIVE\_OK flag set on boot. Boot alert if broken. reauth.py refreshes token.
+- **OAuth token:** GOOGLE\_OAUTH\_TOKEN env var in Railway (base64 token.json). client\_secrets.json and token.json are gitignored — never commit.
+- **Receipt flow:** Photo → upload Em Receipts/YYYY-MM/DD-MM-YYYY-merchant.jpg → vision parse → confirmation always shown → log on yes.
+- **GitHub fetch:** All module files fetched via `https://raw.githubusercontent.com/roystenteng21/telegram-claude-bot/main/<file>.py`. Em Codes Drive folder retired.
 
 ---
 
 ## Rules
-- **Ship Rule:** Nothing ships until fully wired, tested, and deployed in the same session.
-- **Feasibility Rule:** Never suggest a solution without certainty it is feasible — applies to code, claims, and performance predictions alike.
-- **No Silent Changes:** Any change to module boundaries, import structure, coding standards, or deploy flow must be logged to Dev Notes immediately.
-- **Circular Import Zero Tolerance:** Never work around a circular import. Restructure instead.
-- **Em Log Rule:** Every session must produce a complete Em Log entry. Built/Fixed/Pending must be specific.
-- **Cross-Feature Rule:** Only permitted cross-feature import: meetings.py → crm.find\_row (one-way). All other cross-feature calls go through routing.py dispatch. No feature module calls another feature module's handler functions.
+- Ship Rule: nothing ships until deployed in the same session.
+- Feasibility Rule: never suggest without certainty it works.
+- No Silent Changes: architectural changes logged to Dev Notes immediately.
+- Circular Import Zero Tolerance: restructure, never workaround.
+- Secret Files Rule: client\_secrets.json and token.json gitignored, never committed.
 
 ---
 
 ## Handoff Protocol
-- **Session start:** Send "start session" — Claude pulls the brief from Drive (file ID: 1TeFX3klHnKFTwRGFnxLUf1LSjRSNR3zl) automatically. No upload needed.
-- **Em Management Sheet** (ID: 1uoLlnBrgogkWgVnirA4WtlZafwpprWk\_epZy9NPLSQc) may be read mid-session only when explicitly needed. It is a read-only archive updated post-deploy for record keeping.
-- **Module files:** Claude fetches all module files directly from GitHub (repo: roystenteng21/telegram-claude-bot, public). No manual uploads needed. URL pattern: `https://raw.githubusercontent.com/roystenteng21/telegram-claude-bot/main/<filename>.py`
-- **Em's Codes Drive folder** (ID: 18tfp2\_YeVrGviXEIZX78w8OfCfjNoq7v) is now retired — GitHub is the source of truth. Drive is no longer used for module storage.
-- **Mid-session context:** If a session ends mid-build (not deployed): log exactly what was completed, what is half-built, and what the next step is in the Em Log Pending field. Next session picks up from that exact point.
-- Explicit go-ahead required before building anything, no matter the size.
-- During planning: be thorough. During building: no narration, execute and deliver.
-- Session is not closed and no brief is generated until Roysten confirms the deploy succeeded.
-- Brief is delivered as a downloadable Em\_Session\_Brief.txt in chat. Save to Drive (Session Briefs folder) to keep current.
+- Brief pulled from Drive (ID: 1TeFX3klHnKFTwRGFnxLUf1LSjRSNR3zl) on session start.
+- Module files fetched from GitHub — no uploads needed.
+- Explicit go-ahead required before building anything.
+- Session not closed until deploy confirmed. Brief delivered as .txt in chat.
 
 ---
 
-## Deploy Command Format
+## Deploy
 ```
 python3 ~/telegram-claude-bot/deploy.py "commit msg" "Session N" "built" "fixed" "pending"
 ```
+Never commit token.json or client_secrets.json.
 
----
-
-## Deploy Flow
-- Download changed module file(s) from Claude chat → save to `~/telegram-claude-bot/` → run deploy command → deploy.py commits and pushes → Railway auto-deploys, Em Log + Module Registry auto-updated.
-
----
-
-## Modularisation
-- **Status:** S22 — COMPLETE. 20 modules deployed.
-- **Files:** config.py · clients.py · state.py · sheets.py · helpers.py · crm.py · expenses.py · fx.py · reminders.py · cal.py · todos.py · meetings.py · bills.py · restaurants.py · stocks.py · trips.py · sessions.py · routing.py · infrastructure.py · bot.py
+## OAuth Token Refresh
+1. `python3 ~/telegram-claude-bot/reauth.py` → browser login → copy base64 string
+2. Railway → Variables → update `GOOGLE_OAUTH_TOKEN` → redeploy
 
 ---
 
 ## Module Index
-| Module | File | Layer | Key Functions |
+| Module | File | Layer | Owns |
 |---|---|---|---|
-| config | config.py | 0 | All constants, env vars, TIMEZONE, EXPENSE\_CATEGORIES |
-| clients | clients.py | 1 | gc, spreadsheet, drive\_service, Anthropic client |
-| state | state.py | 1 | overseas\_state, expense\_sessions, receipt\_confirm\_sessions, em\_profile, all session dicts, all caches |
-| sheets | sheets.py | 2 | get\_sheet, all sheet accessors, setup\_sheets, em log ops |
-| helpers | helpers.py | 3 | format\_date, calculate\_age, format\_contact, send\_safe, looks\_like\_new\_intent, parse\_date\_flexible |
-| crm | crm.py | 4 | find\_row, save\_contact, find\_contact, add\_note, upcoming\_birthdays, detect\_crm\_natural\_update, mark\_birthday\_greeted, mark\_birthday\_not\_sent, auto\_clear\_birthday\_pending |
-| expenses | expenses.py | 4 | log\_expense, parse\_expense\_text\_v2, handle\_expense\_text, is\_expense\_input, get\_merchant\_memory, cards |
-| fx | fx.py | 4 | get\_fx\_rate, refresh\_fx\_rates, parse\_manual\_fx\_input, persist\_fx\_rates\_to\_sheet |
-| reminders | reminders.py | 4 | add\_reminder, check\_and\_fire\_reminders, is\_reminder\_request, handle\_new\_reminder |
-| calendar | cal.py | 4 | get\_calendar, smart\_add\_event, is\_calendar\_request, get\_events |
-| todos | todos.py | 4 | add\_todo, complete\_todo, delete\_todo, list\_todos |
-| meetings | meetings.py | 4 | handle\_meeting\_session, process\_meeting\_notes, save\_meeting\_recap, is\_meeting\_start |
-| bills | bills.py | 4 | add\_bill, list\_bills, send\_bill\_reminders, is\_bill\_request, handle\_new\_bill |
-| restaurants | restaurants.py | 4 | save\_restaurant, search\_restaurants, get\_restaurant\_review, is\_restaurant\_suggestion\_request |
-| stocks | stocks.py | 4 | handle\_stock\_request, is\_stock\_request, check\_price\_alerts, get\_market\_summary\_now, fetch\_stock\_summary |
-| trips | trips.py | 4 | save\_trip, handle\_overseas\_request, \_activate\_overseas, is\_overseas\_mode\_request, restore\_overseas\_from\_trips, \_expire\_stale\_trip\_setup\_inline |
-| sessions | sessions.py | 5 | touch\_session, check\_session\_timeouts, get\_active\_session\_label, persist\_sessions\_to\_sheet, expire\_stale\_trip\_setup |
-| routing | routing.py | 6 | handle\_message, \_handle\_message\_inner, build\_system\_prompt |
-| infrastructure | infrastructure.py | 7 | run\_infrastructure\_setup, setup\_drive, setup\_em\_profile, send\_startup\_message |
-| bot | bot.py | 8 | post\_init, scheduler setup, main |
+| config | config.py | 0 | Constants, env vars, EXPENSE\_CATEGORIES, TIMEZONE |
+| clients | clients.py | 1 | gc, spreadsheet, drive\_service, personal\_drive\_service, Anthropic client |
+| state | state.py | 1 | All session dicts, caches, OAUTH\_DRIVE\_OK, DRIVE\_FOLDERS |
+| sheets | sheets.py | 2 | Sheet accessors, setup\_sheets, em log ops |
+| helpers | helpers.py | 3 | format\_date, send\_safe, looks\_like\_new\_intent |
+| crm | crm.py | 4 | Contacts, notes, followups, birthdays |
+| expenses | expenses.py | 4 | Expense logging, merchant memory, cards, receipt confirm |
+| fx | fx.py | 4 | FX rates, manual rate input |
+| reminders | reminders.py | 4 | Reminder add/fire/reschedule |
+| calendar | cal.py | 4 | iCloud calendar read/write |
+| todos | todos.py | 4 | Todo add/complete/delete/list |
+| meetings | meetings.py | 4 | Meeting recap session, note processing |
+| bills | bills.py | 4 | Bill add/list/remind |
+| restaurants | restaurants.py | 4 | Restaurant save/search/review |
+| stocks | stocks.py | 4 | Portfolio, price alerts, market summary |
+| trips | trips.py | 4 | Overseas mode, flight tracking, trip history |
+| sessions | sessions.py | 5 | Session timeouts, persist/restore receipt sessions |
+| routing | routing.py | 6 | Main message handler, system prompt |
+| infrastructure | infrastructure.py | 7 | Boot setup, OAuth test, Drive folder creation, alerts |
+| bot | bot.py | 8 | Scheduler, app init |
 
 ---
 
 ## Last Session (S29 — 14/05/2026)
-- **Built:** n/a
-- **Fixed:**
-  - expenses.py: edit field prompt improved — now shows contextual example (e.g. `Enter the new card:\ne.g. \`Citi\``) and fallback message updated to `e.g. card Citi / category Transport`
-  - config.py: removed hardcoded YOUR\_CHAT\_ID default (`281095850`) — now requires env var
-  - infrastructure.py: removed hardcoded RECEIPTS\_FOLDER\_ID default — now requires env var
-- **Pending:** Run S27 test checklist; receipt\_confirm\_sessions age check — enable in prod once stable (uncomment in sessions.py load\_sessions\_from\_sheet); receipt upload to Drive feature (foundation confirmed: Em Receipts folder exists with 2026-04 subfolder, drive\_service can create month folders and upload)
-
----
-
-## Previous Session (S28 — 12/05/2026)
-- **Built:** Drive-based session workflow — Claude pulls brief and module files from Em's Codes folder on demand; no manual uploads needed. Session start trigger changed to "start session" message. Repo made public (S29) — Claude now fetches module files directly from GitHub raw URLs; Em's Codes Drive folder retired.
-- **Fixed:** n/a
-- **Pending:** Run S27 test checklist; receipt\_confirm\_sessions age check — enable in prod once stable (uncomment in sessions.py load\_sessions\_from\_sheet)
-
----
-
-## S27 Test Checklist
-**Trip setup**
-- [ ] "flying to KL 15 May to 18 May SQ123" → activates immediately, shows summary
-- [ ] "flying tomorrow" → asks "Where to, and what dates?" → reply with details → activates
-- [ ] "flying to KL" → asks "What dates?" → reply ‒ activates
-- [ ] Mid-setup send "new bill Citi $500 due 20 May" → trips silently dropped, bill logged
-- [ ] "cancel" during awaiting\_missing → "Trip setup cancelled."
-- [ ] Restart bot with stale \_trip\_setup in sheet → cleared silently on boot
-
-**Routing guards**
-- [ ] "new bill" → bills handler (not overseas)
-- [ ] "I'm in debt $500" → does not trigger overseas
-- [ ] Bill input does not hit detect\_crm\_natural\_update
-
-**Todos**
-- [ ] "done [task]" → struck task + remaining list in one message
-- [ ] Complete via disambig → same struck + list format
+**Built:** Receipt upload to Drive via personal OAuth2 (Em Receipts/YYYY-MM/DD-MM-YYYY-merchant.jpg) · OAuth boot health check + Telegram alert · reauth.py · personal\_drive\_service · state.OAUTH\_DRIVE\_OK
+**Fixed:** expenses.py receipt always forces confirmation + edit prompt improved · config.py/infrastructure.py hardcoded defaults removed · sessions.py age check enabled · routing.py receipt filename DD-MM-YYYY · security audit (20 modules, 2 findings fixed) · repo made public, GitHub fetch standard
+**Pending:** S27 test checklist · bills boot error (`strptime() argument 1 must be str, not int`) · rotate OAuth client secret after deleting this chat
 
 ---
 
 ## Open Backlog
-- receipt\_confirm\_sessions age check — enable in prod once stable (uncomment in sessions.py)
-- Receipt upload to Drive: Em Receipts folder (ID: 14pG1lNPANRwehiW\_xSFjoHzt-AUk5-Xb) exists with 2026-04 subfolder. Feature not yet built in expenses.py. Files: expenses.py + infrastructure.py (for get\_or\_create\_drive\_folder).
+- Bills boot error: `strptime() argument 1 must be str, not int` in check\_missed\_items\_on\_startup
+- S27 test checklist not run
 
 ---
 
-## Expense Categories
-FnB · Transport · Entertainment · Personal · Family · Work · Shopping · Household · Travel
+## S27 Test Checklist
+- [ ] "flying to KL 15 May to 18 May SQ123" → activates immediately
+- [ ] "flying tomorrow" → asks where+dates → activates on reply
+- [ ] Mid-setup new intent → trips silently dropped
+- [ ] "cancel" during awaiting\_missing → cancelled
+- [ ] Stale \_trip\_setup on boot → cleared silently
+- [ ] "new bill" → bills handler not overseas
+- [ ] "I'm in debt $500" → does not trigger overseas
+- [ ] "done [task]" → struck + remaining list
 
-## Cards
-Maybank (4002, default FnB) · Citi (1176, default General) · UOB (5372) · Amex (1008)
+---
+
+## Reference
+**Expense categories:** FnB · Transport · Entertainment · Personal · Family · Work · Shopping · Household · Travel
+**Cards:** Maybank (4002, FnB) · Citi (1176) · UOB (5372) · Amex (1008)
+**Key env vars:** TELEGRAM\_TOKEN · ANTHROPIC\_API\_KEY · SHEET\_ID · GOOGLE\_CREDENTIALS · GOOGLE\_OAUTH\_TOKEN · EM\_RECEIPTS\_FOLDER\_ID (14pG1lNPANRwehiW\_xSFjoHzt-AUk5-Xb) · YOUR\_CHAT\_ID · ICLOUD\_USERNAME · ICLOUD\_PASSWORD · ALPHA\_VANTAGE\_API\_KEY · AVIATIONSTACK\_API\_KEY · EXCHANGE\_RATE\_API\_KEY

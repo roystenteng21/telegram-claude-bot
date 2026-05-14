@@ -1420,9 +1420,9 @@ async def check_missed_items_on_startup(app):
             ws = bills_sheet()
             records = ws.get_all_records()
             for r in records:
-                due_str = r.get("Due Date", "")
-                if not due_str:
-                    continue
+due_str = str(r.get("Due Date", "")).strip()
+if not due_str or due_str.isdigit():
+    continue
                 due_date = None
                 for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y"]:
                     try:

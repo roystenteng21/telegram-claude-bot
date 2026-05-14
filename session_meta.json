@@ -1,8 +1,8 @@
 {
   "date": "2026-05-14",
-  "session": "Session 29",
-  "built": "clients.py: personal_drive_service via OAuth; infrastructure.py: OAuth boot test + alerts; routing.py: use personal_drive_service for uploads; state.py: OAUTH_DRIVE_OK flag",
-  "fixed": "n/a",
-  "pending": "test receipt upload; run S27 test checklist",
-  "deploy_count": 16
+  "session": "Session 30",
+  "built": "fixed bills boot date parse crash",
+  "fixed": "",
+  "pending": "S27 test checklist",
+  "deploy_count": 17
 }
