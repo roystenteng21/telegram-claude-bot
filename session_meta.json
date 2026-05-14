@@ -1,8 +1,8 @@
 {
   "date": "2026-05-14",
   "session": "Session 30",
-  "built": "fixed bills boot date parse crash",
-  "fixed": "",
+  "built": "receipt save only, split expense",
+  "fixed": "bills boot strptime fix",
   "pending": "S27 test checklist",
-  "deploy_count": 17
+  "deploy_count": 18
 }
