@@ -11,7 +11,7 @@ from config import (
     EXPENSE_CATEGORIES, EXPENSE_CARDS, YOUR_CHAT_ID, TIMEZONE,
     AVIATIONSTACK_API_KEY
 )
-from clients import client, drive_service
+from clients import client, drive_service, personal_drive_service
 from sheets import get_sheet, get_pending_backlog, append_bug_to_backlog
 from helpers import send_safe, looks_like_new_intent, format_date
 from crm import (
@@ -84,7 +84,7 @@ from sessions import (
 from infrastructure import (
     run_infrastructure_setup, send_startup_message, save_em_profile,
     setup_em_profile, track_anthropic_call, notify_anthropic_down,
-    get_or_create_drive_folder, RECEIPTS_FOLDER_ID
+    notify_oauth_broken, get_or_create_drive_folder, RECEIPTS_FOLDER_ID
 )
 
 
@@ -243,23 +243,29 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         drive_file_id = ""
         today_obj = date.today()
         month_folder_name = today_obj.strftime("%Y-%m")
-        today_str = today_obj.strftime("%d-%m-%Y")
+        today_str = today_obj.strftime("%Y-%m")
         try:
             from googleapiclient.http import MediaIoBaseUpload
             receipts_root = state.DRIVE_FOLDERS.get("receipts", "")
-            if receipts_root:
+            if receipts_root and getattr(state, "OAUTH_DRIVE_OK", False):
                 month_folder_id = get_or_create_drive_folder(month_folder_name, receipts_root)
                 temp_name = f"{today_str}-{photo.file_id[:8]}.jpg"
                 media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
                 file_meta = {"name": temp_name, "parents": [month_folder_id]}
-                uploaded = drive_service.files().create(
-                    body=file_meta, media_body=media, fields="id,webViewLink",
-                    supportsAllDrives=True
+                uploaded = personal_drive_service.files().create(
+                    body=file_meta, media_body=media, fields="id,webViewLink"
                 ).execute()
                 drive_file_id = uploaded.get("id", "")
                 receipt_link = uploaded.get("webViewLink", "")
+            elif receipts_root and not getattr(state, "OAUTH_DRIVE_OK", False):
+                print("Receipt upload skipped — OAuth Drive not available")
         except Exception as e:
-            print(f"Receipt upload error: {e}")
+            err = str(e)
+            print(f"Receipt upload error: {err}")
+            if "invalid_grant" in err or "Token has been expired" in err or "unauthorized" in err.lower():
+                state.OAUTH_DRIVE_OK = False
+                import asyncio
+                asyncio.create_task(notify_oauth_broken(context.application, err[:100]))
 
         def rename_receipt_in_drive(merchant_name):
             if not drive_file_id or not merchant_name:

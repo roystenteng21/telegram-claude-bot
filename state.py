@@ -78,3 +78,6 @@ _app_ref = None
 # --- Drive folders ---
 DRIVE_FOLDERS = {}
 RECEIPTS_FOLDER_ID = ""
+
+# --- OAuth Drive health ---
+OAUTH_DRIVE_OK = False

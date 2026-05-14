@@ -1,8 +1,8 @@
 {
   "date": "2026-05-14",
   "session": "Session 29",
-  "built": "infrastructure.py: setup_drive uses EM_RECEIPTS_FOLDER_ID; expenses.py: force confirmation for receipt photos; sessions.py: age check enabled; routing.py: receipt filename DD-MM-YYYY",
+  "built": "clients.py: personal_drive_service via OAuth; infrastructure.py: OAuth boot test + alerts; routing.py: use personal_drive_service for uploads; state.py: OAUTH_DRIVE_OK flag",
   "fixed": "n/a",
-  "pending": "test receipt upload to Drive subfolder",
-  "deploy_count": 15
+  "pending": "test receipt upload; run S27 test checklist",
+  "deploy_count": 16
 }
