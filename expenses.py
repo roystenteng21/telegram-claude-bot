@@ -499,7 +499,7 @@ def handle_expense_text(text, user_id, receipt_link="", last4=None):
         if not amount:
             missing.append("amount")
         is_new_merchant = not bool(known_cat)
-        if not missing and not high_amount and not use_manual_rate and not is_new_merchant:
+        if not missing and not high_amount and not use_manual_rate and not is_new_merchant and not receipt_link:
             success = log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
             if not success:
                 return "⚠️ Failed to save expense — please try again.", False, None
