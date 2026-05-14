@@ -6,6 +6,12 @@ from config import RAILWAY_DEPLOYMENT_ID, YOUR_CHAT_ID
 from clients import spreadsheet, drive_service
 from sheets import setup_sheets, get_sheet, reconcile_backlog_status, apply_boot_em_log
 
+# Em Receipts folder — existing folder, created manually in Drive.
+# Month subfolders (YYYY-MM) are created automatically on first receipt upload per month.
+EM_RECEIPTS_FOLDER_ID = os.getenv("EM_RECEIPTS_FOLDER_ID", "14pG1lNPANRwehiW_xSFjoHzt-AUk5-Xb")
+
+RECEIPTS_FOLDER_ID = os.getenv("RECEIPTS_FOLDER_ID", "")
+
 def get_or_create_drive_folder(name, parent_id=None):
     query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
     if parent_id:
@@ -24,17 +30,9 @@ def get_or_create_drive_folder(name, parent_id=None):
     print(f"Created Drive folder: {name}")
     return folder["id"]
 
-RECEIPTS_FOLDER_ID = os.getenv("RECEIPTS_FOLDER_ID", "")
-
 def setup_drive():
-    em_id = get_or_create_drive_folder("Em")
-    meeting_notes_id = get_or_create_drive_folder("Meeting Notes", em_id)
-    backups_id = get_or_create_drive_folder("Backups", em_id)
-    receipts_id = get_or_create_drive_folder("Receipts", em_id)
+    receipts_id = EM_RECEIPTS_FOLDER_ID
     return {
-        "em": em_id,
-        "meeting_notes": meeting_notes_id,
-        "backups": backups_id,
         "receipts": receipts_id,
     }
 

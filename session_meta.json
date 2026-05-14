@@ -1,8 +1,8 @@
 {
   "date": "2026-05-14",
   "session": "Session 29",
-  "built": "fixed edit field prompt clarity in expenses.py; removed hardcoded YOUR_CHAT_ID and RECEIPTS_FOLDER_ID defaults",
+  "built": "receipt upload to Drive now wired correctly via EM_RECEIPTS_FOLDER_ID; receipt_confirm_sessions age check enabled in sessions.py",
   "fixed": "n/a",
-  "pending": "run S27 test checklist; enable receipt_confirm_sessions age check; build receipt upload to Drive",
-  "deploy_count": 11
+  "pending": "run S27 test checklist; test receipt upload by sending a photo",
+  "deploy_count": 12
 }

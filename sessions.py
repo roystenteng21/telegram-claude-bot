@@ -139,17 +139,15 @@ def load_sessions_from_sheet():
                     now = datetime.now(TIMEZONE)
                     valid = {}
                     for k, v in loaded.items():
-                        # DEBUG: age check — skip sessions older than 6 hours
-                        # TODO: enable once confirmed stable in prod
-                        # started = v.get("started_at", "")
-                        # if started:
-                        #     try:
-                        #         age = (now - datetime.fromisoformat(started)).total_seconds() / 3600
-                        #         if age > 6:
-                        #             print(f"Dropped stale receipt_confirm_session (age {age:.1f}h)")
-                        #             continue
-                        #     except Exception:
-                        #         pass
+                        started = v.get("started_at", "")
+                        if started:
+                            try:
+                                age = (now - datetime.fromisoformat(started)).total_seconds() / 3600
+                                if age > 6:
+                                    print(f"Dropped stale receipt_confirm_session (age {age:.1f}h)")
+                                    continue
+                            except Exception:
+                                pass
                         valid[k] = v
                     state.receipt_confirm_sessions.update({int(k): v for k, v in valid.items()})
                     if valid:
@@ -166,7 +164,6 @@ def expire_stale_trip_setup():
         if not ts:
             return
         if state.overseas_state.get("active"):
-            # Overseas mode is live — leave it alone
             return
         started = ts.get("started_at", "")
         stale = True
@@ -207,7 +204,6 @@ class _AutoPersistDict(dict):
         super().__delitem__(key)
         self._schedule_persist()
 
-# Wire receipt_confirm_sessions to the auto-persist dict at module load
 def _init_auto_persist():
     """Replace state.receipt_confirm_sessions with the auto-persisting version."""
     apd = _AutoPersistDict()
