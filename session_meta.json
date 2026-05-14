@@ -1,8 +1,8 @@
 {
-  "date": "2026-05-12",
-  "session": "Session 27",
-  "built": "restored _AutoPersistDict class definition lost in previous edit",
-  "fixed": "NameError on boot: _AutoPersistDict not defined",
-  "pending": "none",
-  "deploy_count": 8
+  "date": "2026-05-14",
+  "session": "Session 29",
+  "built": "improved edit instruction UX in expense confirm session",
+  "fixed": "n/a",
+  "pending": "security audit of all 20 modules (repo now public)",
+  "deploy_count": 9
 }

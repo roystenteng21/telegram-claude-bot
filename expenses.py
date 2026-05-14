@@ -610,7 +610,10 @@ async def handle_receipt_confirm_session(user_id, text, update):
         session["_awaiting_edit"] = field
         state.receipt_confirm_sessions[user_id] = session
         field_label = {"merchant": "merchant name", "amount": "amount", "category": "category", "card": "card"}[field]
-        await update.message.reply_text(f"Enter the new {field_label}:")
+        await update.message.reply_text(
+            f"Enter the new {field_label}:\n"
+            f"e.g. `{'Starbucks' if field == 'merchant' else 'FnB' if field == 'category' else 'Citi' if field == 'card' else '12.50'}`"
+        )
         return True
     if session.get("_awaiting_edit"):
         field = session.pop("_awaiting_edit")
@@ -717,7 +720,7 @@ async def handle_receipt_confirm_session(user_id, text, update):
                 'e.g. merchant "Gift Card Store" category Shopping'
             )
         return True
-    await update.message.reply_text("Didn't catch that — reply yes to log, skip to cancel, or edit fields (e.g. category FnB card Citi)")
+    await update.message.reply_text("Didn't catch that — reply yes to log, skip to cancel, or edit fields (e.g. card Citi / category Transport)")
     return True
 
 async def _finalise_receipt_confirm(user_id, session, update):

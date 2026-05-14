@@ -23,6 +23,8 @@ _Paste contents at the start of every dev session._
 - **R6:** Session messages never reach main routing chain. Session data is flat dict with explicit fields. Sessions time out cleanly.
 - **R7:** Cache hierarchy: in-memory → cached sheet read → live sheet read → external API. Each layer reached only if above misses.
 - **R8:** Every branch sets reply or returns. Empty reply is a bug. Claude fallback for genuine unknown intent only.
+- **R9:** After every file edit, verify with `python3 -c "import <module>"` — not just `ast.parse`. This catches NameErrors, missing class definitions, and module-level execution failures that syntax checks miss.
+- **R10:** After any str_replace touching a class or function boundary, view the surrounding lines of the output file before proceeding to the next edit.
 
 ---
 
