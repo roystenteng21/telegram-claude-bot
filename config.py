@@ -13,7 +13,7 @@ ICLOUD_PASSWORD = os.getenv("ICLOUD_PASSWORD")
 AVIATIONSTACK_API_KEY = os.getenv("AVIATIONSTACK_API_KEY", "")
 EXCHANGE_RATE_API_KEY = os.getenv("EXCHANGE_RATE_API_KEY", "")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-YOUR_CHAT_ID = int(os.getenv("YOUR_CHAT_ID", "281095850"))
+YOUR_CHAT_ID = int(os.getenv("YOUR_CHAT_ID"))
 RAILWAY_DEPLOYMENT_ID = os.getenv("RAILWAY_DEPLOYMENT_ID", "")
 
 ANTHROPIC_FAILURE_THRESHOLD = 3
@@ -227,4 +227,3 @@ DEV_NOTES_CONTENT = [
 
 EM_LOG_HEADERS_BACKLOG = ["Priority", "Item", "Stage", "Notes", "Added", "Status"]
 EM_LOG_HEADERS_SESSION = ["Date", "Session", "Built", "Fixed", "Pending", "Commit"]
-

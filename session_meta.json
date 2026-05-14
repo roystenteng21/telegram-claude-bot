@@ -1,8 +1,8 @@
 {
   "date": "2026-05-14",
   "session": "Session 29",
-  "built": "improved edit instruction UX in expense confirm session",
-  "fixed": "n/a",
-  "pending": "security audit of all 20 modules (repo now public)",
-  "deploy_count": 9
+  "built": "fixed edit field prompt clarity in expenses.py",
+  "fixed": "removed hardcoded YOUR_CHAT_ID and RECEIPTS_FOLDER_ID defaults from config.py and infrastructure.py; full security audit of all 20 modules (2 findings, both fixed); repo made public; GitHub raw fetch now standard for module access; Em Codes Drive folder retired",
+  "pending": "run S27 test checklist; enable receipt_confirm_sessions age check in sessions.py; build receipt upload to Drive feature",
+  "deploy_count": 10
 }
