@@ -243,13 +243,13 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         drive_file_id = ""
         today_obj = date.today()
         month_folder_name = today_obj.strftime("%Y-%m")
-        today_str = today_obj.strftime("%Y-%m")
+        today_str = today_obj.strftime("%d-%m-%Y")
         try:
             from googleapiclient.http import MediaIoBaseUpload
             receipts_root = state.DRIVE_FOLDERS.get("receipts", "")
             if receipts_root:
                 month_folder_id = get_or_create_drive_folder(month_folder_name, receipts_root)
-                temp_name = f"{today_str}-receipt-{photo.file_id[:8]}.jpg"
+                temp_name = f"{today_str}-{photo.file_id[:8]}.jpg"
                 media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
                 file_meta = {"name": temp_name, "parents": [month_folder_id]}
                 uploaded = drive_service.files().create(

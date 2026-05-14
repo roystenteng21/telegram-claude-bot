@@ -1,8 +1,8 @@
 {
   "date": "2026-05-14",
   "session": "Session 29",
-  "built": "receipt upload to Drive now wired correctly via EM_RECEIPTS_FOLDER_ID; receipt_confirm_sessions age check enabled in sessions.py",
+  "built": "routing.py: fixed receipt filename to DD-MM-YYYY format; infrastructure.py: setup_drive uses EM_RECEIPTS_FOLDER_ID; sessions.py: age check enabled",
   "fixed": "n/a",
-  "pending": "run S27 test checklist; test receipt upload by sending a photo",
-  "deploy_count": 12
+  "pending": "test receipt upload; run S27 test checklist",
+  "deploy_count": 13
 }
