@@ -1,8 +1,8 @@
 {
   "date": "2026-05-15",
   "session": "Session 30",
-  "built": "receipt upload personal_drive_service, force confirm photos, edit card fix, silent failure alert",
-  "fixed": "bills boot strptime",
-  "pending": "S27 test checklist",
-  "deploy_count": 20
+  "built": "merchant map dedup on save",
+  "fixed": "",
+  "pending": "S27 test checklist \u00b7 full audit S31",
+  "deploy_count": 21
 }

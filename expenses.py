@@ -60,6 +60,13 @@ def get_merchant_memory(merchant):
 def save_merchant_memory(merchant, category, card):
     try:
         sheet = merchant_map_sheet()
+        records = sheet.get_all_values()
+        for i, row in enumerate(records[1:], start=2):
+            if row and row[0].lower().strip() == merchant.lower().strip():
+                sheet.update_cell(i, 2, category)
+                sheet.update_cell(i, 3, card)
+                _invalidate_merchant_cache()
+                return True
         sheet.append_row([merchant, category, card])
         _invalidate_merchant_cache()
         return True
