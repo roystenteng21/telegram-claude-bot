@@ -14,6 +14,7 @@ interrupted_sessions = {}
 todo_disambig_sessions = {}
 market_summary_pending = {}
 session_timestamps = {}
+calendar_confirm_sessions = {}
 
 # --- Pending saves ---
 pending_contact_saves = {}
@@ -44,9 +45,6 @@ _anthropic_failure_count = 0
 _anthropic_down_notified = False
 _icloud_down = False
 _icloud_last_notified = None
-
-# --- OAuth Drive flag ---
-OAUTH_DRIVE_OK = False
 
 # --- Caches ---
 _crm_cache = None

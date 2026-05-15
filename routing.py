@@ -11,7 +11,7 @@ from config import (
     EXPENSE_CATEGORIES, EXPENSE_CARDS, YOUR_CHAT_ID, TIMEZONE,
     AVIATIONSTACK_API_KEY
 )
-from clients import client, drive_service, personal_drive_service
+from clients import client, drive_service
 from sheets import get_sheet, get_pending_backlog, append_bug_to_backlog
 from helpers import send_safe, looks_like_new_intent, format_date, alert_error
 from crm import (
@@ -46,7 +46,8 @@ from reminders import (
 )
 from cal import (
     get_calendar, get_events, delete_calendar_event, is_calendar_request,
-    smart_add_event, check_icloud_daily
+    smart_add_event, check_icloud_daily, find_upcoming_events,
+    apply_calendar_edit, format_calendar_confirm, write_calendar_event
 )
 from todos import add_todo, complete_todo, delete_todo, list_todos
 from meetings import (
@@ -243,27 +244,23 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         drive_file_id = ""
         today_obj = date.today()
         month_folder_name = today_obj.strftime("%Y-%m")
-        today_str = today_obj.strftime("%d-%m-%Y")
-        if state.OAUTH_DRIVE_OK:
-            try:
-                from googleapiclient.http import MediaIoBaseUpload
-                receipts_root = state.DRIVE_FOLDERS.get("receipts", "")
-                if receipts_root:
-                    month_folder_id = get_or_create_drive_folder(month_folder_name, receipts_root)
-                    temp_name = f"{today_str}-receipt-{photo.file_id[:8]}.jpg"
-                    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
-                    file_meta = {"name": temp_name, "parents": [month_folder_id]}
-                    uploaded = personal_drive_service.files().create(
-                        body=file_meta, media_body=media, fields="id,webViewLink"
-                    ).execute()
-                    drive_file_id = uploaded.get("id", "")
-                    receipt_link = uploaded.get("webViewLink", "")
-            except Exception as e:
-                print(f"Receipt upload error: {e}")
-                await update.message.reply_text("⚠️ Receipt couldn't be saved to Drive — expense will still be logged.")
-                await alert_error("receipt_upload", str(e))
-        else:
-            print("Receipt upload skipped — OAUTH_DRIVE_OK is False")
+        today_str = today_obj.strftime("%Y-%m")
+        try:
+            from googleapiclient.http import MediaIoBaseUpload
+            receipts_root = state.DRIVE_FOLDERS.get("receipts", "")
+            if receipts_root:
+                month_folder_id = get_or_create_drive_folder(month_folder_name, receipts_root)
+                temp_name = f"{today_str}-receipt-{photo.file_id[:8]}.jpg"
+                media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
+                file_meta = {"name": temp_name, "parents": [month_folder_id]}
+                uploaded = drive_service.files().create(
+                    body=file_meta, media_body=media, fields="id,webViewLink",
+                    supportsAllDrives=True
+                ).execute()
+                drive_file_id = uploaded.get("id", "")
+                receipt_link = uploaded.get("webViewLink", "")
+        except Exception as e:
+            print(f"Receipt upload error: {e}")
 
         def rename_receipt_in_drive(merchant_name):
             if not drive_file_id or not merchant_name:
@@ -271,8 +268,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 safe_merchant = re.sub(r"[^a-zA-Z0-9\-_]", "", merchant_name.replace(" ", "-").lower())
                 new_name = f"{today_str}-{safe_merchant}.jpg"
-                personal_drive_service.files().update(
-                    fileId=drive_file_id, body={"name": new_name}
+                drive_service.files().update(
+                    fileId=drive_file_id, body={"name": new_name}, supportsAllDrives=True
                 ).execute()
             except Exception as e:
                 print(f"Receipt rename error: {e}")
@@ -310,7 +307,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     merchant_v, amount_v, currency_v = parts
                     rename_receipt_in_drive(merchant_v)
                     synthesized = f"{merchant_v} {amount_v} {currency_v}"
-                    reply, needs_session, session_data = handle_expense_text(synthesized, user_id, receipt_link=receipt_link, force_confirm=True)
+                    reply, needs_session, session_data = handle_expense_text(synthesized, user_id, receipt_link=receipt_link)
                     if needs_session and session_data:
                         state.expense_sessions[user_id] = session_data
                     if reply:
@@ -326,7 +323,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             parsed = parse_expense_text(caption)
             if parsed and parsed.get("merchant"):
                 rename_receipt_in_drive(parsed["merchant"])
-            reply, needs_session, session_data = handle_expense_text(caption, user_id, receipt_link=receipt_link, force_confirm=True)
+            reply, needs_session, session_data = handle_expense_text(caption, user_id, receipt_link=receipt_link)
             if needs_session and session_data:
                 state.expense_sessions[user_id] = session_data
             if reply:
@@ -375,7 +372,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── Session timeouts ──────────────────────────────────────────────────────
     if any(user_id in s for s in [state.expense_sessions, state.delete_sessions, state.portfolio_delete_sessions,
                                     state.confirm_sessions, state.receipt_confirm_sessions, state.edit_sessions,
-                                    state.meeting_sessions, state.pending_restaurant_saves]):
+                                    state.meeting_sessions, state.pending_restaurant_saves,
+                                    state.calendar_confirm_sessions]):
         if is_session_expired(user_id):
             await check_session_timeouts(user_id, update)
             return
@@ -390,7 +388,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                           state.edit_sessions, state.confirm_sessions, state.delete_sessions,
                           state.portfolio_delete_sessions, state.excel_import_sessions,
                           state.pending_restaurant_saves, state.pending_contact_saves,
-                          state.todo_disambig_sessions]:
+                          state.todo_disambig_sessions, state.calendar_confirm_sessions]:
                     d.pop(user_id, None)
                 state.session_timestamps.pop(user_id, None)
                 del state.interrupted_sessions[user_id]
@@ -412,6 +410,21 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 f"Reply yes to switch, or no to continue."
             )
             return
+
+    # ── Calendar confirm session ──────────────────────────────────────────────
+    if user_id in state.calendar_confirm_sessions:
+        touch_session(user_id)
+        cs = state.calendar_confirm_sessions[user_id]
+        if lower in ["yes", "y", "yep", "yeah", "yup", "sure", "ok", "okay"]:
+            del state.calendar_confirm_sessions[user_id]
+            state.session_timestamps.pop(user_id, None)
+            reply = write_calendar_event(cs["parsed"])
+            await send_safe(update.message, reply, parse_mode="Markdown")
+        else:
+            # Treat as inline edit
+            reply = apply_calendar_edit(user_id, text)
+            await send_safe(update.message, reply, parse_mode="Markdown")
+        return
 
     # ── Pending restaurant saves ──────────────────────────────────────────────
     if user_id in state.pending_restaurant_saves:
@@ -769,8 +782,46 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ─────────────────────────────────────────────────────────────────────────
     reply = None
 
+    # ── Calendar — cal trigger (highest priority for calendar) ────────────────
+    if lower.startswith("cal delete "):
+        event_query = text[11:].strip()
+        matches, err = find_upcoming_events(event_query)
+        if err:
+            reply = err
+        elif not matches:
+            reply = f"No upcoming event found matching '{event_query}'"
+        elif len(matches) == 1:
+            event_obj, summary, dtstart = matches[0]
+            try:
+                if hasattr(dtstart, 'strftime'):
+                    date_str = dtstart.strftime("%a %d %b %Y, %I:%M%p").replace(" 0", " ").lower()
+                else:
+                    date_str = str(dtstart)
+            except Exception:
+                date_str = str(dtstart)
+            state.confirm_sessions[user_id] = {
+                "action": "delete_event",
+                "args": [summary],
+                "target": f"🗑 *{summary}*\n🗓 {date_str}\n\nDelete it? (yes / no)"
+            }
+            reply = f"🗑 *{summary}*\n🗓 {date_str}\n\nDelete it? (yes / no)"
+        else:
+            lines = ["Found multiple matching events — which one?"]
+            for i, (_, summary, dtstart) in enumerate(matches, 1):
+                try:
+                    date_str = dtstart.strftime("%a %d %b %Y, %I:%M%p").replace(" 0", " ").lower() if hasattr(dtstart, 'strftime') else str(dtstart)
+                except Exception:
+                    date_str = str(dtstart)
+                lines.append(f"{i}. {summary} — {date_str}")
+            # Store matches for disambiguation
+            state.calendar_confirm_sessions[user_id] = {"delete_matches": matches, "step": "pick_delete"}
+            reply = "\n".join(lines)
+
+    elif lower.startswith("cal "):
+        reply = smart_add_event(text[4:].strip(), user_id)
+
     # Save restaurant (must check before generic "save " to handle maps links)
-    if lower.startswith("save restaurant "):
+    elif lower.startswith("save restaurant "):
         result = handle_save_restaurant(text)
         reply = _handle_restaurant_save_result(result, user_id)
 
@@ -841,7 +892,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif lower == "cancel":
         for d in [state.edit_sessions, state.excel_import_sessions, state.confirm_sessions,
-                  state.delete_sessions, state.receipt_confirm_sessions]:
+                  state.delete_sessions, state.receipt_confirm_sessions, state.calendar_confirm_sessions]:
             d.pop(user_id, None)
         state.session_timestamps.pop(user_id, None)
         reply = "Cancelled."
@@ -1040,7 +1091,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = list_reminders()
         else:
             reply = list_todos()
-    elif lower.startswith("edit last expense") or lower.startswith("edit expense "):
+    elif lower.startswith("edit last expense ") or lower.startswith("edit expense "):
         edit_text = re.sub(r"^edit (?:last )?expense\s+", "", text, flags=re.IGNORECASE).strip()
         if edit_text:
             reply = edit_last_expense(edit_text)
@@ -1189,16 +1240,39 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                    "show my tasks", "list my tasks", "pending tasks"]:
         reply = list_todos()
 
-    elif lower.startswith("add event") or lower.startswith("schedule ") or lower.startswith("create event"):
-        reply = smart_add_event(text, user_id)
     elif lower == "events today":
         reply = get_events(1)
     elif lower == "events week":
         reply = get_events(7)
     elif lower.startswith("delete event "):
-        event_name = text[13:].strip()
-        state.confirm_sessions[user_id] = {"action": "delete_event", "args": [event_name], "target": f"Delete event {event_name}?"}
-        reply = f"Delete event *{event_name}*? (yes / no)"
+        event_query = text[13:].strip()
+        matches, err = find_upcoming_events(event_query)
+        if err:
+            reply = err
+        elif not matches:
+            reply = f"No upcoming event found matching '{event_query}'"
+        elif len(matches) == 1:
+            event_obj, summary, dtstart = matches[0]
+            try:
+                date_str = dtstart.strftime("%a %d %b %Y, %I:%M%p").replace(" 0", " ").lower() if hasattr(dtstart, 'strftime') else str(dtstart)
+            except Exception:
+                date_str = str(dtstart)
+            state.confirm_sessions[user_id] = {
+                "action": "delete_event",
+                "args": [summary],
+                "target": f"Delete {summary}?"
+            }
+            reply = f"🗑 *{summary}*\n🗓 {date_str}\n\nDelete it? (yes / no)"
+        else:
+            lines = ["Found multiple matching events — which one?"]
+            for i, (_, summary, dtstart) in enumerate(matches, 1):
+                try:
+                    date_str = dtstart.strftime("%a %d %b %Y, %I:%M%p").replace(" 0", " ").lower() if hasattr(dtstart, 'strftime') else str(dtstart)
+                except Exception:
+                    date_str = str(dtstart)
+                lines.append(f"{i}. {summary} — {date_str}")
+            state.calendar_confirm_sessions[user_id] = {"delete_matches": matches, "step": "pick_delete"}
+            reply = "\n".join(lines)
 
     elif lower in ("em whats pending", "em what's pending", "em pending", "whats pending"):
         reply = get_pending_backlog()
@@ -1223,8 +1297,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         from config import ANTHROPIC_FAILURE_THRESHOLD
         if state._anthropic_failure_count >= ANTHROPIC_FAILURE_THRESHOLD:
             issues.append("• Anthropic API: repeated failures detected — check API key or Anthropic status page")
-        if not state.OAUTH_DRIVE_OK:
-            issues.append("• Personal Drive (OAuth): not connected — receipt uploads won't save to Drive. Check GOOGLE_OAUTH_TOKEN in Railway.")
         reply = "✅ Systems all green" if not issues else "⚠️ Issues detected:\n\n" + "\n".join(issues)
 
     elif lower == "help":
@@ -1235,8 +1307,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             "referrals, all referrals, top referrers, referrals from [name]\n"
             "import excel — import contacts from a spreadsheet\n\n"
             "*Calendar:*\n"
-            "Just tell me naturally — 'schedule dinner tomorrow 7pm' or 'add event'\n"
-            "events today / events week / delete event\n\n"
+            "cal [title] [calendar] [date] [time] — add an event\n"
+            "cal delete [title] — delete an event\n"
+            "events today / events week\n\n"
             "*To-Do:*\n"
             "todo [task] / add task [task] / new task [task]\n"
             "done [task] — mark complete\n"
@@ -1294,7 +1367,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if needs_session and session_data:
             state.expense_sessions[user_id] = session_data
 
-    # Calendar queries (read — what's on, do I have anything)
+    # Calendar queries (read)
     elif any(t in lower for t in [
         "what's on today", "whats on today", "what is on today",
         "what's on tomorrow", "whats on tomorrow",
@@ -1308,12 +1381,15 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         days = 7 if "week" in lower else 1
         reply = get_events(days)
 
-    # Calendar (create)
+    # Calendar (create) — natural language fallback
     elif is_calendar_request(text):
         reply = smart_add_event(text, user_id)
 
-    # Claude conversation fallback
+    # ── Claude conversation fallback ──────────────────────────────────────────
     else:
+        # Alert: message fell through to Claude fallback
+        await alert_error(f"⚠️ Routing fallback — no handler matched.\nMessage: \"{text[:200]}\"")
+
         if user_id not in state.conversation_histories:
             state.conversation_histories[user_id] = []
         state.conversation_histories[user_id].append({"role": "user", "content": text})
@@ -1420,7 +1496,7 @@ async def check_missed_items_on_startup(app):
             ws = bills_sheet()
             records = ws.get_all_records()
             for r in records:
-                due_str = str(r.get("Due Date", ""))
+                due_str = r.get("Due Date", "")
                 if not due_str:
                     continue
                 due_date = None
