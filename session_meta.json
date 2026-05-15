@@ -1,8 +1,8 @@
 {
   "date": "2026-05-16",
   "session": "Session 32",
-  "built": "cal confirm session, programmatic dates, cal/cal delete triggers, fallback alert",
-  "fixed": "iCloud auth, date hallucination, no confirm before write",
+  "built": "",
+  "fixed": "alert_error import crash in handlers.py, silent calendar write failure",
   "pending": "",
-  "deploy_count": 25
+  "deploy_count": 26
 }

@@ -185,24 +185,18 @@ async def send_safe(target, text, parse_mode=None):
         chunks.append(current)
     for chunk in chunks:
         try:
-            await target.reply_text(chunk, parse_mode=parse_mode)
+            await chunk.reply_text(chunk, parse_mode=parse_mode)
         except Exception:
             await target.reply_text(chunk)
 
-# ── Silent failure alerter ─────────────────────────────────────────────────────
+# ── Dev alert ─────────────────────────────────────────────────────────────────
 
-async def alert_error(source: str, error: str):
-    """Send a Telegram alert for silent failures in critical paths.
-    Uses state._app_ref — never raises, never blocks."""
+async def alert_error(message: str):
+    """Send a dev alert to Telegram on silent failures. Never raises."""
     try:
         import state
-        app = state._app_ref
-        if not app:
-            return
-        from config import YOUR_CHAT_ID
-        await app.bot.send_message(
-            chat_id=YOUR_CHAT_ID,
-            text=f"⚠️ Silent failure in `{source}`:\n{str(error)[:200]}"
-        )
-    except Exception:
-        pass  # alerter must never crash anything
+        if state._app_ref:
+            from config import YOUR_CHAT_ID
+            await state._app_ref.bot.send_message(chat_id=YOUR_CHAT_ID, text=message)
+    except Exception as e:
+        print(f"alert_error failed: {e}")
