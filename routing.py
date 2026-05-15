@@ -182,6 +182,7 @@ def build_system_prompt():
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    print(f"MSG from {user_id}, expected {YOUR_CHAT_ID}")
     if user_id != YOUR_CHAT_ID:
         return
     try:
