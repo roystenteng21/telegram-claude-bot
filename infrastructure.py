@@ -6,17 +6,13 @@ from config import RAILWAY_DEPLOYMENT_ID, YOUR_CHAT_ID
 from clients import spreadsheet, drive_service, personal_drive_service
 from sheets import setup_sheets, get_sheet, reconcile_backlog_status, apply_boot_em_log
 
-EM_RECEIPTS_FOLDER_ID = os.getenv("EM_RECEIPTS_FOLDER_ID", "14pG1lNPANRwehiW_xSFjoHzt-AUk5-Xb")
-RECEIPTS_FOLDER_ID = os.getenv("RECEIPTS_FOLDER_ID", "")
-
 def get_or_create_drive_folder(name, parent_id=None):
-    """Create folder using personal OAuth drive (for Em Receipts subfolders)."""
-    svc = personal_drive_service._get() or drive_service
     query = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
     if parent_id:
         query += f" and '{parent_id}' in parents"
-    results = svc.files().list(
-        q=query, fields="files(id, name)"
+    results = drive_service.files().list(
+        q=query, fields="files(id, name)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True
     ).execute()
     files = results.get("files", [])
     if files:
@@ -24,28 +20,41 @@ def get_or_create_drive_folder(name, parent_id=None):
     meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
     if parent_id:
         meta["parents"] = [parent_id]
-    folder = svc.files().create(body=meta, fields="id").execute()
+    folder = drive_service.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
     print(f"Created Drive folder: {name}")
     return folder["id"]
 
+RECEIPTS_FOLDER_ID = os.getenv("RECEIPTS_FOLDER_ID", "14pG1lNPANRwehiW_xSFjoHzt-AUk5-Xb")
+
 def setup_drive():
-    receipts_id = EM_RECEIPTS_FOLDER_ID
+    em_id = get_or_create_drive_folder("Em")
+    meeting_notes_id = get_or_create_drive_folder("Meeting Notes", em_id)
+    backups_id = get_or_create_drive_folder("Backups", em_id)
+    receipts_id = get_or_create_drive_folder("Receipts", em_id)
     return {
+        "em": em_id,
+        "meeting_notes": meeting_notes_id,
+        "backups": backups_id,
         "receipts": receipts_id,
     }
 
-def test_oauth_drive():
-    """Test personal OAuth drive access. Returns (ok, error_msg)."""
+def _test_oauth_drive():
+    """Test personal OAuth Drive connection. Sets state.OAUTH_DRIVE_OK."""
     try:
-        if not personal_drive_service.is_available():
-            return False, "GOOGLE_OAUTH_TOKEN not set — run reauth.py locally and add token to Railway"
-        personal_drive_service.files().list(pageSize=1, fields="files(id)").execute()
-        return True, None
+        svc = personal_drive_service.files()
+        if svc is None:
+            print("⚠️ personal_drive_service unavailable — GOOGLE_OAUTH_TOKEN may be missing or expired")
+            state.OAUTH_DRIVE_OK = False
+            return False
+        # Light check — just list 1 file to confirm auth works
+        svc.list(pageSize=1, fields="files(id)").execute()
+        state.OAUTH_DRIVE_OK = True
+        print("✅ Personal OAuth Drive connection OK")
+        return True
     except Exception as e:
-        err = str(e)
-        if "invalid_grant" in err or "Token has been expired" in err:
-            return False, "OAuth token expired or revoked — run reauth.py locally and update GOOGLE_OAUTH_TOKEN in Railway"
-        return False, f"OAuth Drive error: {err[:80]}"
+        state.OAUTH_DRIVE_OK = False
+        print(f"⚠️ Personal OAuth Drive test failed: {e}")
+        return False
 
 def setup_em_profile():
     default_profile = {
@@ -127,14 +136,13 @@ def run_infrastructure_setup():
         health["Drive"] = "❌ Failed — receipt uploads won't work"
         state.DRIVE_FOLDERS = {}
         print(f"setup_drive error: {e}")
-    ok, err = test_oauth_drive()
-    if ok:
-        print("✅ OAuth Drive connected")
-        state.OAUTH_DRIVE_OK = True
-    else:
-        health["OAuth Drive"] = f"❌ {err}"
-        state.OAUTH_DRIVE_OK = False
-        print(f"OAuth Drive error: {err}")
+    try:
+        oauth_ok = _test_oauth_drive()
+        if not oauth_ok:
+            health["OAuth Drive"] = "❌ Failed — personal receipt uploads won't work. Check GOOGLE_OAUTH_TOKEN in Railway."
+    except Exception as e:
+        health["OAuth Drive"] = "❌ Failed — personal receipt uploads won't work"
+        print(f"_test_oauth_drive error: {e}")
     try:
         setup_em_profile()
         if not state.em_profile:
@@ -223,18 +231,3 @@ async def notify_anthropic_down(app):
             )
         except Exception as e:
             print(f"notify_anthropic_down error: {e}")
-
-async def notify_oauth_broken(app, reason):
-    """Alert when OAuth Drive access breaks mid-session."""
-    try:
-        await app.bot.send_message(
-            chat_id=YOUR_CHAT_ID,
-            text=(
-                f"⚠️ Receipt upload to Drive stopped working.\n\n"
-                f"Reason: {reason}\n\n"
-                f"Fix: run `python3 ~/telegram-claude-bot/reauth.py` on your Mac, "
-                f"then update GOOGLE_OAUTH_TOKEN in Railway and redeploy."
-            )
-        )
-    except Exception as e:
-        print(f"notify_oauth_broken error: {e}")

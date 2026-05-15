@@ -15,13 +15,20 @@ def parse_restaurant_save(text):
         f"- notes: string (any notes — only if mentioned, else empty)\n\n"
         f"Return ONLY the JSON."
     )
-    resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=200,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"parse_restaurant_save JSON error: {e}")
+        return None
+    except Exception as e:
+        print(f"parse_restaurant_save error: {e}")
+        return None
 
 def lookup_restaurant_from_maps(url):
     prompt = (
@@ -403,6 +410,8 @@ def handle_save_restaurant(text, force_new=False):
                 return f"_NEEDS_LOCATION_:{name}:{country}"
         else:
             parsed = parse_restaurant_save(text)
+            if not parsed:
+                return "❌ Couldn't parse that restaurant — try: 'save Burnt Ends, Teck Lim Road'"
             name = parsed.get("name", "")
             location = parsed.get("location", "")
             country = parsed.get("country", "Singapore")

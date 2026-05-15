@@ -18,7 +18,8 @@ def is_session_expired(user_id):
 def clear_all_sessions(user_id):
     for d in [state.expense_sessions, state.delete_sessions, state.portfolio_delete_sessions,
               state.confirm_sessions, state.receipt_confirm_sessions, state.recon_sessions,
-              state.edit_sessions, state.meeting_sessions, state.session_timestamps]:
+              state.edit_sessions, state.meeting_sessions, state.session_timestamps,
+              state.todo_disambig_sessions]:
         d.pop(user_id, None)
 
 async def check_session_timeouts(user_id, update):
@@ -139,6 +140,7 @@ def load_sessions_from_sheet():
                     now = datetime.now(TIMEZONE)
                     valid = {}
                     for k, v in loaded.items():
+                        # Drop sessions older than 6 hours
                         started = v.get("started_at", "")
                         if started:
                             try:
@@ -164,6 +166,7 @@ def expire_stale_trip_setup():
         if not ts:
             return
         if state.overseas_state.get("active"):
+            # Overseas mode is live — leave it alone
             return
         started = ts.get("started_at", "")
         stale = True
@@ -204,6 +207,7 @@ class _AutoPersistDict(dict):
         super().__delitem__(key)
         self._schedule_persist()
 
+# Wire receipt_confirm_sessions to the auto-persist dict at module load
 def _init_auto_persist():
     """Replace state.receipt_confirm_sessions with the auto-persisting version."""
     apd = _AutoPersistDict()

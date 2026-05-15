@@ -13,7 +13,7 @@ from config import (
 )
 from clients import client, drive_service, personal_drive_service
 from sheets import get_sheet, get_pending_backlog, append_bug_to_backlog
-from helpers import send_safe, looks_like_new_intent, format_date
+from helpers import send_safe, looks_like_new_intent, format_date, alert_error
 from crm import (
     find_row, find_all_rows, save_contact, find_contact, add_note, set_followup,
     update_field, update_contact_field_natural, delete_contact, search_contacts,
@@ -244,9 +244,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         today_obj = date.today()
         month_folder_name = today_obj.strftime("%Y-%m")
         today_str = today_obj.strftime("%d-%m-%Y")
-        if not state.OAUTH_DRIVE_OK:
-            await update.message.reply_text("⚠️ Receipt upload is unavailable — OAuth not configured. Continuing without saving to Drive.")
-        else:
+        if state.OAUTH_DRIVE_OK:
             try:
                 from googleapiclient.http import MediaIoBaseUpload
                 receipts_root = state.DRIVE_FOLDERS.get("receipts", "")
@@ -262,7 +260,10 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     receipt_link = uploaded.get("webViewLink", "")
             except Exception as e:
                 print(f"Receipt upload error: {e}")
-                await update.message.reply_text(f"⚠️ Receipt upload failed — continuing without Drive save. ({type(e).__name__}: {str(e)[:80]})")
+                await update.message.reply_text("⚠️ Receipt couldn't be saved to Drive — expense will still be logged.")
+                await alert_error("receipt_upload", str(e))
+        else:
+            print("Receipt upload skipped — OAUTH_DRIVE_OK is False")
 
         def rename_receipt_in_drive(merchant_name):
             if not drive_file_id or not merchant_name:
@@ -785,6 +786,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif lower.startswith("find ") or lower.startswith("pull up "):
         name = text[5:] if lower.startswith("find ") else text[8:]
         name_lower = name.strip().lower()
+        # Route pull up to correct handler before defaulting to CRM
         if name_lower in ["todo list", "todos", "my todos", "my todo list", "tasks", "my tasks"]:
             reply = list_todos()
         elif name_lower in ["bills", "my bills", "bill list"]:
@@ -823,11 +825,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = search_contacts(text[7:])
 
     elif (lower.startswith("edit ") and not lower.startswith("edit last expense")
-          and not lower.startswith("edit expense")
-          and not lower.startswith("edit card")
-          and not lower.startswith("edit category")
-          and not lower.startswith("edit merchant")
-          and not lower.startswith("edit amount")):
+          and not lower.startswith("edit expense")):
         name = text[5:].strip()
         _, record = find_row(name)
         if not record:
@@ -1042,7 +1040,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = list_reminders()
         else:
             reply = list_todos()
-    elif lower.startswith("edit last expense ") or lower.startswith("edit expense ") or re.match(r"edit (card|category|merchant|amount)\s+", lower):
+    elif lower.startswith("edit last expense") or lower.startswith("edit expense "):
         edit_text = re.sub(r"^edit (?:last )?expense\s+", "", text, flags=re.IGNORECASE).strip()
         if edit_text:
             reply = edit_last_expense(edit_text)
@@ -1225,6 +1223,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         from config import ANTHROPIC_FAILURE_THRESHOLD
         if state._anthropic_failure_count >= ANTHROPIC_FAILURE_THRESHOLD:
             issues.append("• Anthropic API: repeated failures detected — check API key or Anthropic status page")
+        if not state.OAUTH_DRIVE_OK:
+            issues.append("• Personal Drive (OAuth): not connected — receipt uploads won't save to Drive. Check GOOGLE_OAUTH_TOKEN in Railway.")
         reply = "✅ Systems all green" if not issues else "⚠️ Issues detected:\n\n" + "\n".join(issues)
 
     elif lower == "help":
@@ -1420,8 +1420,8 @@ async def check_missed_items_on_startup(app):
             ws = bills_sheet()
             records = ws.get_all_records()
             for r in records:
-                due_str = str(r.get("Due Date", "")).strip()
-                if not due_str or due_str.isdigit():
+                due_str = r.get("Due Date", "")
+                if not due_str:
                     continue
                 due_date = None
                 for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y"]:

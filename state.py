@@ -45,6 +45,9 @@ _anthropic_down_notified = False
 _icloud_down = False
 _icloud_last_notified = None
 
+# --- OAuth Drive flag ---
+OAUTH_DRIVE_OK = False
+
 # --- Caches ---
 _crm_cache = None
 _crm_cache_ts = None
@@ -78,6 +81,3 @@ _app_ref = None
 # --- Drive folders ---
 DRIVE_FOLDERS = {}
 RECEIPTS_FOLDER_ID = ""
-
-# --- OAuth Drive health ---
-OAUTH_DRIVE_OK = False

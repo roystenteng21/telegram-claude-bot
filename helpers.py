@@ -188,3 +188,21 @@ async def send_safe(target, text, parse_mode=None):
             await target.reply_text(chunk, parse_mode=parse_mode)
         except Exception:
             await target.reply_text(chunk)
+
+# ── Silent failure alerter ─────────────────────────────────────────────────────
+
+async def alert_error(source: str, error: str):
+    """Send a Telegram alert for silent failures in critical paths.
+    Uses state._app_ref — never raises, never blocks."""
+    try:
+        import state
+        app = state._app_ref
+        if not app:
+            return
+        from config import YOUR_CHAT_ID
+        await app.bot.send_message(
+            chat_id=YOUR_CHAT_ID,
+            text=f"⚠️ Silent failure in `{source}`:\n{str(error)[:200]}"
+        )
+    except Exception:
+        pass  # alerter must never crash anything

@@ -1,4 +1,5 @@
 import re
+import json
 from datetime import date, datetime
 import state
 from config import DATE_FORMATS
@@ -577,7 +578,7 @@ def load_birthday_pending_from_sheet():
             if r.get("Key") == "birthday_pending":
                 raw = r.get("Value", "")
                 if raw:
-                    loaded = __import__("json").loads(raw)
+                    loaded = json.loads(raw)
                     if loaded.get("date") == date.today().strftime("%d/%m/%Y"):
                         state.birthday_pending = loaded.get("pending", {})
                         if state.birthday_pending:
@@ -635,7 +636,6 @@ def generate_birthday_greeting(name, age, relationship, context, notes):
 async def send_birthday_reminders(app):
     import asyncio
     from config import YOUR_CHAT_ID
-    global state
     try:
         ensure_birthday_greeted_column()
         records = _get_crm_records()
@@ -670,6 +670,8 @@ async def send_birthday_reminders(app):
                 persist_birthday_pending()
             except Exception as e:
                 print(f"Birthday reminder error for {r.get('Name', '?')}: {e}")
+                from helpers import alert_error
+                await alert_error("send_birthday_reminders", f"{r.get('Name', '?')}: {e}")
     except Exception as e:
         print(f"Error in send_birthday_reminders: {e}")
 
@@ -859,5 +861,3 @@ def detect_crm_natural_update(text):
         field = ask_private.group(2).strip()
         return ("show_private", name, field, None)
     return None
-
-import json

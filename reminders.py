@@ -5,7 +5,7 @@ import state
 from config import TIMEZONE, YOUR_CHAT_ID
 from clients import client
 from sheets import reminders_sheet, get_sheet, log_error_to_em_log
-from helpers import generate_reminder_id, get_next_recurrence
+from helpers import generate_reminder_id, get_next_recurrence, alert_error
 
 def parse_reminder_request(text):
     now = datetime.now(TIMEZONE)
@@ -48,16 +48,19 @@ def parse_reschedule_request(text, original_message):
         f"- recurrence: string (once, daily, weekly, monthly — use 'once' if unclear)\n\n"
         f"Return ONLY the JSON."
     )
-    resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=100,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
     try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
         return json.loads(raw)
     except (json.JSONDecodeError, ValueError) as e:
-        print(f"parse_reschedule_request JSON error: {e} | raw: {raw[:100]}")
+        print(f"parse_reschedule_request JSON error: {e}")
+        return None
+    except Exception as e:
+        print(f"parse_reschedule_request error: {e}")
         return None
 
 def add_reminder(message, scheduled_time_str, recurrence="once", contact=""):
@@ -162,6 +165,7 @@ async def check_and_fire_reminders(app):
                         state._pending_reminders_cache = None
                 except Exception as e:
                     print(f"check_and_fire_reminders: failed to fire reminder id={r.get('ID', '?')}: {e}")
+                    await alert_error("check_and_fire_reminders", f"id={r.get('ID', '?')}: {e}")
     except Exception as e:
         print(f"Error in check_and_fire_reminders: {e}")
 

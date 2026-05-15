@@ -19,16 +19,19 @@ def parse_bill_request(text):
         f"- notes: string (any extra notes, or empty)\n\n"
         f"Return ONLY the JSON."
     )
-    resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=200,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
     try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()
         return json.loads(raw)
     except (json.JSONDecodeError, ValueError) as e:
-        print(f"parse_bill_request JSON error: {e} | raw: {raw[:100]}")
+        print(f"parse_bill_request JSON error: {e} | raw: {raw[:100] if 'raw' in dir() else 'N/A'}")
+        return None
+    except Exception as e:
+        print(f"parse_bill_request error: {e}")
         return None
 
 def add_bill(name, bank, due_date, estimated_amount, notes=""):
@@ -78,7 +81,7 @@ def get_cycle_expenses(card_name, due_day):
         total = 0
         for r in records:
             try:
-                dt = datetime.strptime(r.get("Date", ""), "%d/%m/%Y").date()
+                dt = datetime.strptime(str(r.get("Date", "")), "%d/%m/%Y").date()
                 card = r.get("Card", "")
                 if dt >= cycle_start and card_name.lower() in card.lower():
                     total += float(r.get("SGD Amount", 0) or r.get("Amount", 0))
@@ -97,7 +100,7 @@ async def send_bill_reminders(app):
         today = date.today()
         for r in records:
             try:
-                due_str = r.get("Due Date", "")
+                due_str = str(r.get("Due Date", ""))
                 if not due_str:
                     continue
                 due_date = None
@@ -158,6 +161,8 @@ def is_bill_request(text):
 def handle_new_bill(text):
     try:
         parsed = parse_bill_request(text)
+        if not parsed:
+            return "Couldn't get the bill details — try: 'new bill Citi $800 due 25 May'."
         name = parsed.get("name", "")
         bank = parsed.get("bank", "")
         due_date_str = parsed.get("due_date", "")

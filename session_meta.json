@@ -1,8 +1,8 @@
 {
   "date": "2026-05-15",
-  "session": "Session 30",
-  "built": "merchant map dedup on save",
-  "fixed": "",
-  "pending": "S27 test checklist \u00b7 full audit S31",
-  "deploy_count": 21
+  "session": "Session 31",
+  "built": "force_confirm on all photo receipts \u00b7 personal_drive_service for uploads \u00b7 OAUTH_DRIVE_OK gate + boot test \u00b7 alert_error helper \u00b7 DD-MM-YYYY receipt filenames \u00b7 bills/restaurants Claude call error handling \u00b7 stale receipt session age check enabled \u00b7 todo_disambig cleared on session reset \u00b7 parse_reschedule wrapped \u00b7 crm import json moved to top",
+  "fixed": "C1 C2 C3 C4 C5 C6 H3 H4 H5 H6 H7 H8 H13 \u2014 all critical and high routing/session fixes",
+  "pending": "Medium/low findings deferred",
+  "deploy_count": 22
 }

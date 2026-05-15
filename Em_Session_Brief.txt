@@ -1,6 +1,6 @@
 # Em Session Brief
 _Session start: send "start session" — Claude pulls brief from Drive automatically._
-**Last updated: 14/05/2026 — Session 29**
+**Last updated: 15/05/2026 — Session 31**
 
 ---
 
@@ -21,6 +21,8 @@ R7: Cache hierarchy: in-memory → cached sheet → live sheet → external API.
 R8: Every branch sets reply or returns. Empty reply is a bug.
 R9: Verify with `python3 -c "import <module>"` after edits, not just ast.parse.
 R10: View surrounding lines after any str_replace touching class/function boundaries.
+R11: Every except block must send a user-facing Telegram message — never swallow silently.
+R12: Every sheet field read must be cast to str() before string operations.
 
 ---
 
@@ -29,10 +31,12 @@ R10: View surrounding lines after any str_replace touching class/function bounda
 - **Birthday pending:** Never wiped by 2pm job. Only cleared on explicit sent/skip or midnight.
 - **Trip setup:** Single-message Haiku parse. Stale \_trip\_setup expired on boot (>6h).
 - **Todos:** Complete → struck task + remaining list in one message (MarkdownV2).
-- **Sessions age check:** receipt\_confirm\_sessions drops sessions >6h old on restore. Enabled S29.
+- **Sessions age check:** receipt\_confirm\_sessions drops sessions >6h old on restore. Enabled S29. Re-confirmed active S31.
 - **Receipt uploads:** Personal OAuth2 via personal\_drive\_service (clients.py). Service account has no storage quota on personal Drive. state.OAUTH\_DRIVE\_OK flag set on boot. Boot alert if broken. reauth.py refreshes token.
 - **OAuth token:** GOOGLE\_OAUTH\_TOKEN env var in Railway (base64 token.json). client\_secrets.json and token.json are gitignored — never commit.
-- **Receipt flow:** Photo → upload Em Receipts/YYYY-MM/DD-MM-YYYY-merchant.jpg → vision parse → confirmation always shown → log on yes.
+- **Receipt flow:** Photo → upload Em Receipts/YYYY-MM/DD-MM-YYYY-merchant.jpg → vision parse → confirmation ALWAYS shown (yes / save only / split / edit) → log on yes.
+- **force_confirm:** Photos always pass force_confirm=True to handle_expense_text — bypasses auto-log even for known merchants. Implemented S31.
+- **alert_error:** Shared async helper in helpers.py — sends Telegram message on silent failures in critical paths. Uses state._app_ref. Never raises.
 - **GitHub fetch:** All module files fetched via `https://raw.githubusercontent.com/roystenteng21/telegram-claude-bot/main/<file>.py`. Em Codes Drive folder retired.
 
 ---
@@ -43,6 +47,7 @@ R10: View surrounding lines after any str_replace touching class/function bounda
 - No Silent Changes: architectural changes logged to Dev Notes immediately.
 - Circular Import Zero Tolerance: restructure, never workaround.
 - Secret Files Rule: client\_secrets.json and token.json gitignored, never committed.
+- Silent Failure Rule: every except block must send a user-facing message. Never print-only.
 
 ---
 
@@ -61,8 +66,9 @@ python3 ~/telegram-claude-bot/deploy.py "commit msg" "Session N" "built" "fixed"
 Never commit token.json or client_secrets.json.
 
 ## OAuth Token Refresh
-1. `python3 ~/telegram-claude-bot/reauth.py` → browser login → copy base64 string
-2. Railway → Variables → update `GOOGLE_OAUTH_TOKEN` → redeploy
+1. `rm ~/telegram-claude-bot/token.json` (delete old token first)
+2. `python3 ~/telegram-claude-bot/reauth.py` → browser login → copy base64 string
+3. Railway → Variables → update `GOOGLE_OAUTH_TOKEN` → redeploy
 
 ---
 
@@ -73,7 +79,7 @@ Never commit token.json or client_secrets.json.
 | clients | clients.py | 1 | gc, spreadsheet, drive\_service, personal\_drive\_service, Anthropic client |
 | state | state.py | 1 | All session dicts, caches, OAUTH\_DRIVE\_OK, DRIVE\_FOLDERS |
 | sheets | sheets.py | 2 | Sheet accessors, setup\_sheets, em log ops |
-| helpers | helpers.py | 3 | format\_date, send\_safe, looks\_like\_new\_intent |
+| helpers | helpers.py | 3 | format\_date, send\_safe, looks\_like\_new\_intent, alert\_error |
 | crm | crm.py | 4 | Contacts, notes, followups, birthdays |
 | expenses | expenses.py | 4 | Expense logging, merchant memory, cards, receipt confirm |
 | fx | fx.py | 4 | FX rates, manual rate input |
@@ -92,16 +98,46 @@ Never commit token.json or client_secrets.json.
 
 ---
 
-## Last Session (S29 — 14/05/2026)
-**Built:** Receipt upload to Drive via personal OAuth2 (Em Receipts/YYYY-MM/DD-MM-YYYY-merchant.jpg) · OAuth boot health check + Telegram alert · reauth.py · personal\_drive\_service · state.OAUTH\_DRIVE\_OK
-**Fixed:** expenses.py receipt always forces confirmation + edit prompt improved · config.py/infrastructure.py hardcoded defaults removed · sessions.py age check enabled · routing.py receipt filename DD-MM-YYYY · security audit (20 modules, 2 findings fixed) · repo made public, GitHub fetch standard
-**Pending:** S27 test checklist · bills boot error (`strptime() argument 1 must be str, not int`) · rotate OAuth client secret after deleting this chat
+## Last Session (S31 — 15/05/2026)
+**Built:** force\_confirm=True on all photo receipts (vision + caption paths) · personal\_drive\_service added to clients.py (_LazyPersonalDrive using GOOGLE\_OAUTH\_TOKEN) · OAUTH\_DRIVE\_OK flag in state.py · OAUTH\_DRIVE\_OK gate on receipt upload in routing.py · boot OAuth test in infrastructure.py (_test\_oauth\_drive) · Telegram alert on upload failure · DD-MM-YYYY receipt filename format · alert\_error async helper in helpers.py (wired to receipt upload, log\_expense, check\_and\_fire\_reminders, send\_birthday\_reminders) · stale receipt session age check re-enabled in sessions.py (was commented out) · todo\_disambig\_sessions added to clear\_all\_sessions · parse\_reschedule\_request Claude call wrapped in try/except · import json moved to top of crm.py (was at bottom, caused \_\_import\_\_ hacks) · edit last expense routing fixed (trailing space bug) · OAUTH\_DRIVE\_OK shown in em status output · Full S31 codebase audit (40 findings across all 20 modules)
+**Fixed:** C1 stale session guard · C2/H6 force\_confirm never implemented · C3/H1/H2 personal\_drive\_service missing entirely · C4 crm.py import json position · C5 bills.py unwrapped Claude call · C6 restaurants.py unwrapped Claude call · H3 wrong filename format · H4 missing OAUTH gate · H5 missing OAUTH\_DRIVE\_OK flag · H7 todo\_disambig not cleared · H8 reminders reschedule unwrapped · H13 edit last expense routing
+**Pending:** S27 test checklist · Deploy S31 files (not yet deployed — handoff before deploy confirmed)
 
 ---
 
 ## Open Backlog
-- Bills boot error: `strptime() argument 1 must be str, not int` in check\_missed\_items\_on\_startup
 - S27 test checklist not run
+- S31 files built but NOT YET DEPLOYED — deploy on next session start
+- Medium/low audit findings deferred (H9–H14, M1–M11, L1–L9) — see S31 audit report
+
+---
+
+## S31 Audit — Deferred Findings
+These were audited in S31 but not fixed. Address in future sessions:
+
+**Medium:**
+- M1 — sessions.py: _AutoPersistDict._timer is a class variable (shared across instances)
+- M2 — routing.py: startup missed followup check fires for ALL overdue, not just offline period
+- M3 — cal.py: get_calendar double-attempt swallows first exception silently
+- M4 — trips.py: _activate_overseas doesn't check if overseas already active (duplicate trip rows)
+- M5 — routing.py: market_summary_pending keyed by user_id but set with YOUR_CHAT_ID
+- M6 — fx.py: refresh_fx_rates only refreshes overseas currencies
+- M7 — stocks.py/sessions.py: recon_sessions has no timeout and not in clear_all_sessions
+- M8 — routing.py/infrastructure.py: receipts folder lookup can diverge (DRIVE_FOLDERS vs env var)
+- M9 — meetings.py: always uses Sonnet regardless of note length
+- M10 — routing.py: trip setup silent drop on new intent — no user message
+- M11 — infrastructure.py: run_infrastructure_setup blocks event loop on boot
+
+**Low:**
+- L1 — helpers.py: generate_reminder_id seconds-precision (collision within same second)
+- L2 — helpers.py: generate_trip_id date-only (collision if two trips same day)
+- L3 — crm.py: ensure_birthday_greeted_column is a no-op (dead code)
+- L4 — sheets.py: sheets_call_with_retry defined but never called (dead code)
+- L5 — routing.py: FIXED in S31 (edit last expense trailing space)
+- L6 — expenses.py: get_expense_report ignores report_type parameter
+- L7 — stocks.py: suggest_stocks Claude call has no try/except
+- L8 — bot.py: refresh_fx_rates scheduler jobs pass no args (works but inconsistent)
+- L9 — crm.py: redundant global state in send_birthday_reminders
 
 ---
 
