@@ -2,9 +2,9 @@
   "date": "2026-05-16",
   "session": "Session 32",
   "built": "",
-  "fixed": "",
+  "fixed": "iCloud hanging on Railway \u2014 added 10s timeout",
   "pending": "",
-  "deploy_count": 34,
+  "deploy_count": 35,
   "module_count": 25,
   "modules": [
     "bills.py",
