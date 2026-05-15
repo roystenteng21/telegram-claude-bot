@@ -1,8 +1,8 @@
 {
   "date": "2026-05-16",
-  "session": "Session 31",
-  "built": "none",
-  "fixed": "bills Due Date str() cast in check_missed_items_on_startup",
-  "pending": "none",
-  "deploy_count": 23
+  "session": "Session 32",
+  "built": "",
+  "fixed": "iCloud app-specific password rotated",
+  "pending": "",
+  "deploy_count": 24
 }
