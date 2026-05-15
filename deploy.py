@@ -2,7 +2,7 @@
 """
 deploy.py — Em deployment script
 Usage: python3 ~/telegram-claude-bot/deploy.py "commit msg" "Session N" "built" "fixed" "pending"
-- Copies all 20 module files from ~ to ~/telegram-claude-bot/
+- Auto-detects all module .py files in repo (excludes non-module files)
 - Writes session_meta.json to repo (Railway reads this on boot to update Em Log + Module Registry)
 - Commits and pushes to GitHub
 - Railway auto-deploys on push
@@ -14,32 +14,28 @@ import json
 import subprocess
 from datetime import date
 
-# All 20 module files (flat, same directory)
-MODULE_FILES = [
-    "config.py",
-    "clients.py",
-    "state.py",
-    "sheets.py",
-    "helpers.py",
-    "crm.py",
-    "expenses.py",
-    "fx.py",
-    "reminders.py",
-    "cal.py",
-    "todos.py",
-    "meetings.py",
-    "bills.py",
-    "restaurants.py",
-    "stocks.py",
-    "trips.py",
-    "sessions.py",
-    "routing.py",
-    "infrastructure.py",
-    "bot.py",
-]
-
 REPO_DIR = os.path.expanduser("~/telegram-claude-bot")
 SESSION_META_PATH = os.path.join(REPO_DIR, "session_meta.json")
+
+# Files that live in the repo but are not Em modules
+NON_MODULE_FILES = {
+    "deploy.py",
+    "reauth.py",
+    "session_meta.json",
+    "requirements.txt",
+    "Procfile",
+    "runtime.txt",
+    ".env",
+}
+
+
+def get_module_files():
+    """Auto-detect all .py module files in the repo directory."""
+    files = []
+    for f in sorted(os.listdir(REPO_DIR)):
+        if f.endswith(".py") and f not in NON_MODULE_FILES and not f.startswith("."):
+            files.append(f)
+    return files
 
 
 def run(cmd, cwd=None):
@@ -54,16 +50,17 @@ def run(cmd, cwd=None):
     return result.stdout.strip()
 
 
-def copy_modules():
-    missing = [f for f in MODULE_FILES if not os.path.exists(os.path.join(REPO_DIR, f))]
-    if missing:
-        print(f"⚠️  Missing from repo: {', '.join(missing)}")
-    else:
-        print(f"✅ All {len(MODULE_FILES)} module files present in repo")
+def check_modules():
+    """Detect and report all module files. Abort if none found."""
+    modules = get_module_files()
+    if not modules:
+        print("❌ No module files found in repo — aborting.")
+        sys.exit(1)
+    print(f"✅ {len(modules)} module files detected: {', '.join(modules)}")
+    return modules
 
 
 def _read_deploy_count():
-    """Read current deploy_count from session_meta.json, defaulting to 0."""
     try:
         if os.path.exists(SESSION_META_PATH):
             with open(SESSION_META_PATH) as f:
@@ -74,8 +71,7 @@ def _read_deploy_count():
     return 0
 
 
-def write_session_meta(session_name, built, fixed, pending):
-    """Write session_meta.json to repo. Railway reads this on boot."""
+def write_session_meta(session_name, built, fixed, pending, modules):
     deploy_count = _read_deploy_count() + 1
     meta = {
         "date": date.today().strftime("%Y-%m-%d"),
@@ -84,6 +80,8 @@ def write_session_meta(session_name, built, fixed, pending):
         "fixed": fixed,
         "pending": pending,
         "deploy_count": deploy_count,
+        "module_count": len(modules),
+        "modules": modules,
     }
     with open(SESSION_META_PATH, "w") as f:
         json.dump(meta, f, indent=2)
@@ -142,8 +140,8 @@ def main():
     print(f"\n🚀 Deploying Em — {session_name}")
     print(f"   Commit: {commit_msg}\n")
 
-    copy_modules()
-    write_session_meta(session_name, built, fixed, pending)
+    modules = check_modules()
+    write_session_meta(session_name, built, fixed, pending, modules)
     pushed = git_commit_push(commit_msg)
     commit_hash = get_commit_hash()
 
@@ -152,7 +150,7 @@ def main():
         print("   Railway will restart Em in ~30 seconds.")
         print("   Em Log + Module Registry will update automatically on boot.")
     else:
-        print(f"\n✅ Files copied. No new commit (files unchanged).")
+        print(f"\n✅ Files ready. No new commit (files unchanged).")
 
 
 if __name__ == "__main__":
