@@ -1,8 +1,8 @@
 {
-  "date": "2026-05-14",
+  "date": "2026-05-15",
   "session": "Session 30",
-  "built": "receipt save only split",
-  "fixed": "bills boot strptime fix",
+  "built": "receipt upload personal_drive_service, force confirm photos, edit card fix, silent failure alert",
+  "fixed": "bills boot strptime",
   "pending": "S27 test checklist",
-  "deploy_count": 19
+  "deploy_count": 20
 }

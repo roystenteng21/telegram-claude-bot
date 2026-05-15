@@ -11,7 +11,7 @@ from config import (
     EXPENSE_CATEGORIES, EXPENSE_CARDS, YOUR_CHAT_ID, TIMEZONE,
     AVIATIONSTACK_API_KEY
 )
-from clients import client, drive_service
+from clients import client, drive_service, personal_drive_service
 from sheets import get_sheet, get_pending_backlog, append_bug_to_backlog
 from helpers import send_safe, looks_like_new_intent, format_date
 from crm import (
@@ -243,23 +243,26 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         drive_file_id = ""
         today_obj = date.today()
         month_folder_name = today_obj.strftime("%Y-%m")
-        today_str = today_obj.strftime("%Y-%m")
-        try:
-            from googleapiclient.http import MediaIoBaseUpload
-            receipts_root = state.DRIVE_FOLDERS.get("receipts", "")
-            if receipts_root:
-                month_folder_id = get_or_create_drive_folder(month_folder_name, receipts_root)
-                temp_name = f"{today_str}-receipt-{photo.file_id[:8]}.jpg"
-                media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
-                file_meta = {"name": temp_name, "parents": [month_folder_id]}
-                uploaded = drive_service.files().create(
-                    body=file_meta, media_body=media, fields="id,webViewLink",
-                    supportsAllDrives=True
-                ).execute()
-                drive_file_id = uploaded.get("id", "")
-                receipt_link = uploaded.get("webViewLink", "")
-        except Exception as e:
-            print(f"Receipt upload error: {e}")
+        today_str = today_obj.strftime("%d-%m-%Y")
+        if not state.OAUTH_DRIVE_OK:
+            await update.message.reply_text("⚠️ Receipt upload is unavailable — OAuth not configured. Continuing without saving to Drive.")
+        else:
+            try:
+                from googleapiclient.http import MediaIoBaseUpload
+                receipts_root = state.DRIVE_FOLDERS.get("receipts", "")
+                if receipts_root:
+                    month_folder_id = get_or_create_drive_folder(month_folder_name, receipts_root)
+                    temp_name = f"{today_str}-receipt-{photo.file_id[:8]}.jpg"
+                    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
+                    file_meta = {"name": temp_name, "parents": [month_folder_id]}
+                    uploaded = personal_drive_service.files().create(
+                        body=file_meta, media_body=media, fields="id,webViewLink"
+                    ).execute()
+                    drive_file_id = uploaded.get("id", "")
+                    receipt_link = uploaded.get("webViewLink", "")
+            except Exception as e:
+                print(f"Receipt upload error: {e}")
+                await update.message.reply_text(f"⚠️ Receipt upload failed — continuing without Drive save. ({type(e).__name__}: {str(e)[:80]})")
 
         def rename_receipt_in_drive(merchant_name):
             if not drive_file_id or not merchant_name:
@@ -267,8 +270,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 safe_merchant = re.sub(r"[^a-zA-Z0-9\-_]", "", merchant_name.replace(" ", "-").lower())
                 new_name = f"{today_str}-{safe_merchant}.jpg"
-                drive_service.files().update(
-                    fileId=drive_file_id, body={"name": new_name}, supportsAllDrives=True
+                personal_drive_service.files().update(
+                    fileId=drive_file_id, body={"name": new_name}
                 ).execute()
             except Exception as e:
                 print(f"Receipt rename error: {e}")
@@ -306,7 +309,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     merchant_v, amount_v, currency_v = parts
                     rename_receipt_in_drive(merchant_v)
                     synthesized = f"{merchant_v} {amount_v} {currency_v}"
-                    reply, needs_session, session_data = handle_expense_text(synthesized, user_id, receipt_link=receipt_link)
+                    reply, needs_session, session_data = handle_expense_text(synthesized, user_id, receipt_link=receipt_link, force_confirm=True)
                     if needs_session and session_data:
                         state.expense_sessions[user_id] = session_data
                     if reply:
@@ -322,7 +325,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             parsed = parse_expense_text(caption)
             if parsed and parsed.get("merchant"):
                 rename_receipt_in_drive(parsed["merchant"])
-            reply, needs_session, session_data = handle_expense_text(caption, user_id, receipt_link=receipt_link)
+            reply, needs_session, session_data = handle_expense_text(caption, user_id, receipt_link=receipt_link, force_confirm=True)
             if needs_session and session_data:
                 state.expense_sessions[user_id] = session_data
             if reply:
@@ -820,7 +823,11 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = search_contacts(text[7:])
 
     elif (lower.startswith("edit ") and not lower.startswith("edit last expense")
-          and not lower.startswith("edit expense")):
+          and not lower.startswith("edit expense")
+          and not lower.startswith("edit card")
+          and not lower.startswith("edit category")
+          and not lower.startswith("edit merchant")
+          and not lower.startswith("edit amount")):
         name = text[5:].strip()
         _, record = find_row(name)
         if not record:
@@ -1035,7 +1042,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = list_reminders()
         else:
             reply = list_todos()
-    elif lower.startswith("edit last expense ") or lower.startswith("edit expense "):
+    elif lower.startswith("edit last expense ") or lower.startswith("edit expense ") or re.match(r"edit (card|category|merchant|amount)\s+", lower):
         edit_text = re.sub(r"^edit (?:last )?expense\s+", "", text, flags=re.IGNORECASE).strip()
         if edit_text:
             reply = edit_last_expense(edit_text)
