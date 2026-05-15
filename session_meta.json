@@ -1,10 +1,10 @@
 {
   "date": "2026-05-16",
   "session": "Session 32",
-  "built": "deploy.py auto-detects modules",
-  "fixed": "handlers.py missing from deploy, calendar write silent crash",
+  "built": "",
+  "fixed": "get_calendar blocking event loop \u2014 wrapped in asyncio.to_thread",
   "pending": "",
-  "deploy_count": 31,
+  "deploy_count": 32,
   "module_count": 25,
   "modules": [
     "bills.py",

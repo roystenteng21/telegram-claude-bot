@@ -211,17 +211,18 @@ def format_calendar_confirm(parsed):
 # Write event to iCloud
 # ---------------------------------------------------------------------------
 
-def write_calendar_event(parsed):
+async def write_calendar_event(parsed):
     """Write a parsed event dict to iCloud. Returns success/error string."""
+    import asyncio
     try:
         start = datetime.strptime(parsed["start"], "%d %b %Y %H:%M")
         end = datetime.strptime(parsed["end"], "%d %b %Y %H:%M")
     except Exception as e:
         return f"❌ Date parse error: {e}"
 
-    calendar = get_calendar(parsed.get("calendar", "Personal"))
+    calendar = await asyncio.to_thread(get_calendar, parsed.get("calendar", "Personal"))
     if not calendar:
-        calendar = get_calendar("Personal")
+        calendar = await asyncio.to_thread(get_calendar, "Personal")
     if not calendar:
         return "⚠️ Couldn't connect to iCloud Calendar — check credentials in Railway."
 
@@ -237,7 +238,7 @@ def write_calendar_event(parsed):
         f"{notes_line}"
         "END:VEVENT\nEND:VCALENDAR"
     )
-    calendar.add_event(ics)
+    await asyncio.to_thread(calendar.add_event, ics)
 
     try:
         start_fmt = f"{start.strftime('%a %d %b %Y')}, {start.strftime('%I:%M%p').lstrip('0').lower()} – {end.strftime('%I:%M%p').lstrip('0').lower()}"
@@ -353,16 +354,17 @@ For calendar, match from: {', '.join(KNOWN_CALENDARS)}"""
 # Get events
 # ---------------------------------------------------------------------------
 
-def get_events(days=1):
+async def get_events(days=1):
+    import asyncio
     if not _credentials_ok():
         return _no_credentials_msg()
     try:
-        calendar = get_calendar("Personal")
+        calendar = await asyncio.to_thread(get_calendar, "Personal")
         if not calendar:
             return "⚠️ Couldn't connect to iCloud Calendar — check credentials in Railway."
         start = datetime.now()
         end = start + timedelta(days=days)
-        events = calendar.date_search(start=start, end=end)
+        events = await asyncio.to_thread(calendar.date_search, start=start, end=end)
         if not events:
             label = "today" if days == 1 else "this week"
             return f"📅 No events {label}"
@@ -385,17 +387,18 @@ def get_events(days=1):
 # Delete calendar event — find + confirm, no immediate delete
 # ---------------------------------------------------------------------------
 
-def find_upcoming_events(title_query):
+async def find_upcoming_events(title_query):
     """Search upcoming events matching title. Returns list of (event_obj, summary, start_dt)."""
+    import asyncio
     if not _credentials_ok():
         return None, _no_credentials_msg()
     try:
-        calendar = get_calendar()
+        calendar = await asyncio.to_thread(get_calendar)
         if not calendar:
             return None, "⚠️ Couldn't connect to iCloud Calendar — check credentials in Railway."
         start = datetime.now()
         end = start + timedelta(days=365)
-        events = calendar.date_search(start=start, end=end)
+        events = await asyncio.to_thread(calendar.date_search, start=start, end=end)
         matches = []
         for event in events:
             e = event.vobject_instance.vevent
@@ -408,21 +411,22 @@ def find_upcoming_events(title_query):
         return None, f"⚠️ Calendar error: {str(e)}"
 
 
-def delete_calendar_event(title):
+async def delete_calendar_event(title):
     """Kept for confirm_session action compatibility — deletes by stored event obj."""
+    import asyncio
     if not _credentials_ok():
         return _no_credentials_msg()
     try:
-        calendar = get_calendar()
+        calendar = await asyncio.to_thread(get_calendar)
         if not calendar:
             return "❌ Could not connect to iCloud Calendar"
         start = datetime.now()
         end = start + timedelta(days=365)
-        events = calendar.date_search(start=start, end=end)
+        events = await asyncio.to_thread(calendar.date_search, start=start, end=end)
         for event in events:
             e = event.vobject_instance.vevent
             if title.lower() in str(e.summary.value).lower():
-                event.delete()
+                await asyncio.to_thread(event.delete)
                 return f"✅ *{str(e.summary.value)}* deleted"
         return f"❌ No upcoming event found matching '{title}'"
     except Exception as e:

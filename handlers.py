@@ -69,7 +69,7 @@ async def handle_calendar_confirm_session(user_id, text, lower, update):
                 _, summary, _ = matches[idx]
                 del state.calendar_confirm_sessions[user_id]
                 state.session_timestamps.pop(user_id, None)
-                reply = delete_calendar_event(summary)
+                reply = await delete_calendar_event(summary)
                 await send_safe(update.message, reply, parse_mode="Markdown")
             else:
                 await update.message.reply_text(f"Pick a number between 1 and {len(matches)}.")
@@ -86,7 +86,7 @@ async def handle_calendar_confirm_session(user_id, text, lower, update):
         del state.calendar_confirm_sessions[user_id]
         state.session_timestamps.pop(user_id, None)
         try:
-            reply = write_calendar_event(cs["parsed"])
+            reply = await write_calendar_event(cs["parsed"])
             await send_safe(update.message, reply, parse_mode="Markdown")
         except Exception as e:
             await update.message.reply_text(f"⚠️ Couldn't save to iCloud Calendar: {type(e).__name__}: {str(e)[:100]}")
@@ -325,7 +325,7 @@ async def handle_confirm_session(user_id, text, lower, update):
         elif action == "delete_restaurant":
             reply = delete_restaurant(args[0])
         elif action == "delete_event":
-            reply = delete_calendar_event(args[0])
+            reply = await delete_calendar_event(args[0])
         else:
             reply = "Done."
         await send_safe(update.message, reply, parse_mode="Markdown")

@@ -486,7 +486,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── Calendar — cal trigger ────────────────────────────────────────────────
     if lower.startswith("cal delete "):
         event_query = text[11:].strip()
-        matches, err = find_upcoming_events(event_query)
+        matches, err = await find_upcoming_events(event_query)
         if err:
             reply = err
         elif not matches:
@@ -928,12 +928,12 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── Calendar (read + legacy create) ──────────────────────────────────────
     elif lower == "events today":
-        reply = get_events(1)
+        reply = await get_events(1)
     elif lower == "events week":
-        reply = get_events(7)
+        reply = await get_events(7)
     elif lower.startswith("delete event "):
         event_query = text[13:].strip()
-        matches, err = find_upcoming_events(event_query)
+        matches, err = await find_upcoming_events(event_query)
         if err:
             reply = err
         elif not matches:
@@ -1059,7 +1059,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         "calendar today", "calendar tomorrow",
         "show my calendar", "what's happening today", "what's happening tomorrow",
     ]):
-        reply = get_events(7 if "week" in lower else 1)
+        reply = await get_events(7 if "week" in lower else 1)
 
     elif is_calendar_request(text):
         reply = smart_add_event(text, user_id)
