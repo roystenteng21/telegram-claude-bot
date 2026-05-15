@@ -1420,7 +1420,7 @@ async def check_missed_items_on_startup(app):
             ws = bills_sheet()
             records = ws.get_all_records()
             for r in records:
-                due_str = r.get("Due Date", "")
+                due_str = str(r.get("Due Date", ""))
                 if not due_str:
                     continue
                 due_date = None
