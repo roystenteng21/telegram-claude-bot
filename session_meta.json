@@ -4,5 +4,5 @@
   "built": "",
   "fixed": "alert_error import crash in handlers.py, silent calendar write failure",
   "pending": "",
-  "deploy_count": 26
+  "deploy_count": 27
 }

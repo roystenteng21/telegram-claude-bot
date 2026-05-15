@@ -185,7 +185,7 @@ async def send_safe(target, text, parse_mode=None):
         chunks.append(current)
     for chunk in chunks:
         try:
-            await chunk.reply_text(chunk, parse_mode=parse_mode)
+            await target.reply_text(chunk, parse_mode=parse_mode)
         except Exception:
             await target.reply_text(chunk)
 
