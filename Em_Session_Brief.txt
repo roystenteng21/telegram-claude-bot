@@ -1,6 +1,6 @@
 # Em Session Brief
 _Session start: send "start session" — Claude pulls brief from Drive automatically._
-**Last updated: 16/05/2026 — Session 32**
+**Last updated: 17/05/2026 — Session 33**
 
 ---
 
@@ -38,13 +38,13 @@ R14: deploy.py auto-detects all .py module files — never hardcode module lists
 - **OAuth token:** GOOGLE\_OAUTH\_TOKEN env var in Railway (base64 token.json). client\_secrets.json and token.json are gitignored — never commit.
 - **Receipt flow:** Photo → upload Em Receipts/YYYY-MM/DD-MM-YYYY-merchant.jpg → vision parse → confirmation ALWAYS shown (yes / save only / split / edit) → log on yes.
 - **force_confirm:** Photos always pass force_confirm=True to handle_expense_text — bypasses auto-log even for known merchants. Implemented S31.
-- **alert_error:** Shared async helper in helpers.py — sends Telegram message on silent failures in critical paths. Uses state._app_ref. Never raises. Also fires on Claude fallback to alert routing gaps.
-- **handlers.py:** New Layer 5.5 module. Owns all session handler logic extracted from routing.py. routing.py delegates to it via await calls. Never import routing.py from handlers.py.
+- **alert_error:** Shared async helper in helpers.py — sends Telegram message on silent failures in critical paths. Uses state._app_ref. Never raises. Also fires on Claude fallback to alert routing gaps (scoped to feature-signal messages only — not casual conversation).
+- **handlers.py:** Layer 5.5 module. Owns all session handler logic extracted from routing.py. routing.py delegates to it via await calls. Never import routing.py from handlers.py.
 - **Calendar trigger:** `cal [title] [calendar] [date] [time] [location]` — parses via Haiku with pre-computed date anchors, shows confirmation, writes on yes. `cal delete [title]` — finds upcoming event, confirms before delete.
-- **Calendar sessions:** calendar_confirm_sessions in state.py. Inline edit supported (e.g. "change time to 2pm"). All iCloud ops async via asyncio.to_thread().
+- **Calendar sessions:** calendar_confirm_sessions in state.py. Inline edit supported (e.g. "change time to 2pm"). All Google Calendar ops async via asyncio.to_thread().
+- **Calendar backend:** Google Calendar API (service account). caldav/iCloud removed — Apple blocks PUT writes from Railway IPs. Calendar IDs hardcoded in cal.py. Service object cached at module level.
 - **Calendar date resolution:** Relative dates (next Friday, tomorrow, etc.) pre-computed in Python and injected into Haiku prompt — never left to model inference. Year always injected explicitly.
-- **iCloud CalDAV on Railway:** UNRESOLVED — CalDAV connections hang indefinitely from Railway's network despite asyncio.to_thread() and 10s timeout. Local connections work fine. Root cause unknown — may be Railway blocking outbound CalDAV or iCloud rate-limiting Railway IPs. Needs investigation next session.
-- **Routing fallback alert:** Claude fallback now fires alert_error with the message that fell through — visible in Telegram for routing gap detection.
+- **Routing fallback alert:** Claude fallback fires alert_error only when message contains feature signals — not on casual conversation like "hi em".
 - **GitHub fetch:** All module files fetched via `https://raw.githubusercontent.com/roystenteng21/telegram-claude-bot/main/<file>.py`. Em Codes Drive folder retired.
 
 ---
@@ -93,7 +93,7 @@ deploy.py now auto-detects all .py files in repo — no hardcoded list. NON_MODU
 | expenses | expenses.py | 4 | Expense logging, merchant memory, cards, receipt confirm |
 | fx | fx.py | 4 | FX rates, manual rate input |
 | reminders | reminders.py | 4 | Reminder add/fire/reschedule |
-| calendar | cal.py | 4 | iCloud calendar read/write — all ops async via asyncio.to\_thread() |
+| calendar | cal.py | 4 | Google Calendar API read/write — service cached, all ops async via asyncio.to\_thread() |
 | todos | todos.py | 4 | Todo add/complete/delete/list |
 | meetings | meetings.py | 4 | Meeting recap session, note processing |
 | bills | bills.py | 4 | Bill add/list/remind |
@@ -108,16 +108,26 @@ deploy.py now auto-detects all .py files in repo — no hardcoded list. NON_MODU
 
 ---
 
-## Last Session (S32 — 16/05/2026)
-**Built:** handlers.py (Layer 5.5) — all session logic extracted from routing.py · calendar feature rewrite: cal/cal delete triggers, confirmation before write, programmatic date resolution, inline edit, asyncio.to\_thread() for all iCloud ops · calendar\_confirm\_sessions in state.py · alert\_error in helpers.py (was missing from deployed code) · routing fallback alert · deploy.py rewritten to auto-detect modules (no hardcoded list) · DAVClient timeout=10s added · debug MSG print in routing.py (temporary — remove next session)
-**Fixed:** iCloud app-specific password expired (regenerated) · alert\_error missing from helpers.py · handlers.py missing from repo (deploy.py now auto-detects) · calendar date hallucination (programmatic anchors) · blocking iCloud calls in async context (asyncio.to\_thread) · routing.py session bloat (handlers.py split)
-**Pending:** iCloud CalDAV on Railway UNRESOLVED — connections hang despite asyncio.to\_thread + timeout · debug MSG print in routing.py needs removal · remove test_icloud.py from repo · S27 test checklist not run · Medium/low audit findings deferred
+## Last Session (S33 — 17/05/2026)
+**Built:** Google Calendar API backend replacing caldav entirely · cal.py rewritten: CALENDAR_IDS map, service account auth, _get_service cached at module level, smart_add_event async, parse_calendar_request wrapped in asyncio.to_thread, apply_calendar_edit async · routing.py: calendar_confirm_sessions handler added, SESSION_REPLY_WORDS guard on interrupt check, routing fallback alert scoped to feature signals, debug print removed, get_calendar removed · handlers.py: apply_calendar_edit awaited, iCloud error message updated · requirements.txt: caldav removed
+**Fixed:** iCloud CalDAV write hang on Railway (Apple blocks PUT from Railway IPs) · false routing fallback alerts on casual messages · calendar edit no response (sync blocking call) · routing fallback alert false positives
+**Pending:** Calendar `yes` still not responding after deploy — Railway logs show no output after yes, deployed routing.py may still be old version (fetch from GitHub to confirm on next session start) · test_icloud.py still in repo · S27 test checklist not run · bills strptime crash · Medium/low audit findings deferred
+
+---
+
+## Google Calendar IDs (hardcoded in cal.py)
+- Personal: 094cd89eb5d2892c0a8c8a010705d5579b0f138de525eb9f4af504891100768b@group.calendar.google.com
+- Appointment: 28d3e5cc311ff0fb3db2c7e3ea179bdef7e8c4344521c94db05343d4c015e1e6@group.calendar.google.com
+- Work Meeting: 13be3f7c21c5c948b78f766de1b1c5f07f1fee3af7d6569fc35be8726abeef72@group.calendar.google.com
+- Estate Planning: 288badc142d88a5535d2c256a55a85b014e27a7dcd59a01cd7a401289d1b0522@group.calendar.google.com
+- Closing: 0c29a7d3c34c0b2239a9e0a35e061b8ed06f7dfb5d18036bdd58106959f49541@group.calendar.google.com
+- Urgent: c4fb92c5b60367040fd5a00702fd5416dd1d9b3d2b4fbdffcda1ce3adcd35349@group.calendar.google.com
+- Service account: claude-crm@claude-crm-bot.iam.gserviceaccount.com
 
 ---
 
 ## Open Backlog
-- **CRITICAL:** iCloud CalDAV unreachable from Railway — calendar write/read hangs. Investigate: Railway outbound firewall, iCloud IP blocking, alternative approach (Google Calendar API, local proxy). Currently calendar feature is non-functional on Railway.
-- Remove debug `print(f"MSG from...")` from routing.py (added S32 for debugging)
+- **CRITICAL:** Calendar `yes` not responding — fetch routing.py from GitHub at session start to confirm deployed version
 - Remove test_icloud.py from repo
 - S27 test checklist not run
 - Bills sheet due date stored as int not str — strptime crash on boot (R12 violation, low priority)
@@ -168,4 +178,4 @@ These were audited in S31 but not fixed. Address in future sessions:
 ## Reference
 **Expense categories:** FnB · Transport · Entertainment · Personal · Family · Work · Shopping · Household · Travel
 **Cards:** Maybank (4002, FnB) · Citi (1176) · UOB (5372) · Amex (1008)
-**Key env vars:** TELEGRAM\_TOKEN · ANTHROPIC\_API\_KEY · SHEET\_ID · GOOGLE\_CREDENTIALS · GOOGLE\_OAUTH\_TOKEN · EM\_RECEIPTS\_FOLDER\_ID (14pG1lNPANRwehiW\_xSFjoHzt-AUk5-Xb) · YOUR\_CHAT\_ID · ICLOUD\_USERNAME · ICLOUD\_PASSWORD · ALPHA\_VANTAGE\_API\_KEY · AVIATIONSTACK\_API\_KEY · EXCHANGE\_RATE\_API\_KEY
+**Key env vars:** TELEGRAM\_TOKEN · ANTHROPIC\_API\_KEY · SHEET\_ID · GOOGLE\_CREDENTIALS · GOOGLE\_OAUTH\_TOKEN · EM\_RECEIPTS\_FOLDER\_ID (14pG1lNPANRwehiW\_xSFjoHzt-AUk5-Xb) · YOUR\_CHAT\_ID · ALPHA\_VANTAGE\_API\_KEY · AVIATIONSTACK\_API\_KEY · EXCHANGE\_RATE\_API\_KEY

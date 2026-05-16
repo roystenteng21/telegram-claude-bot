@@ -1,10 +1,10 @@
 {
   "date": "2026-05-17",
-  "session": "Session 33",
-  "built": "routing.py now includes calendar_confirm_sessions handler \u00b7 cal.py Google Calendar API with service cache \u00b7 smart_add_event async \u00b7 apply_calendar_edit async \u00b7 SESSION_REPLY_WORDS guard \u00b7 routing fallback alert scoped \u00b7 caldav removed",
-  "fixed": "yes after calendar confirm silently dropped \u2014 old routing.py was deployed throughout",
-  "pending": "test_icloud.py still in repo \u00b7 S27 test checklist not run \u00b7 bills strptime crash",
-  "deploy_count": 39,
+  "session": "Session 34",
+  "built": "cal.py Google Calendar rewrite, handlers.py calendar session, routing.py calendar_confirm_sessions, state.py calendar_confirm_sessions dict",
+  "fixed": "calendar yes not responding, old caldav version deployed",
+  "pending": "S27 test checklist, bills strptime crash, medium/low audit findings",
+  "deploy_count": 40,
   "module_count": 25,
   "modules": [
     "bills.py",
