@@ -513,7 +513,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = "\n".join(lines)
 
     elif lower.startswith("cal "):
-        reply = smart_add_event(text[4:].strip(), user_id)
+        reply = await smart_add_event(text[4:].strip(), user_id)
 
     # ── CRM ───────────────────────────────────────────────────────────────────
     elif lower.startswith("save restaurant "):
@@ -1066,7 +1066,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = await get_events(7 if "week" in lower else 1)
 
     elif is_calendar_request(text):
-        reply = smart_add_event(text, user_id)
+        reply = await smart_add_event(text, user_id)
 
     # ── Claude conversation fallback ──────────────────────────────────────────
     else:

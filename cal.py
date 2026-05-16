@@ -14,28 +14,33 @@ import os
 # ---------------------------------------------------------------------------
 
 CALENDAR_IDS = {
-    "Personal":       "094cd89eb5d2892c0a8c8a010705d5579b0f138de525eb9f4af504891100768b@group.calendar.google.com",
-    "Appointment":    "28d3e5cc311ff0fb3db2c7e3ea179bdef7e8c4344521c94db05343d4c015e1e6@group.calendar.google.com",
-    "Work Meeting":   "13be3f7c21c5c948b78f766de1b1c5f07f1fee3af7d6569fc35be8726abeef72@group.calendar.google.com",
-    "Estate Planning":"288badc142d88a5535d2c256a55a85b014e27a7dcd59a01cd7a401289d1b0522@group.calendar.google.com",
-    "Closing":        "0c29a7d3c34c0b2239a9e0a35e061b8ed06f7dfb5d18036bdd58106959f49541@group.calendar.google.com",
-    "Urgent":         "c4fb92c5b60367040fd5a00702fd5416dd1d9b3d2b4fbdffcda1ce3adcd35349@group.calendar.google.com",
-    "Appointment":    "28d3e5cc311ff0fb3db2c7e3ea179bdef7e8c4344521c94db05343d4c015e1e6@group.calendar.google.com",
+    "Personal":        "094cd89eb5d2892c0a8c8a010705d5579b0f138de525eb9f4af504891100768b@group.calendar.google.com",
+    "Appointment":     "28d3e5cc311ff0fb3db2c7e3ea179bdef7e8c4344521c94db05343d4c015e1e6@group.calendar.google.com",
+    "Work Meeting":    "13be3f7c21c5c948b78f766de1b1c5f07f1fee3af7d6569fc35be8726abeef72@group.calendar.google.com",
+    "Estate Planning": "288badc142d88a5535d2c256a55a85b014e27a7dcd59a01cd7a401289d1b0522@group.calendar.google.com",
+    "Closing":         "0c29a7d3c34c0b2239a9e0a35e061b8ed06f7dfb5d18036bdd58106959f49541@group.calendar.google.com",
+    "Urgent":          "c4fb92c5b60367040fd5a00702fd5416dd1d9b3d2b4fbdffcda1ce3adcd35349@group.calendar.google.com",
 }
 
 KNOWN_CALENDARS = list(CALENDAR_IDS.keys())
 
 # ---------------------------------------------------------------------------
-# Google Calendar service
+# Google Calendar service (cached — build() fetches discovery doc over HTTP)
 # ---------------------------------------------------------------------------
 
+_service_cache = None
+
 def _get_service():
+    global _service_cache
+    if _service_cache is not None:
+        return _service_cache
     creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS"])
     creds = service_account.Credentials.from_service_account_info(
         creds_json,
         scopes=["https://www.googleapis.com/auth/calendar"]
     )
-    return build("calendar", "v3", credentials=creds)
+    _service_cache = build("calendar", "v3", credentials=creds)
+    return _service_cache
 
 
 def _get_calendar_id(name):
@@ -215,12 +220,12 @@ async def write_calendar_event(parsed):
 # smart_add_event — parse + store in confirm session (no immediate write)
 # ---------------------------------------------------------------------------
 
-def smart_add_event(text, user_id):
+async def smart_add_event(text, user_id):
     try:
-        parsed = parse_calendar_request(text)
+        parsed = await asyncio.to_thread(parse_calendar_request, text)
     except json.JSONDecodeError:
         return "⚠️ Couldn't parse that — try: cal Branson appointment fri 10-12pm"
-    except Exception as e:
+    except Exception:
         return "⚠️ Couldn't parse that — try: cal Branson appointment fri 10-12pm"
 
     if not parsed.get("title") or not parsed.get("start"):
