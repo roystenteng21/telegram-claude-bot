@@ -1,11 +1,11 @@
 # Em Session Brief
 _Session start: send "start session" — Claude pulls brief from Drive automatically._
-**Last updated: 15/05/2026 — Session 31**
+**Last updated: 16/05/2026 — Session 32**
 
 ---
 
 ## Architecture
-20-module flat architecture. Import order (strict, no reverse): config → clients → state → sheets → helpers → feature modules → sessions → routing → infrastructure → bot.py. Only permitted cross-feature import: meetings→crm (one-way). routing.py is sole omnimporter.
+21-module flat architecture. Import order (strict, no reverse): config → clients → state → sheets → helpers → feature modules → sessions → handlers → routing → infrastructure → bot.py. Only permitted cross-feature import: meetings→crm (one-way). routing.py is sole omnimporter. handlers.py owns all session handler logic (Layer 5.5).
 **Repo:** roystenteng21/telegram-claude-bot (public) · **Runtime:** Railway · **Deploy:** deploy.py
 
 ---
@@ -15,7 +15,7 @@ R1: Route by cost — exact→regex→keyword→cache→live→Claude. Never Cla
 R2: Single pass, immediate exit on first match.
 R3: One sheet read per request, cached, invalidated on write only.
 R4: Haiku for classification/extraction <200 tokens. Sonnet for reasoning/conversation only.
-R5: Typing indicator before every external API call. asyncio.gather() for parallel calls.
+R5: ALL iCloud CalDAV calls must use asyncio.to_thread() — blocking network calls freeze the event loop on Railway. Apply to any external blocking call.
 R6: Session messages never reach main routing chain. Sessions time out cleanly.
 R7: Cache hierarchy: in-memory → cached sheet → live sheet → external API.
 R8: Every branch sets reply or returns. Empty reply is a bug.
@@ -23,6 +23,8 @@ R9: Verify with `python3 -c "import <module>"` after edits, not just ast.parse.
 R10: View surrounding lines after any str_replace touching class/function boundaries.
 R11: Every except block must send a user-facing Telegram message — never swallow silently.
 R12: Every sheet field read must be cast to str() before string operations.
+R13: Error messages must never use parse_mode="Markdown" — send via plain reply_text only.
+R14: deploy.py auto-detects all .py module files — never hardcode module lists.
 
 ---
 
@@ -36,7 +38,13 @@ R12: Every sheet field read must be cast to str() before string operations.
 - **OAuth token:** GOOGLE\_OAUTH\_TOKEN env var in Railway (base64 token.json). client\_secrets.json and token.json are gitignored — never commit.
 - **Receipt flow:** Photo → upload Em Receipts/YYYY-MM/DD-MM-YYYY-merchant.jpg → vision parse → confirmation ALWAYS shown (yes / save only / split / edit) → log on yes.
 - **force_confirm:** Photos always pass force_confirm=True to handle_expense_text — bypasses auto-log even for known merchants. Implemented S31.
-- **alert_error:** Shared async helper in helpers.py — sends Telegram message on silent failures in critical paths. Uses state._app_ref. Never raises.
+- **alert_error:** Shared async helper in helpers.py — sends Telegram message on silent failures in critical paths. Uses state._app_ref. Never raises. Also fires on Claude fallback to alert routing gaps.
+- **handlers.py:** New Layer 5.5 module. Owns all session handler logic extracted from routing.py. routing.py delegates to it via await calls. Never import routing.py from handlers.py.
+- **Calendar trigger:** `cal [title] [calendar] [date] [time] [location]` — parses via Haiku with pre-computed date anchors, shows confirmation, writes on yes. `cal delete [title]` — finds upcoming event, confirms before delete.
+- **Calendar sessions:** calendar_confirm_sessions in state.py. Inline edit supported (e.g. "change time to 2pm"). All iCloud ops async via asyncio.to_thread().
+- **Calendar date resolution:** Relative dates (next Friday, tomorrow, etc.) pre-computed in Python and injected into Haiku prompt — never left to model inference. Year always injected explicitly.
+- **iCloud CalDAV on Railway:** UNRESOLVED — CalDAV connections hang indefinitely from Railway's network despite asyncio.to_thread() and 10s timeout. Local connections work fine. Root cause unknown — may be Railway blocking outbound CalDAV or iCloud rate-limiting Railway IPs. Needs investigation next session.
+- **Routing fallback alert:** Claude fallback now fires alert_error with the message that fell through — visible in Telegram for routing gap detection.
 - **GitHub fetch:** All module files fetched via `https://raw.githubusercontent.com/roystenteng21/telegram-claude-bot/main/<file>.py`. Em Codes Drive folder retired.
 
 ---
@@ -64,6 +72,7 @@ R12: Every sheet field read must be cast to str() before string operations.
 python3 ~/telegram-claude-bot/deploy.py "commit msg" "Session N" "built" "fixed" "pending"
 ```
 Never commit token.json or client_secrets.json.
+deploy.py now auto-detects all .py files in repo — no hardcoded list. NON_MODULE_FILES excludes deploy.py, reauth.py, session_meta.json etc.
 
 ## OAuth Token Refresh
 1. `rm ~/telegram-claude-bot/token.json` (delete old token first)
@@ -77,14 +86,14 @@ Never commit token.json or client_secrets.json.
 |---|---|---|---|
 | config | config.py | 0 | Constants, env vars, EXPENSE\_CATEGORIES, TIMEZONE |
 | clients | clients.py | 1 | gc, spreadsheet, drive\_service, personal\_drive\_service, Anthropic client |
-| state | state.py | 1 | All session dicts, caches, OAUTH\_DRIVE\_OK, DRIVE\_FOLDERS |
+| state | state.py | 1 | All session dicts, caches, OAUTH\_DRIVE\_OK, DRIVE\_FOLDERS, calendar\_confirm\_sessions |
 | sheets | sheets.py | 2 | Sheet accessors, setup\_sheets, em log ops |
 | helpers | helpers.py | 3 | format\_date, send\_safe, looks\_like\_new\_intent, alert\_error |
 | crm | crm.py | 4 | Contacts, notes, followups, birthdays |
 | expenses | expenses.py | 4 | Expense logging, merchant memory, cards, receipt confirm |
 | fx | fx.py | 4 | FX rates, manual rate input |
 | reminders | reminders.py | 4 | Reminder add/fire/reschedule |
-| calendar | cal.py | 4 | iCloud calendar read/write |
+| calendar | cal.py | 4 | iCloud calendar read/write — all ops async via asyncio.to\_thread() |
 | todos | todos.py | 4 | Todo add/complete/delete/list |
 | meetings | meetings.py | 4 | Meeting recap session, note processing |
 | bills | bills.py | 4 | Bill add/list/remind |
@@ -92,22 +101,26 @@ Never commit token.json or client_secrets.json.
 | stocks | stocks.py | 4 | Portfolio, price alerts, market summary |
 | trips | trips.py | 4 | Overseas mode, flight tracking, trip history |
 | sessions | sessions.py | 5 | Session timeouts, persist/restore receipt sessions |
-| routing | routing.py | 6 | Main message handler, system prompt |
+| handlers | handlers.py | 5.5 | All session handler logic — calendar, restaurant, contact, todo, expense, CRM edit, recon, portfolio |
+| routing | routing.py | 6 | Main message handler, system prompt, primary routing chain |
 | infrastructure | infrastructure.py | 7 | Boot setup, OAuth test, Drive folder creation, alerts |
 | bot | bot.py | 8 | Scheduler, app init |
 
 ---
 
-## Last Session (S31 — 15/05/2026)
-**Built:** force\_confirm=True on all photo receipts (vision + caption paths) · personal\_drive\_service added to clients.py (_LazyPersonalDrive using GOOGLE\_OAUTH\_TOKEN) · OAUTH\_DRIVE\_OK flag in state.py · OAUTH\_DRIVE\_OK gate on receipt upload in routing.py · boot OAuth test in infrastructure.py (_test\_oauth\_drive) · Telegram alert on upload failure · DD-MM-YYYY receipt filename format · alert\_error async helper in helpers.py (wired to receipt upload, log\_expense, check\_and\_fire\_reminders, send\_birthday\_reminders) · stale receipt session age check re-enabled in sessions.py (was commented out) · todo\_disambig\_sessions added to clear\_all\_sessions · parse\_reschedule\_request Claude call wrapped in try/except · import json moved to top of crm.py (was at bottom, caused \_\_import\_\_ hacks) · edit last expense routing fixed (trailing space bug) · OAUTH\_DRIVE\_OK shown in em status output · Full S31 codebase audit (40 findings across all 20 modules)
-**Fixed:** C1 stale session guard · C2/H6 force\_confirm never implemented · C3/H1/H2 personal\_drive\_service missing entirely · C4 crm.py import json position · C5 bills.py unwrapped Claude call · C6 restaurants.py unwrapped Claude call · H3 wrong filename format · H4 missing OAUTH gate · H5 missing OAUTH\_DRIVE\_OK flag · H7 todo\_disambig not cleared · H8 reminders reschedule unwrapped · H13 edit last expense routing
-**Pending:** S27 test checklist · Deploy S31 files (not yet deployed — handoff before deploy confirmed)
+## Last Session (S32 — 16/05/2026)
+**Built:** handlers.py (Layer 5.5) — all session logic extracted from routing.py · calendar feature rewrite: cal/cal delete triggers, confirmation before write, programmatic date resolution, inline edit, asyncio.to\_thread() for all iCloud ops · calendar\_confirm\_sessions in state.py · alert\_error in helpers.py (was missing from deployed code) · routing fallback alert · deploy.py rewritten to auto-detect modules (no hardcoded list) · DAVClient timeout=10s added · debug MSG print in routing.py (temporary — remove next session)
+**Fixed:** iCloud app-specific password expired (regenerated) · alert\_error missing from helpers.py · handlers.py missing from repo (deploy.py now auto-detects) · calendar date hallucination (programmatic anchors) · blocking iCloud calls in async context (asyncio.to\_thread) · routing.py session bloat (handlers.py split)
+**Pending:** iCloud CalDAV on Railway UNRESOLVED — connections hang despite asyncio.to\_thread + timeout · debug MSG print in routing.py needs removal · remove test_icloud.py from repo · S27 test checklist not run · Medium/low audit findings deferred
 
 ---
 
 ## Open Backlog
+- **CRITICAL:** iCloud CalDAV unreachable from Railway — calendar write/read hangs. Investigate: Railway outbound firewall, iCloud IP blocking, alternative approach (Google Calendar API, local proxy). Currently calendar feature is non-functional on Railway.
+- Remove debug `print(f"MSG from...")` from routing.py (added S32 for debugging)
+- Remove test_icloud.py from repo
 - S27 test checklist not run
-- S31 files built but NOT YET DEPLOYED — deploy on next session start
+- Bills sheet due date stored as int not str — strptime crash on boot (R12 violation, low priority)
 - Medium/low audit findings deferred (H9–H14, M1–M11, L1–L9) — see S31 audit report
 
 ---
@@ -133,7 +146,6 @@ These were audited in S31 but not fixed. Address in future sessions:
 - L2 — helpers.py: generate_trip_id date-only (collision if two trips same day)
 - L3 — crm.py: ensure_birthday_greeted_column is a no-op (dead code)
 - L4 — sheets.py: sheets_call_with_retry defined but never called (dead code)
-- L5 — routing.py: FIXED in S31 (edit last expense trailing space)
 - L6 — expenses.py: get_expense_report ignores report_type parameter
 - L7 — stocks.py: suggest_stocks Claude call has no try/except
 - L8 — bot.py: refresh_fx_rates scheduler jobs pass no args (works but inconsistent)

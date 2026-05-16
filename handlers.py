@@ -89,7 +89,7 @@ async def handle_calendar_confirm_session(user_id, text, lower, update):
             reply = await write_calendar_event(cs["parsed"])
             await send_safe(update.message, reply, parse_mode="Markdown")
         except Exception as e:
-            await update.message.reply_text(f"⚠️ Couldn't save to iCloud Calendar: {type(e).__name__}: {str(e)[:100]}")
+            await update.message.reply_text(f"⚠️ Couldn't save to calendar: {type(e).__name__}: {str(e)[:100]}")
     else:
         # Inline edit
         try:

@@ -1,10 +1,10 @@
 {
   "date": "2026-05-16",
-  "session": "Session 32",
-  "built": "",
-  "fixed": "iCloud hanging on Railway \u2014 added 10s timeout",
-  "pending": "",
-  "deploy_count": 35,
+  "session": "Session 33",
+  "built": "Google Calendar API replaces caldav in cal.py \u00b7 cal delete flow fixed for new match format \u00b7 debug print removed from routing.py \u00b7 caldav removed from requirements.txt",
+  "fixed": "iCloud CalDAV write hang on Railway",
+  "pending": "test_icloud.py still in repo \u00b7 S27 test checklist not run",
+  "deploy_count": 36,
   "module_count": 25,
   "modules": [
     "bills.py",

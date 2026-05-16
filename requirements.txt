@@ -6,6 +6,5 @@ google-api-python-client
 python-dotenv
 apscheduler
 pytz
-caldav
 openpyxl==3.1.5
 requests

@@ -45,7 +45,7 @@ from reminders import (
     cancel_reminder_by_keyword, check_and_fire_reminders
 )
 from cal import (
-    get_calendar, get_events, delete_calendar_event, is_calendar_request,
+    get_events, delete_calendar_event, is_calendar_request,
     smart_add_event, check_icloud_daily, find_upcoming_events,
     apply_calendar_edit, format_calendar_confirm, write_calendar_event
 )
@@ -182,7 +182,6 @@ def build_system_prompt():
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    print(f"MSG from {user_id}, expected {YOUR_CHAT_ID}")
     if user_id != YOUR_CHAT_ID:
         return
     try:
@@ -493,18 +492,20 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         elif not matches:
             reply = f"No upcoming event found matching '{event_query}'"
         elif len(matches) == 1:
-            _, summary, dtstart = matches[0]
+            meta, summary, dtstart = matches[0]
             try:
-                date_str = dtstart.strftime("%a %d %b %Y, %I:%M%p").lower() if hasattr(dtstart, 'strftime') else str(dtstart)
+                from datetime import datetime as _dt
+                date_str = _dt.fromisoformat(dtstart.replace("Z", "+00:00")).strftime("%a %d %b %Y, %I:%M%p").lower() if dtstart and "T" in dtstart else str(dtstart)
             except Exception:
                 date_str = str(dtstart)
-            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [summary], "target": f"Delete {summary}?"}
+            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [meta], "target": f"Delete {summary}?"}
             reply = f"🗑 *{summary}*\n🗓 {date_str}\n\nDelete it? (yes / no)"
         else:
             lines = ["Found multiple matching events — which one?"]
-            for i, (_, summary, dtstart) in enumerate(matches, 1):
+            for i, (meta, summary, dtstart) in enumerate(matches, 1):
                 try:
-                    date_str = dtstart.strftime("%a %d %b %Y, %I:%M%p").lower() if hasattr(dtstart, 'strftime') else str(dtstart)
+                    from datetime import datetime as _dt
+                    date_str = _dt.fromisoformat(dtstart.replace("Z", "+00:00")).strftime("%a %d %b %Y, %I:%M%p").lower() if dtstart and "T" in dtstart else str(dtstart)
                 except Exception:
                     date_str = str(dtstart)
                 lines.append(f"{i}. {summary} — {date_str}")
@@ -940,18 +941,20 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         elif not matches:
             reply = f"No upcoming event found matching '{event_query}'"
         elif len(matches) == 1:
-            _, summary, dtstart = matches[0]
+            meta, summary, dtstart = matches[0]
             try:
-                date_str = dtstart.strftime("%a %d %b %Y, %I:%M%p").lower() if hasattr(dtstart, 'strftime') else str(dtstart)
+                from datetime import datetime as _dt
+                date_str = _dt.fromisoformat(dtstart.replace("Z", "+00:00")).strftime("%a %d %b %Y, %I:%M%p").lower() if dtstart and "T" in dtstart else str(dtstart)
             except Exception:
                 date_str = str(dtstart)
-            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [summary], "target": f"Delete {summary}?"}
+            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [meta], "target": f"Delete {summary}?"}
             reply = f"🗑 *{summary}*\n🗓 {date_str}\n\nDelete it? (yes / no)"
         else:
             lines = ["Found multiple matching events — which one?"]
-            for i, (_, summary, dtstart) in enumerate(matches, 1):
+            for i, (meta, summary, dtstart) in enumerate(matches, 1):
                 try:
-                    date_str = dtstart.strftime("%a %d %b %Y, %I:%M%p").lower() if hasattr(dtstart, 'strftime') else str(dtstart)
+                    from datetime import datetime as _dt
+                    date_str = _dt.fromisoformat(dtstart.replace("Z", "+00:00")).strftime("%a %d %b %Y, %I:%M%p").lower() if dtstart and "T" in dtstart else str(dtstart)
                 except Exception:
                     date_str = str(dtstart)
                 lines.append(f"{i}. {summary} — {date_str}")
@@ -976,9 +979,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not state.em_profile or not state.em_profile.get("version"):
             issues.append("• Profile: not loaded — reply 'reload profile' to retry")
         try:
-            await asyncio.to_thread(get_calendar, "Personal")
+            from cal import _get_service; await asyncio.to_thread(_get_service)
         except Exception:
-            issues.append("• iCloud Calendar: unreachable — check ICLOUD_USERNAME / ICLOUD_PASSWORD in Railway")
+            issues.append("• Google Calendar: unreachable — check GOOGLE_CREDENTIALS in Railway")
         from config import ANTHROPIC_FAILURE_THRESHOLD
         if state._anthropic_failure_count >= ANTHROPIC_FAILURE_THRESHOLD:
             issues.append("• Anthropic API: repeated failures detected — check API key or Anthropic status page")
