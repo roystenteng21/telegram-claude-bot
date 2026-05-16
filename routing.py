@@ -374,8 +374,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
     # ── Session interrupt guard ───────────────────────────────────────────────
+    SESSION_REPLY_WORDS = {"yes", "y", "yep", "yeah", "no", "n", "nope", "edit", "sent", "skip", "cancel"}
     active_label = get_active_session_label(user_id)
-    if active_label and looks_like_new_intent(text):
+    if active_label and lower.strip() not in SESSION_REPLY_WORDS and looks_like_new_intent(text):
         if user_id in state.interrupted_sessions:
             pending = state.interrupted_sessions[user_id]
             if text.strip().lower() in ["yes", "y"]:

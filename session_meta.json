@@ -1,10 +1,10 @@
 {
-  "date": "2026-05-16",
+  "date": "2026-05-17",
   "session": "Session 33",
-  "built": "Google Calendar service cached at module level \u00b7 smart_add_event made async \u00b7 parse_calendar_request wrapped in asyncio.to_thread \u00b7 duplicate Appointment key removed \u00b7 routing.py awaits smart_add_event \u00b7 routing fallback alert scoped to feature signals \u00b7 debug print removed \u00b7 caldav removed",
-  "fixed": "iCloud CalDAV write hang \u00b7 calendar yes no response \u00b7 false routing fallback alerts",
+  "built": "routing.py now includes calendar_confirm_sessions handler \u00b7 cal.py Google Calendar API with service cache \u00b7 smart_add_event async \u00b7 apply_calendar_edit async \u00b7 SESSION_REPLY_WORDS guard \u00b7 routing fallback alert scoped \u00b7 caldav removed",
+  "fixed": "yes after calendar confirm silently dropped \u2014 old routing.py was deployed throughout",
   "pending": "test_icloud.py still in repo \u00b7 S27 test checklist not run \u00b7 bills strptime crash",
-  "deploy_count": 38,
+  "deploy_count": 39,
   "module_count": 25,
   "modules": [
     "bills.py",
