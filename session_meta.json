@@ -1,10 +1,10 @@
 {
   "date": "2026-05-16",
   "session": "Session 33",
-  "built": "Google Calendar API replaces caldav in cal.py \u00b7 cal delete flow fixed for new match format \u00b7 debug print removed from routing.py \u00b7 caldav removed from requirements.txt",
-  "fixed": "iCloud CalDAV write hang on Railway",
-  "pending": "test_icloud.py still in repo \u00b7 S27 test checklist not run",
-  "deploy_count": 36,
+  "built": "cal.py rewritten to Google Calendar API \u00b7 apply_calendar_edit made async \u00b7 routing fallback alert scoped to feature signals only \u00b7 debug print removed \u00b7 caldav removed from requirements",
+  "fixed": "iCloud CalDAV write hang \u00b7 false routing fallback alerts on casual messages \u00b7 calendar edit no response",
+  "pending": "test_icloud.py still in repo \u00b7 S27 test checklist not run \u00b7 bills strptime crash",
+  "deploy_count": 37,
   "module_count": 25,
   "modules": [
     "bills.py",

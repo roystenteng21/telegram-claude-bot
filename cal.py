@@ -242,7 +242,7 @@ def smart_add_event(text, user_id):
 # Apply inline edit during confirm session
 # ---------------------------------------------------------------------------
 
-def apply_calendar_edit(user_id, edit_text):
+async def apply_calendar_edit(user_id, edit_text):
     if user_id not in state.calendar_confirm_sessions:
         return "No pending calendar event to edit."
 
@@ -270,10 +270,12 @@ For start/end use format: DD MMM YYYY HH:MM
 For calendar, match from: {', '.join(KNOWN_CALENDARS)}"""
 
     try:
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=100,
-            messages=[{"role": "user", "content": prompt}]
+        response = await asyncio.to_thread(
+            lambda: client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=100,
+                messages=[{"role": "user", "content": prompt}]
+            )
         )
         raw = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
         edit = json.loads(raw)

@@ -1070,7 +1070,15 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── Claude conversation fallback ──────────────────────────────────────────
     else:
-        await alert_error(f"⚠️ Routing fallback — no handler matched.\nMessage: \"{text[:200]}\"")
+        # Only alert on messages that look like feature requests, not casual conversation
+        FEATURE_SIGNALS = [
+            "remind", "expense", "log ", "save ", "find ", "add ", "delete ", "update ",
+            "todo", "bill", "calendar", "cal ", "stock", "portfolio", "restaurant",
+            "trip", "flight", "meeting", "note ", "contact", "followup", "birthday",
+            "receipt", "import", "report", "summary", "fx ", "rate ", "convert",
+        ]
+        if any(sig in lower for sig in FEATURE_SIGNALS):
+            await alert_error(f"⚠️ Routing fallback — no handler matched.\nMessage: \"{text[:200]}\"")
 
         if user_id not in state.conversation_histories:
             state.conversation_histories[user_id] = []

@@ -93,7 +93,7 @@ async def handle_calendar_confirm_session(user_id, text, lower, update):
     else:
         # Inline edit
         try:
-            reply = apply_calendar_edit(user_id, text)
+            reply = await apply_calendar_edit(user_id, text)
             await send_safe(update.message, reply, parse_mode="Markdown")
         except Exception as e:
             state.calendar_confirm_sessions.pop(user_id, None)
