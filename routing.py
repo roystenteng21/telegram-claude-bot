@@ -511,6 +511,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     date_str = str(dtstart)
                 lines.append(f"{i}. {summary} — {date_str}")
             state.calendar_confirm_sessions[user_id] = {"delete_matches": matches, "step": "pick_delete"}
+            state.session_timestamps[user_id] = datetime.now(TIMEZONE)
             reply = "\n".join(lines)
 
     elif lower.startswith("cal "):
@@ -960,6 +961,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     date_str = str(dtstart)
                 lines.append(f"{i}. {summary} — {date_str}")
             state.calendar_confirm_sessions[user_id] = {"delete_matches": matches, "step": "pick_delete"}
+            state.session_timestamps[user_id] = datetime.now(TIMEZONE)
             reply = "\n".join(lines)
 
     # ── Em system commands ────────────────────────────────────────────────────

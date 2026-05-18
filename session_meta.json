@@ -1,10 +1,10 @@
 {
-  "date": "2026-05-17",
+  "date": "2026-05-18",
   "session": "Session 34",
-  "built": "cal.py Google Calendar rewrite, handlers.py calendar session, routing.py calendar_confirm_sessions, state.py calendar_confirm_sessions dict",
-  "fixed": "calendar yes not responding, old caldav version deployed",
+  "built": "cal.py routing.py timestamp fix",
+  "fixed": "calendar yes silent exit on missing session timestamp",
   "pending": "S27 test checklist, bills strptime crash, medium/low audit findings",
-  "deploy_count": 40,
+  "deploy_count": 41,
   "module_count": 25,
   "modules": [
     "bills.py",

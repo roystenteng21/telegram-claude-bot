@@ -240,6 +240,7 @@ async def smart_add_event(text, user_id):
 
     parsed["calendar"] = _match_calendar_name(parsed.get("calendar", ""))
     state.calendar_confirm_sessions[user_id] = {"parsed": parsed}
+    state.session_timestamps[user_id] = datetime.now(TIMEZONE)
     return format_calendar_confirm(parsed)
 
 
