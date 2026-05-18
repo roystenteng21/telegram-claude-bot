@@ -5,3 +5,8 @@ __pycache__/
 .DS_Store
 token.json
 client_secrets.json
+anthropic_key.txt
+client_secrets.json
+token.json
+*key*.txt
+*secret*.txt
