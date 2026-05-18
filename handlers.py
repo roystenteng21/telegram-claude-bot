@@ -21,7 +21,7 @@ from stocks import (
 from bills import delete_bill
 from cal import (
     delete_calendar_event, write_calendar_event, apply_calendar_edit,
-    find_upcoming_events, format_calendar_confirm
+    find_upcoming_events, format_calendar_confirm, _apply_event_edit
 )
 from todos import complete_todo
 from meetings import handle_meeting_session
@@ -81,6 +81,29 @@ async def handle_calendar_confirm_session(user_id, text, lower, update):
             await update.message.reply_text("Reply with a number or 'cancel'.")
         return True
 
+    # Multiple edit disambiguation
+    if cs.get("step") == "pick_edit":
+        matches = cs.get("edit_matches", [])
+        if text.strip().isdigit():
+            idx = int(text.strip()) - 1
+            if 0 <= idx < len(matches):
+                meta, summary, _ = matches[idx]
+                field = cs.get("field")
+                value = cs.get("value")
+                del state.calendar_confirm_sessions[user_id]
+                state.session_timestamps.pop(user_id, None)
+                reply = await _apply_event_edit(meta, summary, field, value)
+                await send_safe(update.message, reply, parse_mode="Markdown")
+            else:
+                await update.message.reply_text(f"Pick a number between 1 and {len(matches)}.")
+        elif lower in ["cancel", "nvm", "nevermind"]:
+            del state.calendar_confirm_sessions[user_id]
+            state.session_timestamps.pop(user_id, None)
+            await update.message.reply_text("Cancelled.")
+        else:
+            await update.message.reply_text("Reply with a number or 'cancel'.")
+        return True
+
     # Add confirm session
     if lower in ["yes", "y", "yep", "yeah", "yup", "sure", "ok", "okay"]:
         del state.calendar_confirm_sessions[user_id]
@@ -90,6 +113,8 @@ async def handle_calendar_confirm_session(user_id, text, lower, update):
             await send_safe(update.message, reply, parse_mode="Markdown")
         except Exception as e:
             await update.message.reply_text(f"⚠️ Couldn't save to calendar: {type(e).__name__}: {str(e)[:100]}")
+    elif lower.strip() == "edit":
+        await update.message.reply_text("What would you like to edit? (title / time / calendar / location)")
     else:
         # Inline edit
         try:

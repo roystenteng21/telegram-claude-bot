@@ -1,10 +1,10 @@
 {
   "date": "2026-05-18",
   "session": "Session 34",
-  "built": "cal.py calendar edit field save, title prompt fix",
-  "fixed": "calendar edit not applying, calendar name leaking into title",
-  "pending": "edit existing calendar events, split expense, S27 test checklist, bills strptime crash",
-  "deploy_count": 43,
+  "built": "cal.py edit_calendar_event, title strip, handlers.py pick_edit + blank edit prompt, routing.py edit cal trigger",
+  "fixed": "calendar name leaking into title, edit with no field, no way to edit existing events",
+  "pending": "split expense, S27 test checklist, bills strptime crash",
+  "deploy_count": 44,
   "module_count": 25,
   "modules": [
     "bills.py",

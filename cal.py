@@ -239,6 +239,17 @@ async def smart_add_event(text, user_id):
         pass
 
     parsed["calendar"] = _match_calendar_name(parsed.get("calendar", ""))
+
+    # Strip any calendar name words from title
+    cal_words = set()
+    for cal in KNOWN_CALENDARS:
+        for word in cal.lower().split():
+            cal_words.add(word)
+    title_words = parsed.get("title", "").split()
+    cleaned_title = " ".join(w for w in title_words if w.lower() not in cal_words)
+    if cleaned_title.strip():
+        parsed["title"] = cleaned_title.strip()
+
     state.calendar_confirm_sessions[user_id] = {"parsed": parsed}
     state.session_timestamps[user_id] = datetime.now(TIMEZONE)
     return format_calendar_confirm(parsed)
@@ -428,6 +439,133 @@ async def delete_calendar_event(summary_or_meta):
 async def check_icloud_daily(app):
     # No-op — Google Calendar has no equivalent downtime pattern
     pass
+
+
+# ---------------------------------------------------------------------------
+# Edit existing calendar event
+# ---------------------------------------------------------------------------
+
+async def edit_calendar_event(text, user_id):
+    """Parse 'edit cal [event] [field] [value]' and apply the change."""
+    date_block = _build_date_anchor_block()
+    known_cals = ", ".join(KNOWN_CALENDARS)
+
+    parse_prompt = f"""{date_block}
+
+Available calendars: {known_cals}
+
+Parse this calendar edit request:
+"{text}"
+
+Respond ONLY with a JSON object — no other text:
+{{
+  "event_query": "the event name to search for",
+  "field": "title|calendar|start|end|location",
+  "value": "new value"
+}}
+
+For start/end use format: DD MMM YYYY HH:MM
+For calendar, match exactly from the available list."""
+
+    try:
+        response = await asyncio.to_thread(
+            lambda: client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=150,
+                messages=[{"role": "user", "content": parse_prompt}]
+            )
+        )
+        raw = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(raw)
+    except Exception:
+        return "⚠️ Couldn't parse that — try: edit cal Branson time 11am"
+
+    event_query = parsed.get("event_query", "").strip()
+    field = parsed.get("field", "").strip()
+    value = parsed.get("value", "").strip()
+
+    if not event_query or not field or not value:
+        return "⚠️ Couldn't parse that — try: edit cal Branson time 11am"
+
+    matches, err = await find_upcoming_events(event_query)
+    if err:
+        return err
+    if not matches:
+        return f"No upcoming event found matching '{event_query}'"
+
+    if len(matches) > 1:
+        matches = matches[:5]
+        lines = ["Found multiple matching events — which one?\n"]
+        for i, (meta, summary, dtstart) in enumerate(matches, 1):
+            try:
+                date_str = datetime.fromisoformat(dtstart.replace("Z", "+00:00")).strftime("%a %d %b %Y, %I:%M%p").lstrip("0").lower() if dtstart and "T" in dtstart else str(dtstart)
+            except Exception:
+                date_str = str(dtstart)
+            lines.append(f"{i}. {summary} — {date_str}")
+        state.calendar_confirm_sessions[user_id] = {
+            "step": "pick_edit",
+            "edit_matches": matches,
+            "field": field,
+            "value": value
+        }
+        state.session_timestamps[user_id] = datetime.now(TIMEZONE)
+        return "\n".join(lines)
+
+    meta, summary, _ = matches[0]
+    return await _apply_event_edit(meta, summary, field, value)
+
+
+async def _apply_event_edit(meta, summary, field, value):
+    """Apply a single field edit to an existing Google Calendar event."""
+    try:
+        service = await asyncio.to_thread(_get_service)
+        event = await asyncio.to_thread(
+            lambda: service.events().get(
+                calendarId=meta["cal_id"],
+                eventId=meta["event_id"]
+            ).execute()
+        )
+
+        if field == "title":
+            event["summary"] = value
+        elif field == "calendar":
+            new_cal_name = _match_calendar_name(value)
+            new_cal_id = _get_calendar_id(new_cal_name)
+            event.pop("id", None)
+            event.pop("etag", None)
+            await asyncio.to_thread(
+                lambda: service.events().insert(calendarId=new_cal_id, body=event).execute()
+            )
+            await asyncio.to_thread(
+                lambda: service.events().delete(
+                    calendarId=meta["cal_id"],
+                    eventId=meta["event_id"]
+                ).execute()
+            )
+            return f"✅ *{summary}* moved to {new_cal_name}"
+        elif field in ("start", "end"):
+            try:
+                dt = datetime.strptime(value, "%d %b %Y %H:%M")
+            except Exception:
+                return "⚠️ Couldn't parse that date — try: edit cal Branson time 22 May 2026 11:00"
+            iso = dt.strftime("%Y-%m-%dT%H:%M:%S")
+            event[field] = {"dateTime": iso, "timeZone": str(TIMEZONE)}
+        elif field == "location":
+            event["location"] = value
+
+        if field != "calendar":
+            await asyncio.to_thread(
+                lambda: service.events().update(
+                    calendarId=meta["cal_id"],
+                    eventId=meta["event_id"],
+                    body=event
+                ).execute()
+            )
+
+        field_label = {"title": "Title", "start": "Start time", "end": "End time", "location": "Location"}.get(field, field.title())
+        return f"✅ *{summary}* updated — {field_label}: {value}"
+    except Exception as e:
+        return f"❌ Couldn't update event: {str(e)}"
 
 
 # ---------------------------------------------------------------------------

@@ -47,7 +47,8 @@ from reminders import (
 from cal import (
     get_events, delete_calendar_event, is_calendar_request,
     smart_add_event, check_icloud_daily, find_upcoming_events,
-    apply_calendar_edit, format_calendar_confirm, write_calendar_event
+    apply_calendar_edit, format_calendar_confirm, write_calendar_event,
+    edit_calendar_event
 )
 from todos import add_todo, complete_todo, delete_todo, list_todos
 from meetings import (
@@ -485,7 +486,10 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     reply = None
 
     # ── Calendar — cal trigger ────────────────────────────────────────────────
-    if lower.startswith("cal delete "):
+    if lower.startswith("edit cal "):
+        reply = await edit_calendar_event(text[9:].strip(), user_id)
+
+    elif lower.startswith("cal delete "):
         event_query = text[11:].strip()
         matches, err = await find_upcoming_events(event_query)
         if err:
