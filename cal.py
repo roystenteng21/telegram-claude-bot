@@ -189,8 +189,8 @@ async def write_calendar_event(parsed):
 
     event_body = {
         "summary": parsed.get("title", "Event"),
-        "start": {"dateTime": start.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": TIMEZONE},
-        "end":   {"dateTime": end.strftime("%Y-%m-%dT%H:%M:%S"),   "timeZone": TIMEZONE},
+        "start": {"dateTime": start.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": str(TIMEZONE)},
+        "end":   {"dateTime": end.strftime("%Y-%m-%dT%H:%M:%S"),   "timeZone": str(TIMEZONE)},
     }
     if parsed.get("location"):
         event_body["location"] = parsed["location"]

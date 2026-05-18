@@ -1,10 +1,10 @@
 {
   "date": "2026-05-18",
   "session": "Session 34",
-  "built": "cal.py routing.py timestamp fix",
-  "fixed": "calendar yes silent exit on missing session timestamp",
+  "built": "cal.py timezone string fix",
+  "fixed": "TIMEZONE object not JSON serializable",
   "pending": "S27 test checklist, bills strptime crash, medium/low audit findings",
-  "deploy_count": 41,
+  "deploy_count": 42,
   "module_count": 25,
   "modules": [
     "bills.py",
