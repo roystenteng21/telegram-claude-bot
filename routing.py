@@ -491,30 +491,25 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif lower.startswith("cal delete ") or lower.startswith("remove cal ") or lower.startswith("remove event "):
         event_query = re.sub(r"^(cal delete|remove cal|remove event)\s+", "", text, flags=re.IGNORECASE).strip()
-        matches, err = await find_upcoming_events(event_query)
+        matches, err, capped = await find_upcoming_events(event_query)
         if err:
             reply = err
         elif not matches:
             reply = f"No upcoming event found matching '{event_query}'"
         elif len(matches) == 1:
-            meta, summary, dtstart = matches[0]
-            try:
-                from datetime import datetime as _dt
-                date_str = _dt.fromisoformat(dtstart.replace("Z", "+00:00")).strftime("%a %d %b %Y, %I:%M%p").lower() if dtstart and "T" in dtstart else str(dtstart)
-            except Exception:
-                date_str = str(dtstart)
-            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [meta], "target": f"Delete {summary}?"}
-            reply = f"🗑 *{summary}*\n🗓 {date_str}\n\nDelete it? (yes / no)"
+            meta, summary, dtstart, dtend = matches[0]
+            from cal import _fmt_event_row
+            event_str = _fmt_event_row(summary, meta.get("cal_name", ""), dtstart, dtend)
+            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [{**meta, "dtstart": dtstart, "summary": summary}], "target": f"Delete {summary}?"}
+            reply = f"🗑 {event_str}\n\nDelete it? (yes / no)"
         else:
-            lines = ["Found multiple matching events — which one?"]
-            for i, (meta, summary, dtstart) in enumerate(matches, 1):
-                try:
-                    from datetime import datetime as _dt
-                    date_str = _dt.fromisoformat(dtstart.replace("Z", "+00:00")).strftime("%a %d %b %Y, %I:%M%p").lower() if dtstart and "T" in dtstart else str(dtstart)
-                except Exception:
-                    date_str = str(dtstart)
-                lines.append(f"{i}. {summary} — {date_str}")
-            state.calendar_confirm_sessions[user_id] = {"delete_matches": matches, "step": "pick_delete"}
+            from cal import _fmt_event_row
+            lines = ["Found multiple matching events — which one?\n"]
+            for i, (meta, summary, dtstart, dtend) in enumerate(matches, 1):
+                lines.append(f"{i}. {_fmt_event_row(summary, meta.get('cal_name', ''), dtstart, dtend)}")
+            if capped:
+                lines.append("\nShowing next 4 — reply 'more' to see further ahead.")
+            state.calendar_confirm_sessions[user_id] = {"delete_matches": matches, "step": "pick_delete", "event_query": event_query, "capped": capped}
             state.session_timestamps[user_id] = datetime.now(TIMEZONE)
             reply = "\n".join(lines)
 
@@ -941,30 +936,25 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = await get_events(7)
     elif lower.startswith("delete event "):
         event_query = re.sub(r"^delete event\s+", "", text, flags=re.IGNORECASE).strip()
-        matches, err = await find_upcoming_events(event_query)
+        matches, err, capped = await find_upcoming_events(event_query)
         if err:
             reply = err
         elif not matches:
             reply = f"No upcoming event found matching '{event_query}'"
         elif len(matches) == 1:
-            meta, summary, dtstart = matches[0]
-            try:
-                from datetime import datetime as _dt
-                date_str = _dt.fromisoformat(dtstart.replace("Z", "+00:00")).strftime("%a %d %b %Y, %I:%M%p").lower() if dtstart and "T" in dtstart else str(dtstart)
-            except Exception:
-                date_str = str(dtstart)
-            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [meta], "target": f"Delete {summary}?"}
-            reply = f"🗑 *{summary}*\n🗓 {date_str}\n\nDelete it? (yes / no)"
+            meta, summary, dtstart, dtend = matches[0]
+            from cal import _fmt_event_row
+            event_str = _fmt_event_row(summary, meta.get("cal_name", ""), dtstart, dtend)
+            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [{**meta, "dtstart": dtstart, "summary": summary}], "target": f"Delete {summary}?"}
+            reply = f"🗑 {event_str}\n\nDelete it? (yes / no)"
         else:
-            lines = ["Found multiple matching events — which one?"]
-            for i, (meta, summary, dtstart) in enumerate(matches, 1):
-                try:
-                    from datetime import datetime as _dt
-                    date_str = _dt.fromisoformat(dtstart.replace("Z", "+00:00")).strftime("%a %d %b %Y, %I:%M%p").lower() if dtstart and "T" in dtstart else str(dtstart)
-                except Exception:
-                    date_str = str(dtstart)
-                lines.append(f"{i}. {summary} — {date_str}")
-            state.calendar_confirm_sessions[user_id] = {"delete_matches": matches, "step": "pick_delete"}
+            from cal import _fmt_event_row
+            lines = ["Found multiple matching events — which one?\n"]
+            for i, (meta, summary, dtstart, dtend) in enumerate(matches, 1):
+                lines.append(f"{i}. {_fmt_event_row(summary, meta.get('cal_name', ''), dtstart, dtend)}")
+            if capped:
+                lines.append("\nShowing next 4 — reply 'more' to see further ahead.")
+            state.calendar_confirm_sessions[user_id] = {"delete_matches": matches, "step": "pick_delete", "event_query": event_query, "capped": capped}
             state.session_timestamps[user_id] = datetime.now(TIMEZONE)
             reply = "\n".join(lines)
 
@@ -1145,13 +1135,15 @@ async def check_missed_items_on_startup(app):
 
         try:
             ws = bills_sheet()
+            cutoff = today - timedelta(days=7)
             for r in ws.get_all_records():
-                due_str = r.get("Due Date", "")
+                due_str = str(r.get("Due Date", ""))
                 if not due_str:
                     continue
                 for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y"]:
                     try:
-                        if datetime.strptime(due_str, fmt).date() == yesterday:
+                        due_date = datetime.strptime(due_str, fmt).date()
+                        if cutoff <= due_date <= yesterday:
                             missed_bills.append(r.get("Name", "?"))
                         break
                     except ValueError:

@@ -105,6 +105,54 @@ def _build_date_anchor_block():
 
 
 # ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_event_time(dtstr):
+    """Format a dateTime or date string for display. Returns (time_str, is_allday)."""
+    if not dtstr:
+        return "?", False
+    if "T" in dtstr:
+        try:
+            dt = datetime.fromisoformat(dtstr.replace("Z", "+00:00"))
+            return dt.strftime("%I:%M%p").lstrip("0").lower(), False
+        except Exception:
+            return dtstr, False
+    return "all day", True
+
+
+def _fmt_event_row(summary, cal_name, dtstart, dtend):
+    """Format a single event row for disambiguation lists."""
+    start_str, is_allday = _fmt_event_time(dtstart)
+    if is_allday:
+        try:
+            d = datetime.strptime(dtstart, "%Y-%m-%d")
+            date_label = d.strftime("%a %d %b %Y")
+        except Exception:
+            date_label = dtstart
+        return f"{summary} — {cal_name} | {date_label} (all day)"
+    try:
+        dt = datetime.fromisoformat(dtstart.replace("Z", "+00:00"))
+        date_label = dt.strftime("%a %d %b %Y")
+    except Exception:
+        date_label = dtstart
+    end_str, _ = _fmt_event_time(dtend)
+    return f"{summary} — {cal_name} | {date_label}, {start_str} – {end_str}"
+
+
+def _fmt_delete_success(summary, cal_name, dtstart):
+    """Format delete success message."""
+    if not dtstart or "T" not in dtstart:
+        return f"✅ *{summary}* deleted — {cal_name}"
+    try:
+        dt = datetime.fromisoformat(dtstart.replace("Z", "+00:00"))
+        date_label = dt.strftime("%a %d %b %Y, %-I:%M%p").lower()
+        return f"✅ *{summary}* deleted — {cal_name} | {date_label}"
+    except Exception:
+        return f"✅ *{summary}* deleted — {cal_name}"
+
+
+# ---------------------------------------------------------------------------
 # Parse calendar request via Haiku
 # ---------------------------------------------------------------------------
 
@@ -366,14 +414,22 @@ async def get_events(days=1):
 # Find upcoming events (for delete flow)
 # ---------------------------------------------------------------------------
 
-async def find_upcoming_events(title_query):
+async def find_upcoming_events(title_query, cal_filter=None, days=90, max_results=4):
+    """
+    Returns (matches, err, capped) where each match is:
+      ({"event_id": ..., "cal_id": ..., "cal_name": ...}, summary, dtstart, dtend)
+    cal_filter: optional calendar name string to restrict search
+    capped: True if results were truncated to max_results
+    """
     try:
         service = await asyncio.to_thread(_get_service)
         now = datetime.utcnow().isoformat() + "Z"
-        end_dt = (datetime.utcnow() + timedelta(days=365)).isoformat() + "Z"
+        end_dt = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
 
         matches = []
         for cal_name, cal_id in CALENDAR_IDS.items():
+            if cal_filter and cal_name.lower() != cal_filter.lower():
+                continue
             try:
                 result = await asyncio.to_thread(
                     lambda cid=cal_id: service.events().list(
@@ -388,13 +444,19 @@ async def find_upcoming_events(title_query):
                     summary = e.get("summary", "")
                     if title_query.lower() in summary.lower():
                         start_raw = e.get("start", {}).get("dateTime") or e.get("start", {}).get("date")
-                        matches.append(({"event_id": e["id"], "cal_id": cal_id}, summary, start_raw))
+                        end_raw = e.get("end", {}).get("dateTime") or e.get("end", {}).get("date")
+                        matches.append((
+                            {"event_id": e["id"], "cal_id": cal_id, "cal_name": cal_name},
+                            summary, start_raw, end_raw
+                        ))
             except Exception:
                 continue
 
-        return matches, None
+        matches.sort(key=lambda x: x[2] or "")
+        capped = len(matches) > max_results
+        return matches[:max_results], None, capped
     except Exception as e:
-        return None, f"⚠️ Calendar error: {str(e)}"
+        return None, f"⚠️ Calendar error: {str(e)}", False
 
 
 # ---------------------------------------------------------------------------
@@ -404,30 +466,32 @@ async def find_upcoming_events(title_query):
 async def delete_calendar_event(summary_or_meta):
     try:
         service = await asyncio.to_thread(_get_service)
-        # If passed a dict with event_id + cal_id (from confirm session)
         if isinstance(summary_or_meta, dict):
+            cal_name = summary_or_meta.get("cal_name", "")
+            dtstart = summary_or_meta.get("dtstart", "")
+            summary = summary_or_meta.get("summary", "Event")
             await asyncio.to_thread(
                 lambda: service.events().delete(
                     calendarId=summary_or_meta["cal_id"],
                     eventId=summary_or_meta["event_id"]
                 ).execute()
             )
-            return f"✅ Event deleted"
+            return _fmt_delete_success(summary, cal_name, dtstart)
 
         # Fallback: search by title
-        matches, err = await find_upcoming_events(summary_or_meta)
+        matches, err, _ = await find_upcoming_events(summary_or_meta)
         if err:
             return err
         if not matches:
             return f"❌ No upcoming event found matching '{summary_or_meta}'"
-        meta, summary, _ = matches[0]
+        meta, summary, dtstart, _ = matches[0]
         await asyncio.to_thread(
             lambda: service.events().delete(
                 calendarId=meta["cal_id"],
                 eventId=meta["event_id"]
             ).execute()
         )
-        return f"✅ *{summary}* deleted"
+        return _fmt_delete_success(summary, meta.get("cal_name", ""), dtstart)
     except Exception as e:
         return f"❌ Error deleting event: {str(e)}"
 
@@ -445,7 +509,7 @@ async def check_icloud_daily(app):
 # Edit existing calendar event
 # ---------------------------------------------------------------------------
 
-async def edit_calendar_event(text, user_id):
+async def edit_calendar_event(text, user_id, expand_search=False):
     """Parse 'edit cal [event] [field] [value]' and apply the change."""
     date_block = _build_date_anchor_block()
     known_cals = ", ".join(KNOWN_CALENDARS)
@@ -460,12 +524,24 @@ Parse this calendar edit request:
 Respond ONLY with a JSON object — no other text:
 {{
   "event_query": "the event name to search for",
-  "field": "title|calendar|start|end|location",
+  "calendar_filter": "calendar name if mentioned, or empty string",
+  "field": "title|calendar|start|end|time_range|end_only",
   "value": "new value"
 }}
 
-For start/end use format: DD MMM YYYY HH:MM
-For calendar, match exactly from the available list."""
+Field rules:
+- "start": single new start time only (end time unchanged). Format: HH:MM (24h)
+- "end_only": only the end time is being changed. Format: HH:MM (24h)
+- "time_range": both start and end explicitly stated. Format: "HH:MM-HH:MM" (24h)
+- "title": new event title
+- "calendar": new calendar name from available list
+- "location": new location
+
+For time values always use 24h format HH:MM.
+If a range like "6.30 to 9.30pm" is given, output field "time_range" and value "18:30-21:30".
+If only one time is given (e.g. "time 6pm"), output field "start" and value "18:00".
+If "end [time]" is given, output field "end_only" and value e.g. "21:30".
+calendar_filter: only populate if a calendar name is explicitly mentioned in the request."""
 
     try:
         response = await asyncio.to_thread(
@@ -483,39 +559,49 @@ For calendar, match exactly from the available list."""
     event_query = parsed.get("event_query", "").strip()
     field = parsed.get("field", "").strip()
     value = parsed.get("value", "").strip()
+    cal_filter_raw = parsed.get("calendar_filter", "").strip()
+    cal_filter = _match_calendar_name(cal_filter_raw) if cal_filter_raw else None
 
     if not event_query or not field or not value:
         return "⚠️ Couldn't parse that — try: edit cal Branson time 11am"
 
-    matches, err = await find_upcoming_events(event_query)
+    days = 365 if expand_search else 90
+    matches, err, capped = await find_upcoming_events(event_query, cal_filter=cal_filter, days=days, max_results=4)
     if err:
         return err
+
+    # If calendar filter returned nothing, retry without filter
+    if cal_filter and not matches:
+        matches, err, capped = await find_upcoming_events(event_query, days=days, max_results=4)
+        if err:
+            return err
+        cal_filter = None  # fell back
+
     if not matches:
         return f"No upcoming event found matching '{event_query}'"
 
     if len(matches) > 1:
-        matches = matches[:5]
         lines = ["Found multiple matching events — which one?\n"]
-        for i, (meta, summary, dtstart) in enumerate(matches, 1):
-            try:
-                date_str = datetime.fromisoformat(dtstart.replace("Z", "+00:00")).strftime("%a %d %b %Y, %I:%M%p").lstrip("0").lower() if dtstart and "T" in dtstart else str(dtstart)
-            except Exception:
-                date_str = str(dtstart)
-            lines.append(f"{i}. {summary} — {date_str}")
+        for i, (meta, summary, dtstart, dtend) in enumerate(matches, 1):
+            lines.append(f"{i}. {_fmt_event_row(summary, meta.get('cal_name', ''), dtstart, dtend)}")
+        if capped:
+            lines.append("\nShowing next 4 — reply 'more' to see further ahead.")
         state.calendar_confirm_sessions[user_id] = {
             "step": "pick_edit",
             "edit_matches": matches,
             "field": field,
-            "value": value
+            "value": value,
+            "event_query": event_query,
+            "capped": capped,
         }
         state.session_timestamps[user_id] = datetime.now(TIMEZONE)
         return "\n".join(lines)
 
-    meta, summary, _ = matches[0]
-    return await _apply_event_edit(meta, summary, field, value)
+    meta, summary, dtstart, dtend = matches[0]
+    return await _apply_event_edit(meta, summary, field, value, dtstart, dtend)
 
 
-async def _apply_event_edit(meta, summary, field, value):
+async def _apply_event_edit(meta, summary, field, value, dtstart=None, dtend=None):
     """Apply a single field edit to an existing Google Calendar event."""
     try:
         service = await asyncio.to_thread(_get_service)
@@ -526,8 +612,11 @@ async def _apply_event_edit(meta, summary, field, value):
             ).execute()
         )
 
+        cal_name = meta.get("cal_name", "")
+
         if field == "title":
             event["summary"] = value
+
         elif field == "calendar":
             new_cal_name = _match_calendar_name(value)
             new_cal_id = _get_calendar_id(new_cal_name)
@@ -543,27 +632,98 @@ async def _apply_event_edit(meta, summary, field, value):
                 ).execute()
             )
             return f"✅ *{summary}* moved to {new_cal_name}"
-        elif field in ("start", "end"):
+
+        elif field == "start":
+            # Update start only; end time unchanged
+            existing_start = event.get("start", {}).get("dateTime", "")
             try:
-                dt = datetime.strptime(value, "%d %b %Y %H:%M")
+                existing_dt = datetime.fromisoformat(existing_start.replace("Z", "+00:00"))
+                existing_date = existing_dt.strftime("%Y-%m-%d")
             except Exception:
-                return "⚠️ Couldn't parse that date — try: edit cal Branson time 22 May 2026 11:00"
-            iso = dt.strftime("%Y-%m-%dT%H:%M:%S")
-            event[field] = {"dateTime": iso, "timeZone": str(TIMEZONE)}
+                return "⚠️ Couldn't read existing event start time"
+            try:
+                new_time = datetime.strptime(value, "%H:%M")
+            except Exception:
+                return "⚠️ Couldn't parse that time — use HH:MM format e.g. 18:30"
+            new_start_iso = f"{existing_date}T{new_time.strftime('%H:%M')}:00"
+            event["start"] = {"dateTime": new_start_iso, "timeZone": str(TIMEZONE)}
+            # Validate new start not after existing end
+            existing_end = event.get("end", {}).get("dateTime", "")
+            if existing_end:
+                try:
+                    end_dt = datetime.fromisoformat(existing_end.replace("Z", "+00:00"))
+                    new_start_dt = datetime.fromisoformat(new_start_iso)
+                    if new_start_dt >= end_dt.replace(tzinfo=None):
+                        return "⚠️ New start time is at or after the existing end time — clarify the range"
+                except Exception:
+                    pass
+
+        elif field == "end_only":
+            # Update end only; start unchanged
+            existing_start = event.get("start", {}).get("dateTime", "")
+            try:
+                existing_dt = datetime.fromisoformat(existing_start.replace("Z", "+00:00"))
+                existing_date = existing_dt.strftime("%Y-%m-%d")
+                existing_start_time = existing_dt.replace(tzinfo=None)
+            except Exception:
+                return "⚠️ Couldn't read existing event start time"
+            try:
+                new_time = datetime.strptime(value, "%H:%M")
+            except Exception:
+                return "⚠️ Couldn't parse that time — use HH:MM format e.g. 21:30"
+            new_end_iso = f"{existing_date}T{new_time.strftime('%H:%M')}:00"
+            new_end_dt = datetime.strptime(new_end_iso, "%Y-%m-%dT%H:%M:%S")
+            if new_end_dt <= existing_start_time:
+                return "⚠️ End time can't be before or equal to start time — try again"
+            event["end"] = {"dateTime": new_end_iso, "timeZone": str(TIMEZONE)}
+
+        elif field == "time_range":
+            # Both start and end explicitly set; preserve existing date
+            existing_start = event.get("start", {}).get("dateTime", "")
+            try:
+                existing_dt = datetime.fromisoformat(existing_start.replace("Z", "+00:00"))
+                existing_date = existing_dt.strftime("%Y-%m-%d")
+            except Exception:
+                return "⚠️ Couldn't read existing event date"
+            try:
+                parts = value.split("-")
+                if len(parts) != 2:
+                    raise ValueError("expected HH:MM-HH:MM")
+                new_start_dt = datetime.strptime(parts[0].strip(), "%H:%M")
+                new_end_dt = datetime.strptime(parts[1].strip(), "%H:%M")
+            except Exception:
+                return "⚠️ Couldn't parse that time range — try: edit cal Jet time 18:30-21:30"
+            if new_end_dt <= new_start_dt:
+                return "⚠️ End time can't be before or equal to start time — try again"
+            new_start_iso = f"{existing_date}T{new_start_dt.strftime('%H:%M')}:00"
+            new_end_iso = f"{existing_date}T{new_end_dt.strftime('%H:%M')}:00"
+            event["start"] = {"dateTime": new_start_iso, "timeZone": str(TIMEZONE)}
+            event["end"] = {"dateTime": new_end_iso, "timeZone": str(TIMEZONE)}
+
         elif field == "location":
             event["location"] = value
 
-        if field != "calendar":
-            await asyncio.to_thread(
-                lambda: service.events().update(
-                    calendarId=meta["cal_id"],
-                    eventId=meta["event_id"],
-                    body=event
-                ).execute()
-            )
+        # For all fields except calendar (already returned above)
+        await asyncio.to_thread(
+            lambda: service.events().update(
+                calendarId=meta["cal_id"],
+                eventId=meta["event_id"],
+                body=event
+            ).execute()
+        )
 
-        field_label = {"title": "Title", "start": "Start time", "end": "End time", "location": "Location"}.get(field, field.title())
-        return f"✅ *{summary}* updated — {field_label}: {value}"
+        # Build success message
+        updated_start = event.get("start", {}).get("dateTime", "")
+        updated_end = event.get("end", {}).get("dateTime", "")
+        try:
+            s_dt = datetime.fromisoformat(updated_start.replace("Z", "+00:00"))
+            e_dt = datetime.fromisoformat(updated_end.replace("Z", "+00:00"))
+            date_label = s_dt.strftime("%a %d %b %Y")
+            time_label = f"{s_dt.strftime('%I:%M%p').lstrip('0').lower()} – {e_dt.strftime('%I:%M%p').lstrip('0').lower()}"
+            return f"✅ *{summary}* updated — {cal_name} | {date_label}, {time_label}"
+        except Exception:
+            return f"✅ *{summary}* updated"
+
     except Exception as e:
         return f"❌ Couldn't update event: {str(e)}"
 

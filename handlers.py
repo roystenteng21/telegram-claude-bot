@@ -21,7 +21,8 @@ from stocks import (
 from bills import delete_bill
 from cal import (
     delete_calendar_event, write_calendar_event, apply_calendar_edit,
-    find_upcoming_events, format_calendar_confirm, _apply_event_edit
+    find_upcoming_events, format_calendar_confirm, _apply_event_edit,
+    _fmt_event_row
 )
 from todos import complete_todo
 from meetings import handle_meeting_session
@@ -63,45 +64,121 @@ async def handle_calendar_confirm_session(user_id, text, lower, update):
     # Multiple delete disambiguation
     if cs.get("step") == "pick_delete":
         matches = cs.get("delete_matches", [])
-        if text.strip().isdigit():
-            idx = int(text.strip()) - 1
+        raw = text.strip()
+        # Fast confirm: "1 confirm", "1y", "1 yes"
+        fast_confirm = False
+        pick_num = None
+        raw_lower = raw.lower()
+        if raw_lower.isdigit():
+            pick_num = int(raw_lower)
+        else:
+            import re as _re
+            m = _re.match(r'^(\d+)\s*(confirm|yes|y)$', raw_lower)
+            if m:
+                pick_num = int(m.group(1))
+                fast_confirm = True
+
+        if pick_num is not None:
+            idx = pick_num - 1
             if 0 <= idx < len(matches):
-                _, summary, _ = matches[idx]
-                del state.calendar_confirm_sessions[user_id]
-                state.session_timestamps.pop(user_id, None)
-                reply = await delete_calendar_event(summary)
-                await send_safe(update.message, reply, parse_mode="Markdown")
+                meta, summary, dtstart, dtend = matches[idx]
+                if fast_confirm:
+                    # Delete immediately
+                    del state.calendar_confirm_sessions[user_id]
+                    state.session_timestamps.pop(user_id, None)
+                    # Store dtstart/summary/cal_name in meta for success message
+                    meta["dtstart"] = dtstart
+                    meta["summary"] = summary
+                    reply = await delete_calendar_event(meta)
+                    await send_safe(update.message, reply, parse_mode="Markdown")
+                else:
+                    # Show confirm step with rich format
+                    from cal import _fmt_event_row
+                    event_str = _fmt_event_row(summary, meta.get("cal_name", ""), dtstart, dtend)
+                    state.calendar_confirm_sessions[user_id] = {
+                        "step": "confirm_delete_picked",
+                        "meta": meta,
+                        "summary": summary,
+                        "dtstart": dtstart,
+                    }
+                    state.session_timestamps[user_id] = touch_session(user_id) or state.session_timestamps.get(user_id)
+                    await send_safe(update.message, f"🗑 {event_str}\n\nDelete it? (yes / no)", parse_mode="Markdown")
             else:
                 await update.message.reply_text(f"Pick a number between 1 and {len(matches)}.")
-        elif lower in ["cancel", "nvm", "nevermind"]:
+        elif raw_lower in ["more"]:
+            # Widen search
+            event_query = cs.get("event_query", "")
+            field = cs.get("field")
+            value = cs.get("value")
+            if event_query and field:
+                from cal import edit_calendar_event
+                del state.calendar_confirm_sessions[user_id]
+                reply = await edit_calendar_event(f"{event_query}", user_id, expand_search=True)
+                await send_safe(update.message, reply, parse_mode="Markdown")
+            else:
+                await update.message.reply_text("Reply with a number or 'cancel'.")
+        elif raw_lower in ["cancel", "nvm", "nevermind"]:
             del state.calendar_confirm_sessions[user_id]
             state.session_timestamps.pop(user_id, None)
             await update.message.reply_text("Cancelled.")
         else:
-            await update.message.reply_text("Reply with a number or 'cancel'.")
+            await update.message.reply_text("Reply with a number, 'more', or 'cancel'.")
+        return True
+
+    # Confirm picked delete
+    if cs.get("step") == "confirm_delete_picked":
+        if lower in ["yes", "y", "yep", "yeah", "yup"]:
+            meta = cs.get("meta", {})
+            summary = cs.get("summary", "Event")
+            dtstart = cs.get("dtstart", "")
+            meta["dtstart"] = dtstart
+            meta["summary"] = summary
+            del state.calendar_confirm_sessions[user_id]
+            state.session_timestamps.pop(user_id, None)
+            reply = await delete_calendar_event(meta)
+            await send_safe(update.message, reply, parse_mode="Markdown")
+        elif lower in ["no", "n", "cancel", "nope", "nah"]:
+            del state.calendar_confirm_sessions[user_id]
+            state.session_timestamps.pop(user_id, None)
+            await update.message.reply_text("Cancelled.")
+        else:
+            await update.message.reply_text("Reply yes to delete or no to cancel.")
         return True
 
     # Multiple edit disambiguation
     if cs.get("step") == "pick_edit":
         matches = cs.get("edit_matches", [])
-        if text.strip().isdigit():
+        raw_lower = lower.strip()
+        if raw_lower == "more":
+            event_query = cs.get("event_query", "")
+            field = cs.get("field")
+            value = cs.get("value")
+            if event_query and field:
+                from cal import edit_calendar_event
+                del state.calendar_confirm_sessions[user_id]
+                # Reconstruct original text for expand search
+                reply = await edit_calendar_event(f"{event_query} {field} {value}", user_id, expand_search=True)
+                await send_safe(update.message, reply, parse_mode="Markdown")
+            else:
+                await update.message.reply_text("Reply with a number or 'cancel'.")
+        elif text.strip().isdigit():
             idx = int(text.strip()) - 1
             if 0 <= idx < len(matches):
-                meta, summary, _ = matches[idx]
+                meta, summary, dtstart, dtend = matches[idx]
                 field = cs.get("field")
                 value = cs.get("value")
                 del state.calendar_confirm_sessions[user_id]
                 state.session_timestamps.pop(user_id, None)
-                reply = await _apply_event_edit(meta, summary, field, value)
+                reply = await _apply_event_edit(meta, summary, field, value, dtstart, dtend)
                 await send_safe(update.message, reply, parse_mode="Markdown")
             else:
                 await update.message.reply_text(f"Pick a number between 1 and {len(matches)}.")
-        elif lower in ["cancel", "nvm", "nevermind"]:
+        elif raw_lower in ["cancel", "nvm", "nevermind"]:
             del state.calendar_confirm_sessions[user_id]
             state.session_timestamps.pop(user_id, None)
             await update.message.reply_text("Cancelled.")
         else:
-            await update.message.reply_text("Reply with a number or 'cancel'.")
+            await update.message.reply_text("Reply with a number, 'more', or 'cancel'.")
         return True
 
     # Add confirm session
