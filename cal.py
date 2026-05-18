@@ -130,7 +130,7 @@ Respond ONLY with a JSON object — no other text, no markdown:
 }}
 
 Rules:
-- title: the person or event name only, no calendar name in the title
+- title: the person or event name only — if any word in the input matches a calendar name from the available list, it belongs in the calendar field, never in the title
 - calendar: match exactly from the available list; if the user says 'appointment' use 'Appointment'
 - start/end: always include the full year; never use a past year
 - if no end time given, assume 1 hour after start
@@ -290,7 +290,7 @@ For calendar, match from: {', '.join(KNOWN_CALENDARS)}"""
 
         if field == "calendar":
             value = _match_calendar_name(value)
-        if field in ("start", "end", "title", "location", "notes"):
+        if field in ("start", "end", "title", "location", "notes", "calendar"):
             parsed[field] = value
         elif field == "time":
             parsed["start"] = value
