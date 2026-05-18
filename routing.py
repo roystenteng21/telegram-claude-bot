@@ -489,8 +489,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     if lower.startswith("edit cal "):
         reply = await edit_calendar_event(text[9:].strip(), user_id)
 
-    elif lower.startswith("cal delete "):
-        event_query = text[11:].strip()
+    elif lower.startswith("cal delete ") or lower.startswith("remove cal ") or lower.startswith("remove event "):
+        event_query = re.sub(r"^(cal delete|remove cal|remove event)\s+", "", text, flags=re.IGNORECASE).strip()
         matches, err = await find_upcoming_events(event_query)
         if err:
             reply = err
@@ -940,7 +940,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif lower == "events week":
         reply = await get_events(7)
     elif lower.startswith("delete event "):
-        event_query = text[13:].strip()
+        event_query = re.sub(r"^delete event\s+", "", text, flags=re.IGNORECASE).strip()
         matches, err = await find_upcoming_events(event_query)
         if err:
             reply = err

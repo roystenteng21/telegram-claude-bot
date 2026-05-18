@@ -41,6 +41,7 @@ manual_fx_rates = {}
 cached_fx_rates = {}
 
 # --- API health flags ---
+OAUTH_DRIVE_OK = False
 _anthropic_failure_count = 0
 _anthropic_down_notified = False
 _icloud_down = False

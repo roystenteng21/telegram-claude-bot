@@ -1,6 +1,6 @@
 # Em Session Brief
 _Session start: send "start session" — Claude pulls brief from Drive automatically._
-**Last updated: 17/05/2026 — Session 33**
+**Last updated: 18/05/2026 — Session 34**
 
 ---
 
@@ -15,7 +15,7 @@ R1: Route by cost — exact→regex→keyword→cache→live→Claude. Never Cla
 R2: Single pass, immediate exit on first match.
 R3: One sheet read per request, cached, invalidated on write only.
 R4: Haiku for classification/extraction <200 tokens. Sonnet for reasoning/conversation only.
-R5: ALL iCloud CalDAV calls must use asyncio.to_thread() — blocking network calls freeze the event loop on Railway. Apply to any external blocking call.
+R5: ALL external blocking calls must use asyncio.to_thread() — blocking network calls freeze the event loop on Railway.
 R6: Session messages never reach main routing chain. Sessions time out cleanly.
 R7: Cache hierarchy: in-memory → cached sheet → live sheet → external API.
 R8: Every branch sets reply or returns. Empty reply is a bug.
@@ -40,12 +40,15 @@ R14: deploy.py auto-detects all .py module files — never hardcode module lists
 - **force_confirm:** Photos always pass force_confirm=True to handle_expense_text — bypasses auto-log even for known merchants. Implemented S31.
 - **alert_error:** Shared async helper in helpers.py — sends Telegram message on silent failures in critical paths. Uses state._app_ref. Never raises. Also fires on Claude fallback to alert routing gaps (scoped to feature-signal messages only — not casual conversation).
 - **handlers.py:** Layer 5.5 module. Owns all session handler logic extracted from routing.py. routing.py delegates to it via await calls. Never import routing.py from handlers.py.
-- **Calendar trigger:** `cal [title] [calendar] [date] [time] [location]` — parses via Haiku with pre-computed date anchors, shows confirmation, writes on yes. `cal delete [title]` — finds upcoming event, confirms before delete.
-- **Calendar sessions:** calendar_confirm_sessions in state.py. Inline edit supported (e.g. "change time to 2pm"). All Google Calendar ops async via asyncio.to_thread().
+- **Calendar trigger:** `cal [title] [calendar] [date] [time] [location]` — parses via Haiku with pre-computed date anchors, shows confirmation, writes on yes. `cal delete [title]` — finds upcoming event, confirms before delete. `edit cal [event] [field] [value]` — edits existing event directly.
+- **Calendar sessions:** calendar_confirm_sessions in state.py. Supports: add confirm (yes/edit), delete disambiguation (pick_delete), edit disambiguation (pick_edit). Blank "edit" during confirm prompts field selection. All Google Calendar ops async via asyncio.to_thread().
 - **Calendar backend:** Google Calendar API (service account). caldav/iCloud removed — Apple blocks PUT writes from Railway IPs. Calendar IDs hardcoded in cal.py. Service object cached at module level.
 - **Calendar date resolution:** Relative dates (next Friday, tomorrow, etc.) pre-computed in Python and injected into Haiku prompt — never left to model inference. Year always injected explicitly.
+- **Calendar title cleanup:** Calendar name words are stripped from title post-parse (e.g. "Branson appointment" → title "Branson", calendar "Appointment").
+- **Calendar session timestamp:** touch_session / session_timestamps must be set when creating any calendar_confirm_sessions entry — missing timestamp causes silent expiry.
 - **Routing fallback alert:** Claude fallback fires alert_error only when message contains feature signals — not on casual conversation like "hi em".
 - **GitHub fetch:** All module files fetched via `https://raw.githubusercontent.com/roystenteng21/telegram-claude-bot/main/<file>.py`. Em Codes Drive folder retired.
+- **Secret Files Rule:** anthropic_key.txt and any sensitive files must never be committed. .gitignore covers: anthropic_key.txt, client_secrets.json, token.json, *key*.txt, *secret*.txt.
 
 ---
 
@@ -54,14 +57,16 @@ R14: deploy.py auto-detects all .py module files — never hardcode module lists
 - Feasibility Rule: never suggest without certainty it works.
 - No Silent Changes: architectural changes logged to Dev Notes immediately.
 - Circular Import Zero Tolerance: restructure, never workaround.
-- Secret Files Rule: client\_secrets.json and token.json gitignored, never committed.
+- Secret Files Rule: client\_secrets.json, token.json, and any file with sensitive/personal data gitignored — never committed.
 - Silent Failure Rule: every except block must send a user-facing message. Never print-only.
+- **STRICT MANDATE: Never suggest or allow committing files with sensitive or personal information to GitHub. If detected, flag immediately for removal.**
 
 ---
 
 ## Handoff Protocol
 - Brief pulled from Drive (ID: 1TeFX3klHnKFTwRGFnxLUf1LSjRSNR3zl) on session start.
 - Module files fetched from GitHub — no uploads needed.
+- **At session start: always fetch routing.py from GitHub to confirm deployed version matches expected state.**
 - Explicit go-ahead required before building anything.
 - Session not closed until deploy confirmed. Brief delivered as .txt in chat.
 
@@ -101,17 +106,17 @@ deploy.py now auto-detects all .py files in repo — no hardcoded list. NON_MODU
 | stocks | stocks.py | 4 | Portfolio, price alerts, market summary |
 | trips | trips.py | 4 | Overseas mode, flight tracking, trip history |
 | sessions | sessions.py | 5 | Session timeouts, persist/restore receipt sessions |
-| handlers | handlers.py | 5.5 | All session handler logic — calendar, restaurant, contact, todo, expense, CRM edit, recon, portfolio |
+| handlers | handlers.py | 5.5 | All session handler logic — calendar (add/delete/edit), restaurant, contact, todo, expense, CRM edit, recon, portfolio |
 | routing | routing.py | 6 | Main message handler, system prompt, primary routing chain |
 | infrastructure | infrastructure.py | 7 | Boot setup, OAuth test, Drive folder creation, alerts |
 | bot | bot.py | 8 | Scheduler, app init |
 
 ---
 
-## Last Session (S33 — 17/05/2026)
-**Built:** Google Calendar API backend replacing caldav entirely · cal.py rewritten: CALENDAR_IDS map, service account auth, _get_service cached at module level, smart_add_event async, parse_calendar_request wrapped in asyncio.to_thread, apply_calendar_edit async · routing.py: calendar_confirm_sessions handler added, SESSION_REPLY_WORDS guard on interrupt check, routing fallback alert scoped to feature signals, debug print removed, get_calendar removed · handlers.py: apply_calendar_edit awaited, iCloud error message updated · requirements.txt: caldav removed
-**Fixed:** iCloud CalDAV write hang on Railway (Apple blocks PUT from Railway IPs) · false routing fallback alerts on casual messages · calendar edit no response (sync blocking call) · routing fallback alert false positives
-**Pending:** Calendar `yes` still not responding after deploy — Railway logs show no output after yes, deployed routing.py may still be old version (fetch from GitHub to confirm on next session start) · test_icloud.py still in repo · S27 test checklist not run · bills strptime crash · Medium/low audit findings deferred
+## Last Session (S34 — 18/05/2026)
+**Built:** edit_calendar_event — one-step edit existing Google Calendar events via `edit cal [event] [field] [value]` · _apply_event_edit — patches event via Google Calendar API, handles calendar moves · pick_edit session step in handlers.py for multi-match disambiguation · blank "edit" during confirm now prompts field selection · calendar title post-processing strips calendar name words · state.py: calendar_confirm_sessions dict added · .gitignore updated to block sensitive files
+**Fixed:** Calendar `yes` not responding — session_timestamps never set on calendar_confirm_sessions creation · TIMEZONE object not JSON serializable in write_calendar_event · calendar field not saved after inline edit · S33 files never committed to GitHub (root cause of all calendar issues)
+**Pending:** Expense confirmation options update (yes / save / edit) · Split expense rebuild (divide by people) · S27 test checklist not run · bills strptime crash · Medium/low audit findings deferred
 
 ---
 
@@ -127,8 +132,8 @@ deploy.py now auto-detects all .py files in repo — no hardcoded list. NON_MODU
 ---
 
 ## Open Backlog
-- **CRITICAL:** Calendar `yes` not responding — fetch routing.py from GitHub at session start to confirm deployed version
-- Remove test_icloud.py from repo
+- Expense confirmation options — change to yes / save / edit (split broken, needs rebuild as divide-by-people)
+- Split expense — rebuild: ask how many ways, divide amount, log per-person amount
 - S27 test checklist not run
 - Bills sheet due date stored as int not str — strptime crash on boot (R12 violation, low priority)
 - Medium/low audit findings deferred (H9–H14, M1–M11, L1–L9) — see S31 audit report

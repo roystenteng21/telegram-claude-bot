@@ -1,11 +1,11 @@
 {
   "date": "2026-05-18",
-  "session": "Session 34",
-  "built": "cal.py edit_calendar_event, title strip, handlers.py pick_edit + blank edit prompt, routing.py edit cal trigger",
-  "fixed": "calendar name leaking into title, edit with no field, no way to edit existing events",
-  "pending": "split expense, S27 test checklist, bills strptime crash",
-  "deploy_count": 44,
-  "module_count": 25,
+  "session": "Session 35",
+  "built": "remove cal/remove event routing",
+  "fixed": "OAUTH_DRIVE_OK missing from state",
+  "pending": "none",
+  "deploy_count": 45,
+  "module_count": 22,
   "modules": [
     "bills.py",
     "bot.py",
@@ -22,14 +22,11 @@
     "reminders.py",
     "restaurants.py",
     "routing.py",
-    "routing_s31_patch.py",
     "sessions.py",
-    "sheet_updater.py",
     "sheets.py",
     "state.py",
     "stocks.py",
     "test_em.py",
-    "test_icloud.py",
     "todos.py",
     "trips.py"
   ]
