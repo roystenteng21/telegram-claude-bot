@@ -1,10 +1,10 @@
 {
   "date": "2026-05-19",
   "session": "Session 36",
-  "built": "M2 M4 M5 M7 M9 M10 L1 L2 L6 L7 L8 L9 FC food court alias",
-  "fixed": "M1 M3 M6 M8 M11 deferred",
-  "pending": "live test calendar C1-C8",
-  "deploy_count": 48,
+  "built": "alert_error restored to helpers.py",
+  "fixed": "boot crash",
+  "pending": "none",
+  "deploy_count": 49,
   "module_count": 22,
   "modules": [
     "bills.py",

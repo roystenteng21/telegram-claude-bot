@@ -165,6 +165,16 @@ def looks_like_new_intent(text):
 
 # ── Safe message sender ────────────────────────────────────────────────────────
 
+async def alert_error(message):
+    """Send an error alert to the bot owner via state._app_ref."""
+    try:
+        import state
+        from config import YOUR_CHAT_ID
+        if state._app_ref:
+            await state._app_ref.bot.send_message(chat_id=YOUR_CHAT_ID, text=message)
+    except Exception as e:
+        print(f"alert_error failed: {e}")
+
 async def send_safe(target, text, parse_mode=None):
     """Send a message, splitting into chunks if over Telegram's 4096 char limit."""
     MAX = 4096
