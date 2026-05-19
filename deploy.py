@@ -3,6 +3,7 @@
 deploy.py — Em deployment script
 Usage: python3 ~/telegram-claude-bot/deploy.py "commit msg" "Session N" "built" "fixed" "pending"
 - Auto-detects all module .py files in repo (excludes non-module files)
+- Runs cross-reference check: verifies all imported functions exist in their source files
 - Writes session_meta.json to repo (Railway reads this on boot to update Em Log + Module Registry)
 - Commits and pushes to GitHub
 - Railway auto-deploys on push
@@ -10,6 +11,7 @@ Usage: python3 ~/telegram-claude-bot/deploy.py "commit msg" "Session N" "built" 
 
 import os
 import sys
+import ast
 import json
 import subprocess
 from datetime import date
@@ -58,6 +60,88 @@ def check_modules():
         sys.exit(1)
     print(f"✅ {len(modules)} module files detected: {', '.join(modules)}")
     return modules
+
+
+def _get_defined_names(filepath):
+    """Return set of all names available from a module — defined or imported."""
+    try:
+        with open(filepath) as f:
+            tree = ast.parse(f.read(), filename=filepath)
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name != "*":
+                        names.add(alias.asname or alias.name)
+        return names
+    except Exception as e:
+        print(f"  ⚠️  Could not parse {os.path.basename(filepath)}: {e}")
+        return set()
+
+
+def _get_from_imports(filepath):
+    """Return list of (module_name, [imported_names]) for all 'from X import ...' statements."""
+    try:
+        with open(filepath) as f:
+            tree = ast.parse(f.read(), filename=filepath)
+        imports = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.module and not node.module.startswith("."):
+                    names = [alias.name for alias in node.names if alias.name != "*"]
+                    if names:
+                        imports.append((node.module, names))
+        return imports
+    except Exception:
+        return []
+
+
+def check_cross_references(modules):
+    """
+    For each module file, check that functions imported from other local modules
+    actually exist in those source files. Returns True if all clean, False if issues found.
+    """
+    print("\n🔍 Running cross-reference check...")
+
+    # Build map of module name -> defined names
+    local_modules = {os.path.splitext(f)[0]: f for f in modules}
+    defined = {}
+    for mod_name, filename in local_modules.items():
+        filepath = os.path.join(REPO_DIR, filename)
+        defined[mod_name] = _get_defined_names(filepath)
+
+    issues = []
+    for mod_name, filename in local_modules.items():
+        filepath = os.path.join(REPO_DIR, filename)
+        from_imports = _get_from_imports(filepath)
+        for source_module, imported_names in from_imports:
+            if source_module not in local_modules:
+                continue  # skip third-party imports
+            source_defined = defined.get(source_module, set())
+            for name in imported_names:
+                if name not in source_defined:
+                    issues.append(
+                        f"  ❌ {filename}: imports '{name}' from {source_module}.py — not found"
+                    )
+
+    if issues:
+        print(f"⚠️  Cross-reference issues found ({len(issues)}):")
+        for issue in issues:
+            print(issue)
+        print("\n  Fix these before deploying, or the bot will crash on startup.")
+        return False
+    else:
+        print("✅ Cross-reference check passed — all imports verified")
+        return True
 
 
 def _read_deploy_count():
@@ -141,6 +225,13 @@ def main():
     print(f"   Commit: {commit_msg}\n")
 
     modules = check_modules()
+
+    # Cross-reference check — abort if broken imports found
+    refs_ok = check_cross_references(modules)
+    if not refs_ok:
+        print("\n❌ Deploy aborted — fix cross-reference issues first.")
+        sys.exit(1)
+
     write_session_meta(session_name, built, fixed, pending, modules)
     pushed = git_commit_push(commit_msg)
     commit_hash = get_commit_hash()

@@ -1,10 +1,10 @@
 {
   "date": "2026-05-19",
   "session": "Session 36",
-  "built": "full audit all 21 files clean",
-  "fixed": "M2 missed followup scope, M5 market summary key",
-  "pending": "none",
-  "deploy_count": 50,
+  "built": "deploy.py cross-reference check",
+  "fixed": "M2 M5 routing fixes, all S36 audit items",
+  "pending": "expense confirm options, split expense rebuild, S27 test checklist",
+  "deploy_count": 51,
   "module_count": 21,
   "modules": [
     "bills.py",
