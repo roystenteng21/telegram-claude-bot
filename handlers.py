@@ -61,6 +61,19 @@ async def handle_calendar_confirm_session(user_id, text, lower, update):
     touch_session(user_id)
     cs = state.calendar_confirm_sessions[user_id]
 
+    # C2: awaiting edit field prompt response
+    if cs.get("step") == "awaiting_edit_field":
+        event_query = cs.get("event_query", "")
+        cal_filter = cs.get("cal_filter", "")
+        del state.calendar_confirm_sessions[user_id]
+        state.session_timestamps.pop(user_id, None)
+        # Re-run edit with the combined query
+        from cal import edit_calendar_event
+        combined = f"{event_query} {text.strip()}"
+        reply = await edit_calendar_event(combined, user_id)
+        await send_safe(update.message, reply, parse_mode="Markdown")
+        return True
+
     # Multiple delete disambiguation
     if cs.get("step") == "pick_delete":
         matches = cs.get("delete_matches", [])
@@ -165,11 +178,13 @@ async def handle_calendar_confirm_session(user_id, text, lower, update):
             idx = int(text.strip()) - 1
             if 0 <= idx < len(matches):
                 meta, summary, dtstart, dtend = matches[idx]
-                field = cs.get("field")
-                value = cs.get("value")
+                field = cs.get("field", "")
+                value = cs.get("value", "")
+                date_val = cs.get("date_val", "")
+                time_range_val = cs.get("time_range_val", "")
                 del state.calendar_confirm_sessions[user_id]
                 state.session_timestamps.pop(user_id, None)
-                reply = await _apply_event_edit(meta, summary, field, value, dtstart, dtend)
+                reply = await _apply_event_edit(meta, summary, field, value, dtstart, dtend, date_val=date_val, time_range_val=time_range_val)
                 await send_safe(update.message, reply, parse_mode="Markdown")
             else:
                 await update.message.reply_text(f"Pick a number between 1 and {len(matches)}.")

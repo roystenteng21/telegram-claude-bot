@@ -489,8 +489,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     if lower.startswith("edit cal "):
         reply = await edit_calendar_event(text[9:].strip(), user_id)
 
-    elif lower.startswith("cal delete ") or lower.startswith("remove cal ") or lower.startswith("remove event "):
-        event_query = re.sub(r"^(cal delete|remove cal|remove event)\s+", "", text, flags=re.IGNORECASE).strip()
+    elif lower.startswith("cal delete ") or lower.startswith("cal del ") or lower.startswith("remove cal ") or lower.startswith("remove event "):
+        event_query = re.sub(r"^(cal delete|cal del|remove cal|remove event)\s+", "", text, flags=re.IGNORECASE).strip()
         matches, err, capped = await find_upcoming_events(event_query)
         if err:
             reply = err
@@ -1134,20 +1134,7 @@ async def check_missed_items_on_startup(app):
             print(f"Missed followups check error: {e}")
 
         try:
-            ws = bills_sheet()
-            cutoff = today - timedelta(days=7)
-            for r in ws.get_all_records():
-                due_str = str(r.get("Due Date", ""))
-                if not due_str:
-                    continue
-                for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y"]:
-                    try:
-                        due_date = datetime.strptime(due_str, fmt).date()
-                        if cutoff <= due_date <= yesterday:
-                            missed_bills.append(r.get("Name", "?"))
-                        break
-                    except ValueError:
-                        continue
+            pass  # Missed bill alerts suppressed — reminders fire on schedule only
         except Exception as e:
             print(f"Missed bills check error: {e}")
 

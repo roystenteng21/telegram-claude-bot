@@ -178,7 +178,7 @@ Respond ONLY with a JSON object — no other text, no markdown:
 }}
 
 Rules:
-- title: the person or event name only — if any word in the input matches a calendar name from the available list, it belongs in the calendar field, never in the title
+- title: the person or event name only — if any word in the input matches a calendar name from the available list, it belongs in the calendar field, never in the title. Day-of-week words (monday, tuesday, wednesday, thursday, friday, saturday, sunday, mon, tue, wed, thu, fri, sat, sun) must NEVER appear in the title — they belong in the date field only
 - calendar: match exactly from the available list; if the user says 'appointment' use 'Appointment'
 - start/end: always include the full year; never use a past year
 - if no end time given, assume 1 hour after start
@@ -511,6 +511,10 @@ async def check_icloud_daily(app):
 
 async def edit_calendar_event(text, user_id, expand_search=False):
     """Parse 'edit cal [event] [field] [value]' and apply the change."""
+
+    # C1: strip "delete" to prevent confusion with delete flow
+    clean_text = re.sub(r'\bdelete\b', '', text, flags=re.IGNORECASE).strip()
+
     date_block = _build_date_anchor_block()
     known_cals = ", ".join(KNOWN_CALENDARS)
 
@@ -519,35 +523,37 @@ async def edit_calendar_event(text, user_id, expand_search=False):
 Available calendars: {known_cals}
 
 Parse this calendar edit request:
-"{text}"
+"{clean_text}"
 
 Respond ONLY with a JSON object — no other text:
 {{
   "event_query": "the event name to search for",
-  "calendar_filter": "calendar name if mentioned, or empty string",
-  "field": "title|calendar|start|end|time_range|end_only",
-  "value": "new value"
+  "calendar_filter": "calendar name if explicitly mentioned, or empty string",
+  "field": "title|calendar|start|end_only|location, or empty string if only date/time_range",
+  "value": "new value for that field, or empty string",
+  "date": "DD MMM YYYY if a new date is specified, or empty string",
+  "time_range": "HH:MM-HH:MM if both start and end time are given, or empty string"
 }}
 
-Field rules:
-- "start": single new start time only (end time unchanged). Format: HH:MM (24h)
-- "end_only": only the end time is being changed. Format: HH:MM (24h)
-- "time_range": both start and end explicitly stated. Format: "HH:MM-HH:MM" (24h)
-- "title": new event title
-- "calendar": new calendar name from available list
-- "location": new location
-
-For time values always use 24h format HH:MM.
-If a range like "6.30 to 9.30pm" is given, output field "time_range" and value "18:30-21:30".
-If only one time is given (e.g. "time 6pm"), output field "start" and value "18:00".
-If "end [time]" is given, output field "end_only" and value e.g. "21:30".
-calendar_filter: only populate if a calendar name is explicitly mentioned in the request."""
+Rules:
+- event_query: event name only — never include calendar names or date/time words in it
+- calendar_filter: only populate if a calendar name from the available list is explicitly mentioned. Do NOT put it in event_query
+- date: populate if the user specifies a new date (e.g. "23 may", "next friday"). Use resolved dates above. Leave empty if only time is changing
+- time_range: populate if both start AND end time are given (e.g. "6.30pm to 9.30pm" → "18:30-21:30"). When set, field/value may be empty
+- field/value: use for single-field changes:
+  - "start": single new start time only (end unchanged). value = HH:MM (24h)
+  - "end_only": only end time changing. value = HH:MM (24h)
+  - "title": new event title
+  - "calendar": new calendar name
+  - "location": new location
+- If both date and time_range are given, populate both
+- All time values in 24h HH:MM format"""
 
     try:
         response = await asyncio.to_thread(
             lambda: client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=150,
+                max_tokens=200,
                 messages=[{"role": "user", "content": parse_prompt}]
             )
         )
@@ -559,11 +565,24 @@ calendar_filter: only populate if a calendar name is explicitly mentioned in the
     event_query = parsed.get("event_query", "").strip()
     field = parsed.get("field", "").strip()
     value = parsed.get("value", "").strip()
+    date_val = parsed.get("date", "").strip()
+    time_range_val = parsed.get("time_range", "").strip()
     cal_filter_raw = parsed.get("calendar_filter", "").strip()
     cal_filter = _match_calendar_name(cal_filter_raw) if cal_filter_raw else None
 
-    if not event_query or not field or not value:
+    if not event_query:
         return "⚠️ Couldn't parse that — try: edit cal Branson time 11am"
+
+    # C2: if no field/value and no date/time_range, prompt for what to edit
+    has_change = (field and value) or date_val or time_range_val
+    if not has_change:
+        state.calendar_confirm_sessions[user_id] = {
+            "step": "awaiting_edit_field",
+            "event_query": event_query,
+            "cal_filter": cal_filter_raw,
+        }
+        state.session_timestamps[user_id] = datetime.now(TIMEZONE)
+        return f"What would you like to edit for *{event_query}*?\n(time / date / calendar / location / title)"
 
     days = 365 if expand_search else 90
     matches, err, capped = await find_upcoming_events(event_query, cal_filter=cal_filter, days=days, max_results=4)
@@ -575,7 +594,7 @@ calendar_filter: only populate if a calendar name is explicitly mentioned in the
         matches, err, capped = await find_upcoming_events(event_query, days=days, max_results=4)
         if err:
             return err
-        cal_filter = None  # fell back
+        cal_filter = None
 
     if not matches:
         return f"No upcoming event found matching '{event_query}'"
@@ -591,6 +610,8 @@ calendar_filter: only populate if a calendar name is explicitly mentioned in the
             "edit_matches": matches,
             "field": field,
             "value": value,
+            "date_val": date_val,
+            "time_range_val": time_range_val,
             "event_query": event_query,
             "capped": capped,
         }
@@ -598,10 +619,9 @@ calendar_filter: only populate if a calendar name is explicitly mentioned in the
         return "\n".join(lines)
 
     meta, summary, dtstart, dtend = matches[0]
-    return await _apply_event_edit(meta, summary, field, value, dtstart, dtend)
+    return await _apply_event_edit(meta, summary, field, value, dtstart, dtend, date_val=date_val, time_range_val=time_range_val)
 
-
-async def _apply_event_edit(meta, summary, field, value, dtstart=None, dtend=None):
+async def _apply_event_edit(meta, summary, field, value, dtstart=None, dtend=None, date_val="", time_range_val=""):
     """Apply a single field edit to an existing Google Calendar event."""
     try:
         service = await asyncio.to_thread(_get_service)
@@ -614,96 +634,136 @@ async def _apply_event_edit(meta, summary, field, value, dtstart=None, dtend=Non
 
         cal_name = meta.get("cal_name", "")
 
-        if field == "title":
-            event["summary"] = value
-
-        elif field == "calendar":
-            new_cal_name = _match_calendar_name(value)
-            new_cal_id = _get_calendar_id(new_cal_name)
-            event.pop("id", None)
-            event.pop("etag", None)
-            await asyncio.to_thread(
-                lambda: service.events().insert(calendarId=new_cal_id, body=event).execute()
-            )
-            await asyncio.to_thread(
-                lambda: service.events().delete(
-                    calendarId=meta["cal_id"],
-                    eventId=meta["event_id"]
-                ).execute()
-            )
-            return f"✅ *{summary}* moved to {new_cal_name}"
-
-        elif field == "start":
-            # Update start only; end time unchanged
+        # C4/C5: apply date change first (preserving existing times)
+        if date_val:
+            try:
+                new_date = datetime.strptime(date_val, "%d %b %Y")
+                new_date_str = new_date.strftime("%Y-%m-%d")
+            except Exception:
+                return f"⚠️ Couldn't parse date '{date_val}' — try: 23 May 2026"
             existing_start = event.get("start", {}).get("dateTime", "")
-            try:
-                existing_dt = datetime.fromisoformat(existing_start.replace("Z", "+00:00"))
-                existing_date = existing_dt.strftime("%Y-%m-%d")
-            except Exception:
-                return "⚠️ Couldn't read existing event start time"
-            try:
-                new_time = datetime.strptime(value, "%H:%M")
-            except Exception:
-                return "⚠️ Couldn't parse that time — use HH:MM format e.g. 18:30"
-            new_start_iso = f"{existing_date}T{new_time.strftime('%H:%M')}:00"
-            event["start"] = {"dateTime": new_start_iso, "timeZone": str(TIMEZONE)}
-            # Validate new start not after existing end
             existing_end = event.get("end", {}).get("dateTime", "")
-            if existing_end:
+            if existing_start and "T" in existing_start:
                 try:
-                    end_dt = datetime.fromisoformat(existing_end.replace("Z", "+00:00"))
-                    new_start_dt = datetime.fromisoformat(new_start_iso)
-                    if new_start_dt >= end_dt.replace(tzinfo=None):
-                        return "⚠️ New start time is at or after the existing end time — clarify the range"
+                    s_dt = datetime.fromisoformat(existing_start.replace("Z", "+00:00"))
+                    e_dt = datetime.fromisoformat(existing_end.replace("Z", "+00:00")) if existing_end and "T" in existing_end else None
+                    event["start"] = {"dateTime": f"{new_date_str}T{s_dt.strftime('%H:%M')}:00", "timeZone": str(TIMEZONE)}
+                    if e_dt:
+                        event["end"] = {"dateTime": f"{new_date_str}T{e_dt.strftime('%H:%M')}:00", "timeZone": str(TIMEZONE)}
                 except Exception:
-                    pass
+                    return "⚠️ Couldn't update event date"
+            else:
+                event["start"] = {"date": new_date_str}
+                event["end"] = {"date": new_date_str}
 
-        elif field == "end_only":
-            # Update end only; start unchanged
-            existing_start = event.get("start", {}).get("dateTime", "")
-            try:
-                existing_dt = datetime.fromisoformat(existing_start.replace("Z", "+00:00"))
-                existing_date = existing_dt.strftime("%Y-%m-%d")
-                existing_start_time = existing_dt.replace(tzinfo=None)
-            except Exception:
-                return "⚠️ Couldn't read existing event start time"
-            try:
-                new_time = datetime.strptime(value, "%H:%M")
-            except Exception:
-                return "⚠️ Couldn't parse that time — use HH:MM format e.g. 21:30"
-            new_end_iso = f"{existing_date}T{new_time.strftime('%H:%M')}:00"
-            new_end_dt = datetime.strptime(new_end_iso, "%Y-%m-%dT%H:%M:%S")
-            if new_end_dt <= existing_start_time:
-                return "⚠️ End time can't be before or equal to start time — try again"
-            event["end"] = {"dateTime": new_end_iso, "timeZone": str(TIMEZONE)}
-
-        elif field == "time_range":
-            # Both start and end explicitly set; preserve existing date
-            existing_start = event.get("start", {}).get("dateTime", "")
-            try:
-                existing_dt = datetime.fromisoformat(existing_start.replace("Z", "+00:00"))
-                existing_date = existing_dt.strftime("%Y-%m-%d")
-            except Exception:
+        # C5: apply time_range (uses updated date if date_val also set)
+        if time_range_val:
+            existing_start_raw = event.get("start", {}).get("dateTime", "")
+            if existing_start_raw and "T" in existing_start_raw:
+                use_date = existing_start_raw.split("T")[0]
+            else:
                 return "⚠️ Couldn't read existing event date"
             try:
-                parts = value.split("-")
+                parts = time_range_val.split("-")
                 if len(parts) != 2:
-                    raise ValueError("expected HH:MM-HH:MM")
-                new_start_dt = datetime.strptime(parts[0].strip(), "%H:%M")
-                new_end_dt = datetime.strptime(parts[1].strip(), "%H:%M")
+                    raise ValueError
+                tr_start = datetime.strptime(parts[0].strip(), "%H:%M")
+                tr_end = datetime.strptime(parts[1].strip(), "%H:%M")
             except Exception:
-                return "⚠️ Couldn't parse that time range — try: edit cal Jet time 18:30-21:30"
-            if new_end_dt <= new_start_dt:
+                return "⚠️ Couldn't parse time range — try: 18:30-21:30"
+            if tr_end <= tr_start:
                 return "⚠️ End time can't be before or equal to start time — try again"
-            new_start_iso = f"{existing_date}T{new_start_dt.strftime('%H:%M')}:00"
-            new_end_iso = f"{existing_date}T{new_end_dt.strftime('%H:%M')}:00"
-            event["start"] = {"dateTime": new_start_iso, "timeZone": str(TIMEZONE)}
-            event["end"] = {"dateTime": new_end_iso, "timeZone": str(TIMEZONE)}
+            event["start"] = {"dateTime": f"{use_date}T{tr_start.strftime('%H:%M')}:00", "timeZone": str(TIMEZONE)}
+            event["end"] = {"dateTime": f"{use_date}T{tr_end.strftime('%H:%M')}:00", "timeZone": str(TIMEZONE)}
 
-        elif field == "location":
-            event["location"] = value
+        # Single-field edits — only when field is set
+        only_date_time = (date_val or time_range_val) and not field
+        if not only_date_time and field:
 
-        # For all fields except calendar (already returned above)
+            if field == "title":
+                event["summary"] = value
+
+            elif field == "calendar":
+                new_cal_name = _match_calendar_name(value)
+                new_cal_id = _get_calendar_id(new_cal_name)
+                event.pop("id", None)
+                event.pop("etag", None)
+                await asyncio.to_thread(
+                    lambda: service.events().insert(calendarId=new_cal_id, body=event).execute()
+                )
+                await asyncio.to_thread(
+                    lambda: service.events().delete(
+                        calendarId=meta["cal_id"],
+                        eventId=meta["event_id"]
+                    ).execute()
+                )
+                return f"✅ *{summary}* moved to {new_cal_name}"
+
+            elif field == "start":
+                existing_start = event.get("start", {}).get("dateTime", "")
+                try:
+                    existing_dt = datetime.fromisoformat(existing_start.replace("Z", "+00:00"))
+                    existing_date = existing_dt.strftime("%Y-%m-%d")
+                except Exception:
+                    return "⚠️ Couldn't read existing event start time"
+                try:
+                    new_time = datetime.strptime(value, "%H:%M")
+                except Exception:
+                    return "⚠️ Couldn't parse that time — use HH:MM format e.g. 18:30"
+                new_start_iso = f"{existing_date}T{new_time.strftime('%H:%M')}:00"
+                event["start"] = {"dateTime": new_start_iso, "timeZone": str(TIMEZONE)}
+                existing_end = event.get("end", {}).get("dateTime", "")
+                if existing_end:
+                    try:
+                        end_dt = datetime.fromisoformat(existing_end.replace("Z", "+00:00"))
+                        new_start_dt = datetime.fromisoformat(new_start_iso)
+                        if new_start_dt >= end_dt.replace(tzinfo=None):
+                            return "⚠️ New start time is at or after the existing end time — clarify the range"
+                    except Exception:
+                        pass
+
+            elif field == "end_only":
+                existing_start = event.get("start", {}).get("dateTime", "")
+                try:
+                    existing_dt = datetime.fromisoformat(existing_start.replace("Z", "+00:00"))
+                    existing_date = existing_dt.strftime("%Y-%m-%d")
+                    existing_start_time = existing_dt.replace(tzinfo=None)
+                except Exception:
+                    return "⚠️ Couldn't read existing event start time"
+                try:
+                    new_time = datetime.strptime(value, "%H:%M")
+                except Exception:
+                    return "⚠️ Couldn't parse that time — use HH:MM format e.g. 21:30"
+                new_end_iso = f"{existing_date}T{new_time.strftime('%H:%M')}:00"
+                new_end_dt = datetime.strptime(new_end_iso, "%Y-%m-%dT%H:%M:%S")
+                if new_end_dt <= existing_start_time:
+                    return "⚠️ End time can't be before or equal to start time — try again"
+                event["end"] = {"dateTime": new_end_iso, "timeZone": str(TIMEZONE)}
+
+            elif field == "time_range":
+                # Legacy path: time_range in field (pre-C5 sessions stored this way)
+                existing_start = event.get("start", {}).get("dateTime", "")
+                try:
+                    existing_dt = datetime.fromisoformat(existing_start.replace("Z", "+00:00"))
+                    existing_date = existing_dt.strftime("%Y-%m-%d")
+                except Exception:
+                    return "⚠️ Couldn't read existing event date"
+                try:
+                    parts = value.split("-")
+                    if len(parts) != 2:
+                        raise ValueError("expected HH:MM-HH:MM")
+                    new_start_dt = datetime.strptime(parts[0].strip(), "%H:%M")
+                    new_end_dt = datetime.strptime(parts[1].strip(), "%H:%M")
+                except Exception:
+                    return "⚠️ Couldn't parse that time range — try: edit cal Jet time 18:30-21:30"
+                if new_end_dt <= new_start_dt:
+                    return "⚠️ End time can't be before or equal to start time — try again"
+                event["start"] = {"dateTime": f"{existing_date}T{new_start_dt.strftime('%H:%M')}:00", "timeZone": str(TIMEZONE)}
+                event["end"] = {"dateTime": f"{existing_date}T{new_end_dt.strftime('%H:%M')}:00", "timeZone": str(TIMEZONE)}
+
+            elif field == "location":
+                event["location"] = value
+
         await asyncio.to_thread(
             lambda: service.events().update(
                 calendarId=meta["cal_id"],
@@ -712,7 +772,6 @@ async def _apply_event_edit(meta, summary, field, value, dtstart=None, dtend=Non
             ).execute()
         )
 
-        # Build success message
         updated_start = event.get("start", {}).get("dateTime", "")
         updated_end = event.get("end", {}).get("dateTime", "")
         try:

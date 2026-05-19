@@ -1,11 +1,11 @@
 {
   "date": "2026-05-19",
-  "session": "Session 35",
-  "built": "cal disambig rich format, time_range edit, fast delete confirm, split expense, remove cal routing",
-  "fixed": "bills strptime crash, OAUTH_DRIVE_OK missing, missed bills 7-day window",
+  "session": "Session 36",
+  "built": "missed bill boot alert removed",
+  "fixed": "stale bill notifications on startup",
   "pending": "none",
-  "deploy_count": 46,
-  "module_count": 22,
+  "deploy_count": 47,
+  "module_count": 21,
   "modules": [
     "bills.py",
     "bot.py",
@@ -26,7 +26,6 @@
     "sheets.py",
     "state.py",
     "stocks.py",
-    "test_em.py",
     "todos.py",
     "trips.py"
   ]
