@@ -624,8 +624,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif lower in ["skip missed bills", "dismiss missed bills"]:
         reply = "Missed bill reminders dismissed ✅"
 
-    elif lower in ["yes", "y", "yep", "yeah", "yup", "sure"] and state.market_summary_pending.get(user_id):
+    elif lower in ["yes", "y", "yep", "yeah", "yup", "sure"] and (state.market_summary_pending.get(user_id) or state.market_summary_pending.get(YOUR_CHAT_ID)):
         state.market_summary_pending.pop(user_id, None)
+        state.market_summary_pending.pop(YOUR_CHAT_ID, None)
         reply = await get_market_summary_now()
 
     elif re.match(r"set default card for .+ to .+", lower):
@@ -1126,7 +1127,8 @@ async def check_missed_items_on_startup(app):
                     for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]:
                         try:
                             fu_date = datetime.strptime(fu_date_str, fmt).date()
-                            if fu_date < today:
+                            # M2: only alert for yesterday (missed while offline overnight)
+                            if fu_date == yesterday:
                                 missed_followups.append({"name": r.get("Name", "?"), "date": fu_date_str})
                             break
                         except ValueError:

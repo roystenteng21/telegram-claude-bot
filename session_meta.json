@@ -1,11 +1,11 @@
 {
   "date": "2026-05-19",
   "session": "Session 36",
-  "built": "alert_error restored to helpers.py",
-  "fixed": "boot crash",
+  "built": "full audit all 21 files clean",
+  "fixed": "M2 missed followup scope, M5 market summary key",
   "pending": "none",
-  "deploy_count": 49,
-  "module_count": 22,
+  "deploy_count": 50,
+  "module_count": 21,
   "modules": [
     "bills.py",
     "bot.py",
@@ -14,7 +14,6 @@
     "config.py",
     "crm.py",
     "expenses.py",
-    "final_patches.py",
     "fx.py",
     "handlers.py",
     "helpers.py",
