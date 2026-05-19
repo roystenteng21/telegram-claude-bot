@@ -19,7 +19,7 @@ def clear_all_sessions(user_id):
     for d in [state.expense_sessions, state.delete_sessions, state.portfolio_delete_sessions,
               state.confirm_sessions, state.receipt_confirm_sessions, state.recon_sessions,
               state.edit_sessions, state.meeting_sessions, state.session_timestamps,
-              state.todo_disambig_sessions]:
+              state.calendar_confirm_sessions, state.todo_disambig_sessions]:
         d.pop(user_id, None)
 
 async def check_session_timeouts(user_id, update):
@@ -53,6 +53,9 @@ async def check_session_timeouts(user_id, update):
     if user_id in state.meeting_sessions:
         await update.message.reply_text(SESSION_TIMEOUT_MESSAGES["meeting"])
         del state.meeting_sessions[user_id]
+        expired = True
+    if user_id in state.recon_sessions:
+        del state.recon_sessions[user_id]
         expired = True
     state.session_timestamps.pop(user_id, None)
     return expired
@@ -140,16 +143,6 @@ def load_sessions_from_sheet():
                     now = datetime.now(TIMEZONE)
                     valid = {}
                     for k, v in loaded.items():
-                        # Drop sessions older than 6 hours
-                        started = v.get("started_at", "")
-                        if started:
-                            try:
-                                age = (now - datetime.fromisoformat(started)).total_seconds() / 3600
-                                if age > 6:
-                                    print(f"Dropped stale receipt_confirm_session (age {age:.1f}h)")
-                                    continue
-                            except Exception:
-                                pass
                         valid[k] = v
                     state.receipt_confirm_sessions.update({int(k): v for k, v in valid.items()})
                     if valid:
@@ -166,7 +159,6 @@ def expire_stale_trip_setup():
         if not ts:
             return
         if state.overseas_state.get("active"):
-            # Overseas mode is live — leave it alone
             return
         started = ts.get("started_at", "")
         stale = True

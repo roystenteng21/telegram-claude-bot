@@ -54,8 +54,8 @@ async def post_init(app):
     scheduler.add_job(check_icloud_daily, "cron", hour=9, minute=5, args=[app])
     scheduler.add_job(check_price_alerts, "interval", minutes=15, args=[app], misfire_grace_time=30)
     scheduler.add_job(send_weekly_market_summary, "cron", day_of_week="mon", hour=8, minute=0, args=[app])
-    scheduler.add_job(refresh_fx_rates, "cron", hour=8, minute=0)
-    scheduler.add_job(refresh_fx_rates, "cron", hour=20, minute=0)
+    scheduler.add_job(refresh_fx_rates, "cron", hour=8, minute=0, args=[app])
+    scheduler.add_job(refresh_fx_rates, "cron", hour=20, minute=0, args=[app])
 
     scheduler.start()
     health["Scheduler"] = "✅ Running"

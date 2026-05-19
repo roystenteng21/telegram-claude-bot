@@ -136,7 +136,6 @@ def load_trip_setup_from_sheet():
                     ts = json.loads(raw)
                     state.overseas_state["_trip_setup"] = ts
                     print(f"Restored _trip_setup from sheet: step={ts.get('step')}")
-                    # Immediately expire if stale
                     _expire_stale_trip_setup_inline()
                 return
     except Exception as e:
@@ -313,7 +312,6 @@ def handle_overseas_request(text, _partial=None):
         deactivate_overseas_mode()
         return f"{greeting} Switching back to SGD. 🏠"
 
-    # One follow-up path — partial data was stored, user is supplying missing fields
     if _partial:
         ts = _partial
         combined = f"{ts.get('_original_text', '')} {text}"
@@ -348,7 +346,6 @@ def handle_overseas_request(text, _partial=None):
         persist_trip_setup()
         return _activate_overseas(dest, curr, check_in, check_out, flight_num)
 
-    # Single-parse path
     today = date.today()
     prompt = (
         f"Today is {today.strftime('%d %b %Y')}. Extract trip details from: '{text}'\n"
@@ -376,11 +373,9 @@ def handle_overseas_request(text, _partial=None):
     check_out = parsed.get("check_out", "").strip()
     flight_num = parsed.get("flight_number", "").strip()
 
-    # Also try regex for flight if Haiku missed it
     if not flight_num:
         flight_num = extract_flight_number(text.upper()) or ""
 
-    # Check critical fields
     missing = []
     if not dest:
         missing.append("destination")
@@ -388,7 +383,6 @@ def handle_overseas_request(text, _partial=None):
         missing.append("dates")
 
     if missing:
-        missing_str = " and ".join(missing)
         ask = f"Where to, and what dates?" if len(missing) == 2 else (
             "Where to?" if "destination" in missing else "What dates?"
         )
@@ -410,6 +404,17 @@ def handle_overseas_request(text, _partial=None):
 
 def _activate_overseas(dest, curr, check_in, check_out, flight_num=""):
     """Activate overseas mode immediately and return confirmation message."""
+    # M4: guard against duplicate activation — update state only, no new trip row
+    if state.overseas_state.get("active"):
+        state.overseas_state["destination"] = dest
+        state.overseas_state["currency"] = curr
+        if curr not in state.overseas_state.get("currencies", []):
+            state.overseas_state.setdefault("currencies", []).append(curr)
+        if dest not in state.overseas_state.get("trip_destinations", []):
+            state.overseas_state.setdefault("trip_destinations", []).append(dest)
+        lines = [f"✈️ Updated — now in {dest} ({curr})"]
+        lines.append(f"Expenses will be logged in {curr} with SGD equivalent.")
+        return "\n".join(lines)
     state.overseas_state["active"] = True
     state.overseas_state["destination"] = dest
     state.overseas_state["currency"] = curr

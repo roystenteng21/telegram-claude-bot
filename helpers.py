@@ -81,11 +81,13 @@ def parse_date_flexible(date_str):
     return None
 
 def generate_reminder_id():
-    """Simple unique ID based on timestamp."""
-    return datetime.now().strftime("%Y%m%d%H%M%S")
+    """Unique ID with random suffix to avoid same-second collisions."""
+    import random
+    return datetime.now().strftime("%Y%m%d%H%M%S") + str(random.randint(100, 999))
 
 def generate_trip_id():
-    return date.today().strftime("TRIP-%Y%m%d")
+    import random
+    return date.today().strftime("TRIP-%Y%m%d") + f"-{random.randint(100, 999)}"
 
 def get_next_recurrence(scheduled_time_str, recurrence):
     """Calculate the next fire time for a recurring reminder."""
@@ -188,15 +190,3 @@ async def send_safe(target, text, parse_mode=None):
             await target.reply_text(chunk, parse_mode=parse_mode)
         except Exception:
             await target.reply_text(chunk)
-
-# ── Dev alert ─────────────────────────────────────────────────────────────────
-
-async def alert_error(message: str):
-    """Send a dev alert to Telegram on silent failures. Never raises."""
-    try:
-        import state
-        if state._app_ref:
-            from config import YOUR_CHAT_ID
-            await state._app_ref.bot.send_message(chat_id=YOUR_CHAT_ID, text=message)
-    except Exception as e:
-        print(f"alert_error failed: {e}")

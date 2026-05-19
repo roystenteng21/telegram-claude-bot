@@ -13,6 +13,8 @@ from helpers import format_date
 from fx import get_fx_rate, parse_manual_fx_input, save_manual_fx_rate
 import time as _time
 
+# ── Merchant cache ─────────────────────────────────────────────────────────────
+
 def _get_merchant_records():
     now = _time.monotonic()
     if state._merchant_cache is None or state._merchant_cache_ts is None or (now - state._merchant_cache_ts) > state._MERCHANT_CACHE_TTL:
@@ -32,10 +34,22 @@ def _invalidate_expense_cache():
     state._same_day_expense_cache = set()
     state._same_day_expense_cache_date = ""
 
+# ── Merchant memory ────────────────────────────────────────────────────────────
+
+# Hardcoded merchant aliases — checked before sheet lookup
+_MERCHANT_ALIASES = {
+    "fc": ("FnB", None, "Food Court"),
+}
+
 def get_merchant_memory(merchant):
+    # Check hardcoded aliases first
+    merchant_lower_check = merchant.lower().strip()
+    if merchant_lower_check in _MERCHANT_ALIASES:
+        cat, card, canonical = _MERCHANT_ALIASES[merchant_lower_check]
+        return cat, card, canonical
     try:
         records = _get_merchant_records()
-        merchant_lower = merchant.lower().strip()
+        merchant_lower = merchant_lower_check
         for r in records:
             if r.get("Merchant", "").lower() == merchant_lower:
                 return r.get("Category", ""), r.get("Card", ""), r.get("Merchant", "")
@@ -139,6 +153,8 @@ def get_merchant_list():
         return "\n".join(lines).strip()
     except Exception as e:
         return f"❌ Error fetching merchants: {e}"
+
+# ── Cards ──────────────────────────────────────────────────────────────────────
 
 def get_cards_live():
     if state._card_names_cache is not None:
@@ -274,6 +290,8 @@ def rename_category(old_name, new_name):
         print(f"rename_category cards sheet error: {e}")
     return f"Renamed '{old_title}' to '{new_clean}'. Updated {updated} expense(s)."
 
+# ── Expense core ───────────────────────────────────────────────────────────────
+
 def parse_expense_text(text):
     return parse_expense_text_v2(text)
 
@@ -357,7 +375,7 @@ def format_expense_confirmation(merchant, amount, currency, category, card, sgd_
             prompt = f"yes / enter {missing_fields[0].title()} / skip"
         lines.append(f"\nLog this? ({prompt})")
     else:
-        lines.append("\nLog this? (yes / split N / edit / skip)")
+        lines.append("\nLog this? (yes / edit / skip)")
     return "\n".join(lines)
 
 def format_expense_logged(merchant, amount, currency, category, card, sgd_amount=None, last4=None):
@@ -419,7 +437,7 @@ def parse_multi_field_edit(text, field_keywords=None):
     flush()
     return result
 
-def handle_expense_text(text, user_id, receipt_link="", last4=None, force_confirm=False):
+def handle_expense_text(text, user_id, receipt_link="", last4=None):
     try:
         parsed = parse_expense_text(text)
         if not parsed:
@@ -490,7 +508,7 @@ def handle_expense_text(text, user_id, receipt_link="", last4=None, force_confir
         if not amount:
             missing.append("amount")
         is_new_merchant = not bool(known_cat)
-        if not missing and not high_amount and not use_manual_rate and not is_new_merchant and not force_confirm:
+        if not missing and not high_amount and not use_manual_rate and not is_new_merchant:
             success = log_expense(merchant, amount, currency, sgd_amount, category, card, receipt_link=receipt_link)
             if not success:
                 return "⚠️ Failed to save expense — please try again.", False, None
@@ -527,7 +545,6 @@ async def handle_receipt_confirm_session(user_id, text, update):
     from sessions import touch_session
     touch_session(user_id)
     lower = text.strip().lower()
-
     if lower in ["skip", "cancel", "no", "n", "nope", "nah"]:
         del state.receipt_confirm_sessions[user_id]
         state.session_timestamps.pop(user_id, None)
@@ -537,57 +554,6 @@ async def handle_receipt_confirm_session(user_id, text, update):
         else:
             await update.message.reply_text("Entry not logged.")
         return True
-
-    # ── Split intercept (before edit parser) ──────────────────────────────────
-    split_match = re.match(r'^split\s+(\S+)(\s+ways?)?$', lower)
-    if split_match:
-        if session.get("step") in ("fx_rate", "duplicate_confirm"):
-            await update.message.reply_text("Complete the current step first before splitting.")
-            return True
-        if session.get("missing_fields"):
-            await update.message.reply_text("Fill in the missing fields first, then reply 'split N'.")
-            return True
-        raw_n = split_match.group(1)
-        try:
-            n = int(raw_n)
-        except ValueError:
-            await update.message.reply_text("Reply with a whole number — e.g. split 3")
-            return True
-        if n <= 1:
-            await update.message.reply_text("Split needs to be 2 or more ways.")
-            return True
-        original_amount = session["amount"]
-        original_sgd = session.get("sgd_amount", original_amount)
-        split_amount = round(original_amount / n, 2)
-        split_sgd = round(original_sgd / n, 2)
-        session["amount"] = split_amount
-        session["sgd_amount"] = split_sgd
-        session["high_amount"] = split_sgd > SGD_HIGH_AMOUNT_THRESHOLD
-        session["missing_fields"] = [f for f in session.get("missing_fields", []) if f != "amount"]
-        state.receipt_confirm_sessions[user_id] = session
-        currency = session.get("currency", "SGD")
-        merchant = session.get("merchant", "")
-        category = session.get("category", "")
-        card = session.get("card", "")
-        last4 = session.get("last4")
-        emoji = get_merchant_emoji(category, merchant)
-        if currency != "SGD":
-            total_str = f"${original_sgd:.2f} ({original_amount:,.0f} {currency})"
-            split_str = f"${split_sgd:.2f} ({split_amount:,.0f} {currency})"
-        else:
-            total_str = f"${original_amount:.2f}"
-            split_str = f"${split_amount:.2f}"
-        card_str = f"{card} (*{last4})" if last4 else card
-        lines = [
-            f"{emoji} {merchant}",
-            f"{total_str} → split {n} ways = {split_str} each",
-            f"{category} | {card_str}",
-            "",
-            f"Log {split_str}? (yes / edit / skip)"
-        ]
-        await update.message.reply_text("\n".join(lines))
-        return True
-
     if session.get("step") == "fx_rate":
         currency = session.get("currency", "")
         parsed_rate, display = parse_manual_fx_input(text, currency)
@@ -617,10 +583,8 @@ async def handle_receipt_confirm_session(user_id, text, update):
             )
         )
         return True
-
     if session.get("step") == "duplicate_confirm":
         if lower in ["yes", "y", "yep", "yeah", "yup"]:
-            session["step"] = "receipt_confirm"
             state.receipt_confirm_sessions[user_id] = session
             await update.message.reply_text(
                 format_expense_confirmation(
@@ -636,17 +600,14 @@ async def handle_receipt_confirm_session(user_id, text, update):
             del state.receipt_confirm_sessions[user_id]
             await update.message.reply_text("Skipped duplicate.")
         return True
-
     if lower in ["yes", "y", "yep", "yeah", "yup"]:
         await _finalise_receipt_confirm(user_id, session, update)
         return True
-
     card_match, _ = fuzzy_match_card(text.strip())
     if card_match and len(text.strip().split()) == 1:
         session["card"] = card_match
         await _finalise_receipt_confirm(user_id, session, update)
         return True
-
     edit_field_map = {
         "edit name": "merchant", "edit merchant": "merchant",
         "edit amount": "amount", "edit price": "amount",
@@ -660,7 +621,6 @@ async def handle_receipt_confirm_session(user_id, text, update):
         field_label = {"merchant": "merchant name", "amount": "amount", "category": "category", "card": "card"}[field]
         await update.message.reply_text(f"Enter the new {field_label}:")
         return True
-
     if session.get("_awaiting_edit"):
         field = session.pop("_awaiting_edit")
         state.receipt_confirm_sessions[user_id] = session
@@ -698,7 +658,6 @@ async def handle_receipt_confirm_session(user_id, text, update):
             )
         )
         return True
-
     edits = parse_multi_field_edit(text)
     if edits:
         merchant_val = edits.get("merchant", "")
@@ -753,7 +712,6 @@ async def handle_receipt_confirm_session(user_id, text, update):
         session["high_amount"] = session.get("sgd_amount", 0) > SGD_HIGH_AMOUNT_THRESHOLD
         await _finalise_receipt_confirm(user_id, session, update)
         return True
-
     if session.get("_pending_edits"):
         if lower in ["yes", "y"]:
             edits = session.pop("_pending_edits")
@@ -768,8 +726,7 @@ async def handle_receipt_confirm_session(user_id, text, update):
                 'e.g. merchant "Gift Card Store" category Shopping'
             )
         return True
-
-    await update.message.reply_text("Didn't catch that — reply yes to log, split N to split the bill, skip to cancel, or edit fields (e.g. category FnB card Citi)")
+    await update.message.reply_text("Didn't catch that — reply yes to log, skip to cancel, or edit fields (e.g. category FnB card Citi)")
     return True
 
 async def _finalise_receipt_confirm(user_id, session, update):
@@ -848,6 +805,8 @@ async def handle_expense_session(user_id, text, update):
             del state.expense_sessions[user_id]
             await update.message.reply_text("Skipped.")
         return
+
+# ── Expense queries ────────────────────────────────────────────────────────────
 
 def delete_last_expense():
     try:
@@ -1140,6 +1099,8 @@ def get_expense_categories():
 
 def get_expense_report(report_type="monthly"):
     return get_monthly_summary()
+
+# ── Detectors ──────────────────────────────────────────────────────────────────
 
 def is_log_prefix_input(text):
     lower = text.lower()

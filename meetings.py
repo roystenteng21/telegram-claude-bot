@@ -65,6 +65,10 @@ def format_recap_confirmation(recap):
 
 def process_meeting_notes(event_name, notes_list):
     combined = "\n".join(notes_list)
+    word_count = len(combined.split())
+    # M9: Haiku for short notes (<500 words), Sonnet for longer recaps
+    model = "claude-sonnet-4-6" if word_count >= 500 else "claude-haiku-4-5-20251001"
+    max_tokens = 800 if model == "claude-sonnet-4-6" else 600
     prompt = (
         f"You are processing meeting notes for an event called: {event_name or 'unknown event'}\n\n"
         f"Here are the raw notes:\n{combined}\n\n"
@@ -79,8 +83,8 @@ def process_meeting_notes(event_name, notes_list):
     )
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=800,
+            model=model,
+            max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}]
         )
         raw = resp.content[0].text.strip().replace("```json", "").replace("```", "").strip()

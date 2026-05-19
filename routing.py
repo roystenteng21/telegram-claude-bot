@@ -473,6 +473,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if looks_like_new_intent(text):
             state.overseas_state.pop("_trip_setup", None)
             persist_trip_setup()
+            await update.message.reply_text("Trip setup cancelled — starting fresh.")
             # Fall through
         elif ts.get("step") == "awaiting_missing":
             result = handle_overseas_request(text, _partial=ts)

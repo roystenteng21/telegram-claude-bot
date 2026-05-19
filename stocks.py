@@ -419,12 +419,16 @@ def suggest_stocks(criteria):
         f"---\n\n"
         f"Keep it concise and honest. Flag anything concerning."
     )
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=600,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return resp.content[0].text.strip()
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        print(f"suggest_stocks Claude error: {e}")
+        return "⚠️ Couldn't generate stock suggestions right now — try again in a moment."
 
 async def check_price_alerts(app):
     try:
