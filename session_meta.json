@@ -1,10 +1,10 @@
 {
   "date": "2026-05-20",
   "session": "Session 36",
-  "built": "deploy.py git-scoped freshness + cross-ref checks",
-  "fixed": "",
+  "built": "routing.py get_calendar import removed",
+  "fixed": "boot crash on cal import",
   "pending": "calendar C1-C8 live test, expense confirm options rebuild",
-  "deploy_count": 52,
+  "deploy_count": 53,
   "module_count": 21,
   "modules": [
     "bills.py",

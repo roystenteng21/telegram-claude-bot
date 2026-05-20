@@ -45,7 +45,7 @@ from reminders import (
     cancel_reminder_by_keyword, check_and_fire_reminders
 )
 from cal import (
-    get_calendar, get_events, delete_calendar_event, is_calendar_request,
+    get_events, delete_calendar_event, is_calendar_request,
     smart_add_event, check_icloud_daily
 )
 from todos import add_todo, complete_todo, delete_todo, list_todos
@@ -1214,7 +1214,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not state.em_profile or not state.em_profile.get("version"):
             issues.append("• Profile: not loaded — reply 'reload profile' to retry")
         try:
-            await asyncio.to_thread(get_calendar, "Personal")
+            await asyncio.to_thread(get_events, 1)
         except Exception:
             issues.append("• iCloud Calendar: unreachable — check ICLOUD_USERNAME / ICLOUD_PASSWORD in Railway")
         from config import ANTHROPIC_FAILURE_THRESHOLD
