@@ -1,10 +1,10 @@
 {
-  "date": "2026-05-19",
+  "date": "2026-05-20",
   "session": "Session 36",
-  "built": "deploy.py cross-reference check",
-  "fixed": "M2 M5 routing fixes, all S36 audit items",
-  "pending": "expense confirm options, split expense rebuild, S27 test checklist",
-  "deploy_count": 51,
+  "built": "deploy.py git-scoped freshness + cross-ref checks",
+  "fixed": "",
+  "pending": "calendar C1-C8 live test, expense confirm options rebuild",
+  "deploy_count": 52,
   "module_count": 21,
   "modules": [
     "bills.py",

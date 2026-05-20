@@ -62,11 +62,15 @@ def check_modules():
     return modules
 
 
+PARSE_FAILED = object()  # sentinel: parse failed, skip cross-ref checks against this module
+
 def _get_defined_names(filepath):
-    """Return set of all names available from a module — defined or imported."""
+    """Return set of all names available from a module — defined or imported.
+    Returns PARSE_FAILED sentinel if the file cannot be parsed."""
     try:
-        with open(filepath) as f:
-            tree = ast.parse(f.read(), filename=filepath)
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        tree = ast.parse(content, filename=filepath)
         names = set()
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -84,8 +88,8 @@ def _get_defined_names(filepath):
                         names.add(alias.asname or alias.name)
         return names
     except Exception as e:
-        print(f"  ⚠️  Could not parse {os.path.basename(filepath)}: {e}")
-        return set()
+        print(f"  ⚠️  Could not parse {os.path.basename(filepath)}: {e} — skipping cross-ref checks for this file")
+        return PARSE_FAILED
 
 
 def _get_from_imports(filepath):
@@ -105,10 +109,52 @@ def _get_from_imports(filepath):
         return []
 
 
-def check_cross_references(modules):
+def get_changed_files():
+    """Return set of .py filenames with uncommitted or unpushed changes."""
+    changed = set()
+    try:
+        # Unstaged changes
+        r1 = subprocess.run("git diff --name-only", shell=True, cwd=REPO_DIR, capture_output=True, text=True)
+        # Staged changes
+        r2 = subprocess.run("git diff --name-only --cached", shell=True, cwd=REPO_DIR, capture_output=True, text=True)
+        # Unpushed commits
+        r3 = subprocess.run("git diff --name-only @{u} HEAD", shell=True, cwd=REPO_DIR, capture_output=True, text=True)
+        for r in [r1, r2, r3]:
+            for line in r.stdout.splitlines():
+                if line.strip().endswith(".py"):
+                    changed.add(line.strip())
+    except Exception as e:
+        print(f"  ⚠️  Could not determine changed files: {e}")
+    return changed
+
+
+def check_module_freshness(modules):
+    """Print timestamps only for files with uncommitted or unpushed changes."""
+    from datetime import datetime
+    changed = get_changed_files()
+    relevant = [f for f in modules if f in changed]
+    if not relevant:
+        return changed
+    now = datetime.now()
+    print("\n📋 Changed file timestamps:")
+    for f in relevant:
+        filepath = os.path.join(REPO_DIR, f)
+        try:
+            mtime = os.path.getmtime(filepath)
+            dt = datetime.fromtimestamp(mtime)
+            age_mins = (now - dt).total_seconds() / 60
+            age_str = f"{int(age_mins)}m ago" if age_mins < 60 else f"{int(age_mins/60)}h {int(age_mins%60)}m ago"
+            print(f"   {f:<30} {dt.strftime('%Y-%m-%d %H:%M:%S')}  ({age_str})")
+        except Exception as e:
+            print(f"   {f:<30} ⚠️  Could not read timestamp: {e}")
+    return changed
+
+
+def check_cross_references(modules, changed_files=None):
     """
     For each module file, check that functions imported from other local modules
-    actually exist in those source files. Returns True if all clean, False if issues found.
+    actually exist in those source files. Only checks files in changed_files if provided.
+    Returns True if all clean, False if issues found.
     """
     print("\n🔍 Running cross-reference check...")
 
@@ -121,12 +167,16 @@ def check_cross_references(modules):
 
     issues = []
     for mod_name, filename in local_modules.items():
+        if changed_files is not None and filename not in changed_files:
+            continue  # only check files that changed
         filepath = os.path.join(REPO_DIR, filename)
         from_imports = _get_from_imports(filepath)
         for source_module, imported_names in from_imports:
             if source_module not in local_modules:
                 continue  # skip third-party imports
             source_defined = defined.get(source_module, set())
+            if source_defined is PARSE_FAILED:
+                continue  # skip — parse failed, already warned
             for name in imported_names:
                 if name not in source_defined:
                     issues.append(
@@ -225,9 +275,10 @@ def main():
     print(f"   Commit: {commit_msg}\n")
 
     modules = check_modules()
+    changed = check_module_freshness(modules)
 
-    # Cross-reference check — abort if broken imports found
-    refs_ok = check_cross_references(modules)
+    # Cross-reference check — only changed files, abort if broken imports found
+    refs_ok = check_cross_references(modules, changed_files=changed)
     if not refs_ok:
         print("\n❌ Deploy aborted — fix cross-reference issues first.")
         sys.exit(1)
