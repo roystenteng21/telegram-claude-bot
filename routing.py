@@ -13,9 +13,9 @@ from config import (
 )
 from clients import client, drive_service
 from sheets import get_sheet, get_pending_backlog, append_bug_to_backlog
-from helpers import send_safe, looks_like_new_intent, format_date, alert_error
+from helpers import send_safe, looks_like_new_intent, format_date
 from crm import (
-    find_row, save_contact, find_contact, add_note, set_followup,
+    find_row, find_all_rows, save_contact, find_contact, add_note, set_followup,
     update_field, update_contact_field_natural, delete_contact, search_contacts,
     list_contacts, get_stats, upcoming_followups, overdue_followups,
     upcoming_birthdays, last_contact, set_referral, get_referrals_by,
@@ -45,10 +45,8 @@ from reminders import (
     cancel_reminder_by_keyword, check_and_fire_reminders
 )
 from cal import (
-    get_events, delete_calendar_event, is_calendar_request,
-    smart_add_event, check_icloud_daily, find_upcoming_events,
-    apply_calendar_edit, format_calendar_confirm, write_calendar_event,
-    edit_calendar_event
+    get_calendar, get_events, delete_calendar_event, is_calendar_request,
+    smart_add_event, check_icloud_daily
 )
 from todos import add_todo, complete_todo, delete_todo, list_todos
 from meetings import (
@@ -87,14 +85,6 @@ from infrastructure import (
     run_infrastructure_setup, send_startup_message, save_em_profile,
     setup_em_profile, track_anthropic_call, notify_anthropic_down,
     get_or_create_drive_folder, RECEIPTS_FOLDER_ID
-)
-from handlers import (
-    handle_excel_import_session, handle_calendar_confirm_session,
-    handle_restaurant_save_session, handle_contact_save_session,
-    handle_todo_disambig_session, handle_delete_session,
-    handle_confirm_session, handle_portfolio_delete_session,
-    handle_crm_edit_session, handle_recon_session,
-    handle_restaurant_save_result
 )
 
 
@@ -359,35 +349,44 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(bday_reply)
         return
 
-    # ── Excel import session ──────────────────────────────────────────────────
+    # ── Excel import column declaration ───────────────────────────────────────
     if user_id in state.excel_import_sessions:
-        if await handle_excel_import_session(user_id, text, lower, update, parse_excel_column_order, handle_excel_import):
+        session = state.excel_import_sessions[user_id]
+        if session.get("step") == "awaiting_columns":
+            cols = parse_excel_column_order(text)
+            if cols:
+                if session.get("file_bytes"):
+                    file_bytes = session["file_bytes"]
+                    del state.excel_import_sessions[user_id]
+                    await update.message.reply_text(f"Got it — columns: {', '.join(cols)}. Importing now...")
+                    await handle_excel_import(file_bytes, cols, update)
+                else:
+                    session["column_order"] = cols
+                    session["step"] = "awaiting_file"
+                    await update.message.reply_text(f"Got it — columns: {', '.join(cols)}. Now send the Excel file.")
+            else:
+                await update.message.reply_text("Couldn't parse that. Try: 'Name, Email, Date of Birth, Alias'")
             return
 
     # ── Session timeouts ──────────────────────────────────────────────────────
-    if any(user_id in s for s in [
-        state.expense_sessions, state.delete_sessions, state.portfolio_delete_sessions,
-        state.confirm_sessions, state.receipt_confirm_sessions, state.edit_sessions,
-        state.meeting_sessions, state.pending_restaurant_saves, state.calendar_confirm_sessions
-    ]):
+    if any(user_id in s for s in [state.expense_sessions, state.delete_sessions, state.portfolio_delete_sessions,
+                                    state.confirm_sessions, state.receipt_confirm_sessions, state.edit_sessions,
+                                    state.meeting_sessions, state.pending_restaurant_saves]):
         if is_session_expired(user_id):
             await check_session_timeouts(user_id, update)
             return
 
     # ── Session interrupt guard ───────────────────────────────────────────────
-    SESSION_REPLY_WORDS = {"yes", "y", "yep", "yeah", "no", "n", "nope", "edit", "sent", "skip", "cancel"}
     active_label = get_active_session_label(user_id)
-    if active_label and lower.strip() not in SESSION_REPLY_WORDS and looks_like_new_intent(text):
+    if active_label and looks_like_new_intent(text):
         if user_id in state.interrupted_sessions:
             pending = state.interrupted_sessions[user_id]
             if text.strip().lower() in ["yes", "y"]:
-                for d in [
-                    state.receipt_confirm_sessions, state.expense_sessions, state.meeting_sessions,
-                    state.edit_sessions, state.confirm_sessions, state.delete_sessions,
-                    state.portfolio_delete_sessions, state.excel_import_sessions,
-                    state.pending_restaurant_saves, state.pending_contact_saves,
-                    state.todo_disambig_sessions, state.calendar_confirm_sessions
-                ]:
+                for d in [state.receipt_confirm_sessions, state.expense_sessions, state.meeting_sessions,
+                          state.edit_sessions, state.confirm_sessions, state.delete_sessions,
+                          state.portfolio_delete_sessions, state.excel_import_sessions,
+                          state.pending_restaurant_saves, state.pending_contact_saves,
+                          state.todo_disambig_sessions]:
                     d.pop(user_id, None)
                 state.session_timestamps.pop(user_id, None)
                 del state.interrupted_sessions[user_id]
@@ -410,117 +409,366 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-    # ── Session handlers (delegated to handlers.py) ───────────────────────────
-    if user_id in state.calendar_confirm_sessions:
-        await handle_calendar_confirm_session(user_id, text, lower, update)
-        return
-
+    # ── Pending restaurant saves ──────────────────────────────────────────────
     if user_id in state.pending_restaurant_saves:
-        await handle_restaurant_save_session(user_id, text, lower, update)
-        return
+        prs = state.pending_restaurant_saves[user_id]
+        step = prs.get("step")
+        if step == "awaiting_location":
+            location = text.strip()
+            del state.pending_restaurant_saves[user_id]
+            result = save_restaurant(prs["name"], location, prs.get("country", "Singapore"))
+            if result and result.startswith("_DUPLICATE_:"):
+                state.pending_restaurant_saves[user_id] = {
+                    "step": "duplicate", "existing": prs["name"],
+                    "name": prs["name"], "location": location,
+                    "country": prs.get("country", "Singapore"), "tags": "", "notes": ""
+                }
+                await update.message.reply_text(f"*{prs['name']}* is already in your list. Update or save as new? (update / new)")
+            else:
+                await update.message.reply_text(format_restaurant_saved(prs["name"], location))
+            return
+        elif step == "awaiting_confirm":
+            extra_tags = ""
+            words = lower.split(None, 1)
+            first_word = words[0] if words else ""
+            rest = words[1] if len(words) > 1 else ""
+            if first_word in ["yes", "y"]:
+                extra_tags = rest.strip()
+                merged_tags = ", ".join(filter(None, [prs.get("tags", ""), extra_tags]))
+                location = prs.get("location", "")
+                del state.pending_restaurant_saves[user_id]
+                result = save_restaurant(prs["name"], location, prs.get("country", "Singapore"), merged_tags)
+                if result and result.startswith("_DUPLICATE_:"):
+                    state.pending_restaurant_saves[user_id] = {
+                        "step": "duplicate", "existing": prs["name"],
+                        "name": prs["name"], "location": location,
+                        "country": prs.get("country", "Singapore"), "tags": merged_tags, "notes": ""
+                    }
+                    await update.message.reply_text(f"*{prs['name']}* is already in your list. Update or save as new? (update / new)")
+                else:
+                    await update.message.reply_text(format_restaurant_saved(prs["name"], location, merged_tags))
+            elif first_word in ["no", "n"]:
+                del state.pending_restaurant_saves[user_id]
+                await update.message.reply_text(f"Got it — what's the correct location for {prs['name']}?")
+                state.pending_restaurant_saves[user_id] = {"name": prs["name"], "country": prs.get("country", "Singapore"), "step": "awaiting_location"}
+            else:
+                await update.message.reply_text("Reply yes to confirm or no to correct the location.")
+            return
+        elif step == "awaiting_outlet":
+            outlets = prs.get("outlets", [])
+            words = lower.split(None, 1)
+            first_word = words[0].strip().rstrip(",")
+            rest = words[1].strip() if len(words) > 1 else ""
+            try:
+                idx = int(first_word) - 1
+                if 0 <= idx < len(outlets):
+                    location = outlets[idx]
+                    merged_tags = ", ".join(filter(None, [prs.get("tags", ""), rest]))
+                    del state.pending_restaurant_saves[user_id]
+                    result = save_restaurant(prs["name"], location, prs.get("country", "Singapore"), merged_tags)
+                    if result and result.startswith("_DUPLICATE_:"):
+                        state.pending_restaurant_saves[user_id] = {
+                            "step": "duplicate", "existing": prs["name"],
+                            "name": prs["name"], "location": location,
+                            "country": prs.get("country", "Singapore"), "tags": merged_tags, "notes": ""
+                        }
+                        await update.message.reply_text(f"*{prs['name']}* is already in your list. Update or save as new? (update / new)")
+                    else:
+                        await update.message.reply_text(format_restaurant_saved(prs["name"], location, merged_tags))
+                else:
+                    await update.message.reply_text(f"Pick a number between 1 and {len(outlets)}.")
+            except ValueError:
+                await update.message.reply_text(f"Reply with the number of the outlet (1–{len(outlets)}).")
+            return
+        elif step == "duplicate":
+            if lower in ["new", "save new"]:
+                del state.pending_restaurant_saves[user_id]
+                save_restaurant(prs["name"], prs["location"], prs.get("country", "Singapore"),
+                                prs.get("tags", ""), prs.get("notes", ""), force_new=True)
+                await update.message.reply_text(format_restaurant_saved(prs["name"], prs["location"], prs.get("tags", "")))
+            elif lower in ["update", "update existing"]:
+                del state.pending_restaurant_saves[user_id]
+                await update.message.reply_text(f"Use 'edit restaurant {prs['existing']}' to update it.")
+            elif lower in ["skip", "s", "cancel", "no", "n", "nope", "nah"]:
+                del state.pending_restaurant_saves[user_id]
+                await update.message.reply_text("Skipped.")
+            else:
+                await update.message.reply_text("Reply 'update', 'new', or 'skip'.")
+            return
 
+    # ── Pending contact saves ─────────────────────────────────────────────────
     if user_id in state.pending_contact_saves:
-        await handle_contact_save_session(user_id, text, lower, update)
+        pcs = state.pending_contact_saves[user_id]
+        if lower in ["new", "save new", "save as new"]:
+            del state.pending_contact_saves[user_id]
+            reply = save_contact(pcs["data"], force_new=True)
+            await send_safe(update.message, reply, parse_mode="Markdown")
+        elif lower in ["update", "update existing"]:
+            del state.pending_contact_saves[user_id]
+            reply = f"Opening {pcs['existing_name']} for editing — use 'edit {pcs['existing_name']}' to update fields."
+            await send_safe(update.message, reply, parse_mode="Markdown")
+        elif lower in ["skip", "s", "cancel", "no", "n", "nope", "nah"]:
+            del state.pending_contact_saves[user_id]
+            await update.message.reply_text("Skipped.")
+        else:
+            await update.message.reply_text(f"*{pcs['existing_name']}* already exists. Reply 'update', 'new', or 'skip'.")
         return
 
+    # ── Todo disambiguation ───────────────────────────────────────────────────
     if user_id in state.todo_disambig_sessions:
-        await handle_todo_disambig_session(user_id, text, lower, update)
+        td = state.todo_disambig_sessions[user_id]
+        tasks = td.get("tasks", [])
+        action = td.get("action", "complete")
+        if text.strip().isdigit():
+            idx = int(text.strip()) - 1
+            if 0 <= idx < len(tasks):
+                task_name = tasks[idx]
+                del state.todo_disambig_sessions[user_id]
+                from sheets import todo_sheet
+                if action == "complete":
+                    result = complete_todo(task_name)
+                    await send_safe(update.message, result, parse_mode="MarkdownV2")
+                    return
+                elif action == "delete":
+                    sheet = todo_sheet()
+                    records = sheet.get_all_records()
+                    for i, r in enumerate(records):
+                        if r.get("Task", "") == task_name:
+                            sheet.delete_rows(i + 2)
+                            await update.message.reply_text(f"Deleted — {task_name} ✅")
+                            return
+            else:
+                await update.message.reply_text("Invalid number. Try again or 'cancel'.")
+        elif lower == "cancel":
+            del state.todo_disambig_sessions[user_id]
+            await update.message.reply_text("Cancelled.")
+        else:
+            await update.message.reply_text("Reply with a number or 'cancel'.")
         return
 
+    # ── Active session handlers ───────────────────────────────────────────────
     if user_id in state.receipt_confirm_sessions:
         touch_session(user_id)
         await handle_receipt_confirm_session(user_id, text, update)
         return
-
     if user_id in state.meeting_sessions:
         touch_session(user_id)
         await handle_meeting_session(user_id, text, update)
         return
-
     if user_id in state.expense_sessions:
         touch_session(user_id)
         await handle_expense_session(user_id, text, update)
         return
 
+    # ── Delete session ────────────────────────────────────────────────────────
     if user_id in state.delete_sessions:
-        await handle_delete_session(user_id, text, lower, update)
-        return
+        session = state.delete_sessions[user_id]
+        step = session.get("step")
+        if lower in ["cancel", "nevermind", "never mind", "nvm"]:
+            del state.delete_sessions[user_id]
+            await update.message.reply_text("Cancelled.")
+            return
+        if step == "pick":
+            if text.strip().isdigit():
+                idx = int(text.strip()) - 1
+                expenses = session.get("expenses", [])
+                if 0 <= idx < len(expenses):
+                    sheet_row, _ = expenses[idx]
+                    reply = delete_expense_by_row(sheet_row)
+                    del state.delete_sessions[user_id]
+                    await send_safe(update.message, reply, parse_mode="Markdown")
+                else:
+                    await update.message.reply_text("Invalid number. Try again or 'search [merchant]'.")
+                return
+            elif lower.startswith("search "):
+                query = text[7:].strip()
+                results = search_expenses_by_merchant(query)
+                if not results:
+                    await update.message.reply_text(f"No expenses found matching '{query}'.")
+                elif len(results) == 1:
+                    sheet_row, r = results[0]
+                    reply = delete_expense_by_row(sheet_row)
+                    del state.delete_sessions[user_id]
+                    await send_safe(update.message, reply, parse_mode="Markdown")
+                else:
+                    state.delete_sessions[user_id] = {"step": "pick", "expenses": results}
+                    await update.message.reply_text(format_delete_list(results))
+                return
+            elif lower in ["not there", "not here", "none of these", "not in the list"]:
+                await update.message.reply_text("Reply 'search [merchant name]' to find it.")
+                return
+            else:
+                await update.message.reply_text("Reply with a number, 'search [merchant]', or 'cancel'.")
+                return
 
+    # ── Confirm session ───────────────────────────────────────────────────────
     if user_id in state.confirm_sessions:
-        await handle_confirm_session(user_id, text, lower, update)
+        touch_session(user_id)
+        cs = state.confirm_sessions[user_id]
+        action = cs.get("action")
+        args = cs.get("args", [])
+        if lower in ["yes", "y", "yep", "yeah", "yup", "sure", "ok", "okay"]:
+            del state.confirm_sessions[user_id]
+            state.session_timestamps.pop(user_id, None)
+            if action == "delete_contact":
+                reply = delete_contact(args[0])
+            elif action == "rename_category":
+                reply = rename_category(args[0], args[1])
+            elif action == "delete_bill":
+                reply = delete_bill(args[0])
+            elif action == "delete_restaurant":
+                reply = delete_restaurant(args[0])
+            elif action == "delete_event":
+                reply = delete_calendar_event(args[0])
+            else:
+                reply = "Done."
+            await send_safe(update.message, reply, parse_mode="Markdown")
+        elif lower in ["no", "n", "cancel", "nope", "nah"]:
+            del state.confirm_sessions[user_id]
+            state.session_timestamps.pop(user_id, None)
+            await update.message.reply_text("Cancelled.")
+        else:
+            await update.message.reply_text(f"{cs.get('target', 'Confirm?')} (yes / no)")
         return
 
+    # ── Portfolio delete session ──────────────────────────────────────────────
     if user_id in state.portfolio_delete_sessions:
-        await handle_portfolio_delete_session(user_id, text, lower, update)
-        return
+        touch_session(user_id)
+        pd_session = state.portfolio_delete_sessions[user_id]
+        if lower in ["cancel", "nevermind", "nvm"]:
+            del state.portfolio_delete_sessions[user_id]
+            await update.message.reply_text("Cancelled.")
+            return
+        if text.strip().isdigit():
+            idx = int(text.strip()) - 1
+            rows = pd_session.get("rows", [])
+            if 0 <= idx < len(rows):
+                sheet_row, _ = rows[idx]
+                del state.portfolio_delete_sessions[user_id]
+                result = delete_portfolio_row(sheet_row)
+                await update.message.reply_text(result)
+            else:
+                await update.message.reply_text("Invalid number. Try again or 'cancel'.")
+            return
+        elif lower.startswith("search "):
+            query = text[7:].strip()
+            results = search_portfolio_by_ticker(query)
+            if not results:
+                await update.message.reply_text(f"No holdings found matching '{query}'.")
+            elif len(results) == 1:
+                sheet_row, _ = results[0]
+                del state.portfolio_delete_sessions[user_id]
+                result = delete_portfolio_row(sheet_row)
+                await update.message.reply_text(result)
+            else:
+                state.portfolio_delete_sessions[user_id] = {"step": "pick", "rows": results}
+                await update.message.reply_text(format_portfolio_delete_list(results))
+            return
+        else:
+            await update.message.reply_text("Reply with a number, 'search [ticker]', or 'cancel'.")
+            return
 
+    # ── CRM edit session ──────────────────────────────────────────────────────
     if user_id in state.edit_sessions:
-        await handle_crm_edit_session(user_id, text, lower, update)
+        session = state.edit_sessions[user_id]
+        step = session["step"]
+        fields = ["alias", "birthday", "relationship", "context", "notes",
+                  "follow up date", "follow up notes", "email", "address"]
+        if step == "choose_field":
+            field = text.lower().strip()
+            if field == "cancel":
+                del state.edit_sessions[user_id]
+                await update.message.reply_text("Cancelled.")
+                return
+            if field not in fields:
+                await update.message.reply_text(
+                    f"Pick a field to edit:\n1. Alias\n2. Birthday\n3. Relationship\n4. Context\n"
+                    f"5. Notes\n6. Follow up date\n7. Follow up notes\n8. Email\n9. Address\n\n"
+                    f"Or type *cancel* to exit.",
+                    parse_mode="Markdown"
+                )
+                return
+            session["field"] = field
+            session["step"] = "enter_value"
+            await update.message.reply_text(f"Enter the new value for *{field.title()}*:", parse_mode="Markdown")
+        elif step == "enter_value":
+            field = session["field"]
+            name = session["name"]
+            result = update_field(f"{name}, {field}, {text}")
+            del state.edit_sessions[user_id]
+            await update.message.reply_text(result, parse_mode="Markdown")
         return
 
+    # ── Reconciliation session ────────────────────────────────────────────────
     if user_id in state.recon_sessions:
-        await handle_recon_session(user_id, text, lower, update)
+        touch_session(user_id)
+        rs = state.recon_sessions[user_id]
+        step = rs.get("step")
+        unmatched = rs.get("unmatched", [])
+        idx = rs.get("index", 0)
+        if lower in ["done", "skip all", "close"]:
+            del state.recon_sessions[user_id]
+            await update.message.reply_text("Reconciliation session closed ✅")
+        elif lower.startswith("log "):
+            log_text = text[4:].strip()
+            reply_str, needs_session, session_data = handle_expense_text(log_text, user_id)
+            if needs_session and session_data:
+                state.expense_sessions[user_id] = session_data
+            del state.recon_sessions[user_id]
+            await send_safe(update.message, reply_str, parse_mode="Markdown")
+        elif lower in ["skip", "next", "s"]:
+            rs["index"] = idx + 1
+            if rs["index"] < len(unmatched):
+                await update.message.reply_text(
+                    f"Next unmatched ({rs['index']+1}/{len(unmatched)}):\n{unmatched[rs['index']]}\n\nReply 'log [expense]' to log, 'skip' for next, or 'done' to close."
+                )
+            else:
+                del state.recon_sessions[user_id]
+                await update.message.reply_text("All unmatched items reviewed ✅")
+        else:
+            if idx < len(unmatched):
+                await update.message.reply_text(
+                    f"Unmatched item ({idx+1}/{len(unmatched)}):\n{unmatched[idx]}\n\nReply 'log [expense]' to log it, 'skip' for next, or 'done' to close."
+                )
+            else:
+                del state.recon_sessions[user_id]
+                await update.message.reply_text("All unmatched items reviewed ✅")
         return
 
-    # ── Trip setup session ────────────────────────────────────────────────────
+    # ── Trip setup session (awaiting missing fields only) ─────────────────────
     if state.overseas_state.get("_trip_setup"):
         ts = state.overseas_state["_trip_setup"]
-        if text.strip().lower() in ("cancel", "nevermind", "nvm", "stop", "abort"):
+        t = text.strip()
+
+        # Cancel escape
+        if t.lower() in ("cancel", "nevermind", "nvm", "stop", "abort"):
             state.overseas_state.pop("_trip_setup", None)
             persist_trip_setup()
             await update.message.reply_text("Trip setup cancelled.")
             return
+
+        # Silent termination on new intent — fall through to main routing
         if looks_like_new_intent(text):
             state.overseas_state.pop("_trip_setup", None)
             persist_trip_setup()
-            await update.message.reply_text("Trip setup cancelled — starting fresh.")
-            # Fall through
+            # Fall through — do not return
+
         elif ts.get("step") == "awaiting_missing":
+            # One follow-up to supply missing destination and/or dates
             result = handle_overseas_request(text, _partial=ts)
             if result:
                 await send_safe(update.message, result, parse_mode="Markdown")
             return
 
     # ─────────────────────────────────────────────────────────────────────────
-    # PRIMARY ROUTING CHAIN
+    # PRIMARY ROUTING CHAIN — single pass, immediate exit on first match
     # ─────────────────────────────────────────────────────────────────────────
     reply = None
 
-    # ── Calendar — cal trigger ────────────────────────────────────────────────
-    if lower.startswith("edit cal "):
-        reply = await edit_calendar_event(text[9:].strip(), user_id)
-
-    elif lower.startswith("cal delete ") or lower.startswith("cal del ") or lower.startswith("remove cal ") or lower.startswith("remove event "):
-        event_query = re.sub(r"^(cal delete|cal del|remove cal|remove event)\s+", "", text, flags=re.IGNORECASE).strip()
-        matches, err, capped = await find_upcoming_events(event_query)
-        if err:
-            reply = err
-        elif not matches:
-            reply = f"No upcoming event found matching '{event_query}'"
-        elif len(matches) == 1:
-            meta, summary, dtstart, dtend = matches[0]
-            from cal import _fmt_event_row
-            event_str = _fmt_event_row(summary, meta.get("cal_name", ""), dtstart, dtend)
-            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [{**meta, "dtstart": dtstart, "summary": summary}], "target": f"Delete {summary}?"}
-            reply = f"🗑 {event_str}\n\nDelete it? (yes / no)"
-        else:
-            from cal import _fmt_event_row
-            lines = ["Found multiple matching events — which one?\n"]
-            for i, (meta, summary, dtstart, dtend) in enumerate(matches, 1):
-                lines.append(f"{i}. {_fmt_event_row(summary, meta.get('cal_name', ''), dtstart, dtend)}")
-            if capped:
-                lines.append("\nShowing next 4 — reply 'more' to see further ahead.")
-            state.calendar_confirm_sessions[user_id] = {"delete_matches": matches, "step": "pick_delete", "event_query": event_query, "capped": capped}
-            state.session_timestamps[user_id] = datetime.now(TIMEZONE)
-            reply = "\n".join(lines)
-
-    elif lower.startswith("cal "):
-        reply = await smart_add_event(text[4:].strip(), user_id)
-
-    # ── CRM ───────────────────────────────────────────────────────────────────
-    elif lower.startswith("save restaurant "):
+    # Save restaurant (must check before generic "save " to handle maps links)
+    if lower.startswith("save restaurant "):
         result = handle_save_restaurant(text)
-        reply = handle_restaurant_save_result(result, user_id)
+        reply = _handle_restaurant_save_result(result, user_id)
 
     elif lower.startswith("save ") and not is_restaurant_save(text):
         result = save_contact(text[5:])
@@ -534,6 +782,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif lower.startswith("find ") or lower.startswith("pull up "):
         name = text[5:] if lower.startswith("find ") else text[8:]
         name_lower = name.strip().lower()
+        # Route pull up to correct handler before defaulting to CRM
         if name_lower in ["todo list", "todos", "my todos", "my todo list", "tasks", "my tasks"]:
             reply = list_todos()
         elif name_lower in ["bills", "my bills", "bill list"]:
@@ -549,14 +798,17 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif lower.startswith("note "):
         reply = add_note(text[5:])
+
     elif lower.startswith("followup "):
         reply = set_followup(text[9:])
+
     elif lower.startswith("update "):
         reply = update_field(text[7:])
 
     elif (lower.startswith("delete ") and not lower.startswith("delete event")
           and not lower.startswith("delete expense") and not lower.startswith("delete bill")
-          and not lower.startswith("delete restaurant") and not lower.startswith("delete last")):
+          and not lower.startswith("delete restaurant") and not lower.startswith("delete last")
+          and not lower.startswith("delete todo") and not lower.startswith("remove todo")):
         name = text[7:].strip()
         _, record = find_row(name)
         if not record:
@@ -586,7 +838,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif lower == "cancel":
         for d in [state.edit_sessions, state.excel_import_sessions, state.confirm_sessions,
-                  state.delete_sessions, state.receipt_confirm_sessions, state.calendar_confirm_sessions]:
+                  state.delete_sessions, state.receipt_confirm_sessions]:
             d.pop(user_id, None)
         state.session_timestamps.pop(user_id, None)
         reply = "Cancelled."
@@ -620,19 +872,21 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif lower in ["skip missed", "dismiss missed", "skip all missed"]:
         reply = "All missed follow-ups dismissed ✅"
     elif lower.startswith("skip ") and not lower.startswith("skip missed bills"):
-        reply = f"Follow-up for {text[5:].strip()} dismissed ✅"
+        name = text[5:].strip()
+        reply = f"Follow-up for {name} dismissed ✅"
     elif lower in ["skip missed bills", "dismiss missed bills"]:
         reply = "Missed bill reminders dismissed ✅"
 
-    elif lower in ["yes", "y", "yep", "yeah", "yup", "sure"] and (state.market_summary_pending.get(user_id) or state.market_summary_pending.get(YOUR_CHAT_ID)):
+    elif lower in ["yes", "y", "yep", "yeah", "yup", "sure"] and state.market_summary_pending.get(user_id):
         state.market_summary_pending.pop(user_id, None)
-        state.market_summary_pending.pop(YOUR_CHAT_ID, None)
         reply = await get_market_summary_now()
 
     elif re.match(r"set default card for .+ to .+", lower):
         m = re.match(r"set default card for (.+?) to (.+)", lower)
         if m:
-            reply = set_card_default_category(m.group(2).strip().title(), m.group(1).strip().title())
+            category_name = m.group(1).strip().title()
+            card_name = m.group(2).strip().title()
+            reply = set_card_default_category(card_name, category_name)
         else:
             reply = "Try: 'set default card for FnB to Maybank'"
 
@@ -669,10 +923,12 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         state.excel_import_sessions[user_id] = {"step": "awaiting_columns", "column_order": []}
         reply = "Sure! Tell me the column order in your Excel first — e.g. 'Name, Email, Date of Birth, Alias'"
 
-    # ── Meetings ──────────────────────────────────────────────────────────────
     elif lower.startswith("search meetings ") or lower.startswith("find meeting "):
         query = text[16:] if lower.startswith("search meetings ") else text[13:]
         reply = search_meeting_notes(query.strip())
+    elif lower == "cancel" and user_id in state.meeting_sessions:
+        del state.meeting_sessions[user_id]
+        reply = "Recap cancelled."
     elif is_meeting_start(text):
         event_name = extract_event_name(text)
         state.meeting_sessions[user_id] = {"step": "collecting", "event_name": event_name, "notes": []}
@@ -682,7 +938,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = "Sure, what's the event name?"
             state.meeting_sessions[user_id]["step"] = "get_name"
 
-    # ── Reminders ─────────────────────────────────────────────────────────────
     elif lower in ["reminders", "my reminders", "list reminders"]:
         reply = list_reminders()
     elif is_cancel_reminder_request(text):
@@ -695,7 +950,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             lines = ["Found multiple matching reminders — which one to cancel?"]
             for i, entry in enumerate(entries, 1):
                 parts = entry.split(":", 1)
-                lines.append(f"{i}. {parts[1] if len(parts) > 1 else entry}")
+                msg = parts[1] if len(parts) > 1 else entry
+                lines.append(f"{i}. {msg}")
             lines.append("\nReply with the number or 'all' to cancel all.")
             state.todo_disambig_sessions[user_id] = {"tasks": [e.split(":")[0] for e in entries], "action": "cancel_reminder", "entries": entries}
             reply = "\n".join(lines)
@@ -706,7 +962,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif is_reminder_request(text):
         reply = handle_new_reminder(text)
 
-    # ── Expenses ──────────────────────────────────────────────────────────────
     elif any(lower == p or lower.startswith(p) for p in [
         "what expense categories", "list my categories", "what categories",
         "show categories", "what are my expense categories", "list categories",
@@ -719,9 +974,11 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     ]):
         reply = get_merchant_list()
     elif lower.startswith("delete merchant ") or lower.startswith("remove merchant ") or lower.startswith("forget merchant "):
-        reply = delete_merchant(text.split(" ", 2)[2].strip())
+        merchant_name = text.split(" ", 2)[2].strip()
+        reply = delete_merchant(merchant_name)
     elif lower.startswith("log bug "):
-        reply = append_bug_to_backlog(text[8:].strip())
+        description = text[8:].strip()
+        reply = append_bug_to_backlog(description)
     elif (lower in ["expense report", "monthly report", "spending report", "expenses",
                    "monthly summary", "monthly spend", "this month", "expense summary"]
           or (re.search(r"\b(expense|spend|spent|spending)\b", lower) and re.search(r"\b(month|monthly|this month)\b", lower))):
@@ -741,14 +998,13 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not results:
             reply = f"No expenses found matching '{query}'."
         elif len(results) == 1:
-            reply = delete_expense_by_row(results[0][0])
+            sheet_row, _ = results[0]
+            reply = delete_expense_by_row(sheet_row)
         else:
             state.delete_sessions[user_id] = {"step": "pick", "expenses": results}
             reply = format_delete_list(results)
     elif lower in ["last expense", "show last expense", "what did i log"]:
         reply = show_last_expense()
-
-    # ── Trips ─────────────────────────────────────────────────────────────────
     elif lower in ["trip summary", "trip spend", "how much have i spent", "trip expenses"]:
         reply = get_trip_summary()
     elif lower in ["trip history", "my trips", "past trips", "trips"]:
@@ -772,7 +1028,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 reply += f"\nStarted: {trip_start}"
         else:
             reply = "No active trip — you're in SG mode."
-
     elif lower in ["show me my bills", "show my bills", "show me my reminders",
                    "show my reminders", "show me my tasks", "show my tasks",
                    "show me my todos", "show my todos", "show me my todo list"]:
@@ -782,57 +1037,58 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = list_reminders()
         else:
             reply = list_todos()
-
     elif lower.startswith("edit last expense ") or lower.startswith("edit expense "):
         edit_text = re.sub(r"^edit (?:last )?expense\s+", "", text, flags=re.IGNORECASE).strip()
-        reply = edit_last_expense(edit_text) if edit_text else show_last_expense()
-
+        if edit_text:
+            reply = edit_last_expense(edit_text)
+        else:
+            reply = show_last_expense()
     elif lower.startswith("rename category "):
         m = re.search(r"rename category (.+?) to (.+)", lower)
         if m:
-            old_cat, new_cat = m.group(1).strip(), m.group(2).strip()
+            old_cat = m.group(1).strip()
+            new_cat = m.group(2).strip()
             state.confirm_sessions[user_id] = {"action": "rename_category", "args": [old_cat, new_cat], "target": f"Rename {old_cat} to {new_cat}?"}
             reply = f"Rename category *{old_cat}* to *{new_cat}*? This will update all expense rows and Merchant Map. (yes / no)"
         else:
             reply = "Try: 'rename category FnB to Food'"
-
     elif (lower.startswith("now in ") or lower.startswith("switched to ") or lower.startswith("arrived in ")
-            or re.search(r"\bi'?m in\b|\bi am in\b", lower)
-            or re.search(r"\bcoming back\b|\bheading back\b|\bon my way back\b", lower)) \
+            or re.search(r"\bi'?m in\b|\bi am in\b", lower) or re.search(r"\bcoming back\b|\bheading back\b|\bon my way back\b", lower)) \
             and not is_bill_request(text):
         if state.overseas_state.get("active"):
             dest_text = re.sub(r"^(now in|switched to|arrived in)\s+", "", lower).strip().title()
             new_curr = _get_currency_for_dest(dest_text)
+            new_dest = dest_text
             if new_curr and new_curr != "SGD":
                 state.overseas_state["currency"] = new_curr
-                state.overseas_state["destination"] = dest_text
+                state.overseas_state["destination"] = new_dest
                 if new_curr not in state.overseas_state["currencies"]:
                     state.overseas_state["currencies"].append(new_curr)
-                if dest_text not in state.overseas_state["trip_destinations"]:
-                    state.overseas_state["trip_destinations"].append(dest_text)
+                if new_dest not in state.overseas_state["trip_destinations"]:
+                    state.overseas_state["trip_destinations"].append(new_dest)
                 asyncio.create_task(asyncio.to_thread(get_fx_rate, new_curr))
                 try:
                     from sheets import trips_sheet
                     ws = trips_sheet()
-                    for i, row in enumerate(ws.get_all_records(), start=2):
+                    records = ws.get_all_records()
+                    for i, row in enumerate(records, start=2):
                         if row.get("Status") == "active":
-                            ws.update_cell(i, 2, dest_text)
+                            ws.update_cell(i, 2, new_dest)
                             ws.update_cell(i, 3, new_curr)
                             break
                 except Exception as e:
                     print(f"Trips sheet update error: {e}")
-                reply = f"Switched to {dest_text} — expenses will now be logged in {new_curr}."
+                reply = f"Switched to {new_dest} — expenses will now be logged in {new_curr}."
             else:
                 reply = handle_overseas_request(text)
         else:
             reply = handle_overseas_request(text)
-
     elif is_log_prefix_input(text):
-        reply, needs_session, session_data = handle_expense_text(text[4:].strip(), user_id)
+        log_text = text[4:].strip()
+        reply, needs_session, session_data = handle_expense_text(log_text, user_id)
         if needs_session and session_data:
             state.expense_sessions[user_id] = session_data
 
-    # ── Bills ─────────────────────────────────────────────────────────────────
     elif lower in ["bills", "my bills", "list bills", "bills due", "what bills do i have",
                    "upcoming bills", "show bills"]:
         reply = list_bills()
@@ -843,7 +1099,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif is_bill_request(text):
         reply = handle_new_bill(text)
 
-    # ── Restaurants ───────────────────────────────────────────────────────────
     elif lower.startswith("delete restaurant ") or lower.startswith("remove restaurant "):
         rest_name = text.split(" ", 2)[2].strip()
         state.confirm_sessions[user_id] = {"action": "delete_restaurant", "args": [rest_name], "target": f"Delete restaurant {rest_name}?"}
@@ -851,7 +1106,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif is_restaurant_search(text):
         reply = handle_search_restaurants(text)
     elif is_restaurant_save(text):
-        reply = handle_restaurant_save_result(handle_save_restaurant(text), user_id)
+        result = handle_save_restaurant(text)
+        reply = _handle_restaurant_save_result(result, user_id)
     elif lower.startswith("search restaurants "):
         from restaurants import search_restaurants
         reply = search_restaurants(text[19:].strip())
@@ -861,7 +1117,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         name = re.sub(r"reviews? for|review of|tell me about|how is|how's|what's|what is", "", lower).strip().rstrip("?").strip()
         reply = await get_restaurant_review(name) if name else "Which restaurant are you asking about?"
 
-    # ── Stocks ────────────────────────────────────────────────────────────────
     elif lower in ["portfolio", "my portfolio", "holdings", "portfolio performance",
                    "how is my portfolio", "how are my stocks", "portfolio today", "check portfolio"]:
         reply = await get_portfolio_performance()
@@ -879,7 +1134,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not results:
             reply = f"No holdings found matching '{query}'."
         elif len(results) == 1:
-            reply = delete_portfolio_row(results[0][0])
+            sheet_row, _ = results[0]
+            reply = delete_portfolio_row(sheet_row)
         else:
             state.portfolio_delete_sessions[user_id] = {"step": "pick", "rows": results}
             reply = format_portfolio_delete_list(results)
@@ -891,7 +1147,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if result:
             reply = result
 
-    # ── Todos ─────────────────────────────────────────────────────────────────
     elif any(lower.startswith(p) for p in [
         "todo ", "add task ", "new task ", "create todo ",
         "add todo ", "add to my list ", "add to my todo "
@@ -931,36 +1186,17 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                    "show my tasks", "list my tasks", "pending tasks"]:
         reply = list_todos()
 
-    # ── Calendar (read + legacy create) ──────────────────────────────────────
+    elif lower.startswith("add event") or lower.startswith("schedule ") or lower.startswith("create event"):
+        reply = smart_add_event(text, user_id)
     elif lower == "events today":
-        reply = await get_events(1)
+        reply = get_events(1)
     elif lower == "events week":
-        reply = await get_events(7)
+        reply = get_events(7)
     elif lower.startswith("delete event "):
-        event_query = re.sub(r"^delete event\s+", "", text, flags=re.IGNORECASE).strip()
-        matches, err, capped = await find_upcoming_events(event_query)
-        if err:
-            reply = err
-        elif not matches:
-            reply = f"No upcoming event found matching '{event_query}'"
-        elif len(matches) == 1:
-            meta, summary, dtstart, dtend = matches[0]
-            from cal import _fmt_event_row
-            event_str = _fmt_event_row(summary, meta.get("cal_name", ""), dtstart, dtend)
-            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [{**meta, "dtstart": dtstart, "summary": summary}], "target": f"Delete {summary}?"}
-            reply = f"🗑 {event_str}\n\nDelete it? (yes / no)"
-        else:
-            from cal import _fmt_event_row
-            lines = ["Found multiple matching events — which one?\n"]
-            for i, (meta, summary, dtstart, dtend) in enumerate(matches, 1):
-                lines.append(f"{i}. {_fmt_event_row(summary, meta.get('cal_name', ''), dtstart, dtend)}")
-            if capped:
-                lines.append("\nShowing next 4 — reply 'more' to see further ahead.")
-            state.calendar_confirm_sessions[user_id] = {"delete_matches": matches, "step": "pick_delete", "event_query": event_query, "capped": capped}
-            state.session_timestamps[user_id] = datetime.now(TIMEZONE)
-            reply = "\n".join(lines)
+        event_name = text[13:].strip()
+        state.confirm_sessions[user_id] = {"action": "delete_event", "args": [event_name], "target": f"Delete event {event_name}?"}
+        reply = f"Delete event *{event_name}*? (yes / no)"
 
-    # ── Em system commands ────────────────────────────────────────────────────
     elif lower in ("em whats pending", "em what's pending", "em pending", "whats pending"):
         reply = get_pending_backlog()
 
@@ -978,9 +1214,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not state.em_profile or not state.em_profile.get("version"):
             issues.append("• Profile: not loaded — reply 'reload profile' to retry")
         try:
-            from cal import _get_service; await asyncio.to_thread(_get_service)
+            await asyncio.to_thread(get_calendar, "Personal")
         except Exception:
-            issues.append("• Google Calendar: unreachable — check GOOGLE_CREDENTIALS in Railway")
+            issues.append("• iCloud Calendar: unreachable — check ICLOUD_USERNAME / ICLOUD_PASSWORD in Railway")
         from config import ANTHROPIC_FAILURE_THRESHOLD
         if state._anthropic_failure_count >= ANTHROPIC_FAILURE_THRESHOLD:
             issues.append("• Anthropic API: repeated failures detected — check API key or Anthropic status page")
@@ -994,9 +1230,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             "referrals, all referrals, top referrers, referrals from [name]\n"
             "import excel — import contacts from a spreadsheet\n\n"
             "*Calendar:*\n"
-            "cal [title] [calendar] [date] [time] — add an event\n"
-            "cal delete [title] — delete an event\n"
-            "events today / events week\n\n"
+            "Just tell me naturally — 'schedule dinner tomorrow 7pm' or 'add event'\n"
+            "events today / events week / delete event\n\n"
             "*To-Do:*\n"
             "todo [task] / add task [task] / new task [task]\n"
             "done [task] — mark complete\n"
@@ -1030,7 +1265,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             "Or just chat — I'll figure it out 👍"
         )
 
-    # ── Natural language fallbacks ────────────────────────────────────────────
+    # Natural language CRM updates
     elif (crm_action := detect_crm_natural_update(text)) and not is_bill_request(text) and not is_overseas_mode_request(text):
         action, name, field_or_referred, value = crm_action
         if action == "referral":
@@ -1040,9 +1275,11 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         elif action == "show_private":
             reply = find_contact(name, show_private=True)
 
+    # Overseas / trip setup
     elif is_overseas_mode_request(text):
         reply = handle_overseas_request(text)
 
+    # Expense
     elif is_expense_input(text):
         reply, needs_session, session_data = handle_expense_text(text, user_id)
         if needs_session and session_data:
@@ -1052,6 +1289,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if needs_session and session_data:
             state.expense_sessions[user_id] = session_data
 
+    # Calendar queries (read — what's on, do I have anything)
     elif any(t in lower for t in [
         "what's on today", "whats on today", "what is on today",
         "what's on tomorrow", "whats on tomorrow",
@@ -1062,23 +1300,15 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         "calendar today", "calendar tomorrow",
         "show my calendar", "what's happening today", "what's happening tomorrow",
     ]):
-        reply = await get_events(7 if "week" in lower else 1)
+        days = 7 if "week" in lower else 1
+        reply = get_events(days)
 
+    # Calendar (create)
     elif is_calendar_request(text):
-        reply = await smart_add_event(text, user_id)
+        reply = smart_add_event(text, user_id)
 
-    # ── Claude conversation fallback ──────────────────────────────────────────
+    # Claude conversation fallback
     else:
-        # Only alert on messages that look like feature requests, not casual conversation
-        FEATURE_SIGNALS = [
-            "remind", "expense", "log ", "save ", "find ", "add ", "delete ", "update ",
-            "todo", "bill", "calendar", "cal ", "stock", "portfolio", "restaurant",
-            "trip", "flight", "meeting", "note ", "contact", "followup", "birthday",
-            "receipt", "import", "report", "summary", "fx ", "rate ", "convert",
-        ]
-        if any(sig in lower for sig in FEATURE_SIGNALS):
-            await alert_error(f"⚠️ Routing fallback — no handler matched.\nMessage: \"{text[:200]}\"")
-
         if user_id not in state.conversation_histories:
             state.conversation_histories[user_id] = []
         state.conversation_histories[user_id].append({"role": "user", "content": text})
@@ -1107,6 +1337,48 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await send_safe(update.message, reply, parse_mode="Markdown")
 
 
+def _handle_restaurant_save_result(result, user_id):
+    """Helper to parse restaurant save signals and set up pending session."""
+    if not result:
+        return None
+    if result.startswith("_NEEDS_LOCATION_:"):
+        parts = result.split(":", 2)
+        name = parts[1] if len(parts) > 1 else ""
+        country = parts[2] if len(parts) > 2 else "Singapore"
+        state.pending_restaurant_saves[user_id] = {"name": name, "country": country, "step": "awaiting_location"}
+        return f"⚠️ Couldn't read that Maps link — what's the location for {name}?\n(e.g. 313 Orchard Road, Singapore)"
+    if result.startswith("_INFER_LOCATION_:"):
+        parts = result.split(":", 5)
+        name = parts[1] if len(parts) > 1 else ""
+        country = parts[2] if len(parts) > 2 else "Singapore"
+        tags = parts[3] if len(parts) > 3 else ""
+        multiple = parts[4] == "1" if len(parts) > 4 else False
+        outlets = parts[5].split("|") if len(parts) > 5 and parts[5] else []
+        if multiple and len(outlets) > 1:
+            state.pending_restaurant_saves[user_id] = {
+                "step": "awaiting_outlet", "name": name, "country": country,
+                "tags": tags, "outlets": outlets
+            }
+            outlet_list = "\n".join(f"{i+1}. {o}" for i, o in enumerate(outlets))
+            return f"Found a few {name} outlets — which one, and any tags?\n{outlet_list}"
+        else:
+            location = outlets[0] if outlets else ""
+            state.pending_restaurant_saves[user_id] = {
+                "step": "awaiting_confirm", "name": name, "country": country,
+                "tags": tags, "location": location
+            }
+            return f"Got it — I have {name} at {location}. Is that right, and any tags? (yes / no, add tags or skip)"
+    if result.startswith("_DUPLICATE_RESTAURANT_:"):
+        parts = result.split(":", 5)
+        state.pending_restaurant_saves[user_id] = {
+            "step": "duplicate", "existing": parts[1], "name": parts[2],
+            "location": parts[3], "country": parts[4],
+            "tags": parts[5] if len(parts) > 5 else "", "notes": ""
+        }
+        return f"*{parts[1]}* is already in your list.\nUpdate existing or save as new? (update / new)"
+    return result
+
+
 async def check_missed_items_on_startup(app):
     try:
         from reminders import reminders_sheet, get_next_recurrence
@@ -1127,9 +1399,12 @@ async def check_missed_items_on_startup(app):
                     for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]:
                         try:
                             fu_date = datetime.strptime(fu_date_str, fmt).date()
-                            # M2: only alert for yesterday (missed while offline overnight)
-                            if fu_date == yesterday:
-                                missed_followups.append({"name": r.get("Name", "?"), "date": fu_date_str})
+                            if fu_date < today:
+                                missed_followups.append({
+                                    "name": r.get("Name", "?"),
+                                    "date": fu_date_str,
+                                    "notes": r.get("Follow Up Notes", "")
+                                })
                             break
                         except ValueError:
                             continue
@@ -1137,14 +1412,29 @@ async def check_missed_items_on_startup(app):
             print(f"Missed followups check error: {e}")
 
         try:
-            pass  # Missed bill alerts suppressed — reminders fire on schedule only
+            ws = bills_sheet()
+            records = ws.get_all_records()
+            for r in records:
+                due_str = r.get("Due Date", "")
+                if not due_str:
+                    continue
+                due_date = None
+                for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y"]:
+                    try:
+                        due_date = datetime.strptime(due_str, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+                if due_date and due_date == yesterday:
+                    missed_bills.append(r.get("Name", "?"))
         except Exception as e:
             print(f"Missed bills check error: {e}")
 
         try:
             ws = reminders_sheet()
+            records = ws.get_all_records()
             now = datetime.now(TIMEZONE)
-            for i, r in enumerate(ws.get_all_records(), start=2):
+            for i, r in enumerate(records, start=2):
                 if r.get("Status") != "pending":
                     continue
                 scheduled_str = r.get("Scheduled Time", "")
@@ -1153,7 +1443,11 @@ async def check_missed_items_on_startup(app):
                 try:
                     scheduled = TIMEZONE.localize(datetime.strptime(scheduled_str, "%Y-%m-%d %H:%M"))
                     if scheduled < now:
-                        missed_reminders.append({"message": r.get("Message", ""), "row": i, "recurrence": r.get("Recurrence", "once")})
+                        missed_reminders.append({
+                            "message": r.get("Message", ""),
+                            "row": i,
+                            "recurrence": r.get("Recurrence", "once")
+                        })
                 except Exception:
                     continue
         except Exception as e:
@@ -1167,16 +1461,24 @@ async def check_missed_items_on_startup(app):
             await app.bot.send_message(chat_id=YOUR_CHAT_ID, text="\n".join(lines))
 
         if missed_bills:
-            lines = ["⚠️ Missed bill reminder(s) while offline:"] + [f"• {b}" for b in missed_bills]
+            lines = ["⚠️ Missed bill reminder(s) while offline:"]
+            for b in missed_bills:
+                lines.append(f"• {b}")
             lines.append("\nReply 'skip missed bills' to dismiss.")
             await app.bot.send_message(chat_id=YOUR_CHAT_ID, text="\n".join(lines))
 
         for rem in missed_reminders:
             try:
-                await app.bot.send_message(chat_id=YOUR_CHAT_ID, text=f"🔔 Reminder (missed while offline): {rem['message']}")
+                await app.bot.send_message(
+                    chat_id=YOUR_CHAT_ID,
+                    text=f"🔔 Reminder (missed while offline): {rem['message']}"
+                )
                 ws = reminders_sheet()
                 if rem["recurrence"] != "once":
-                    next_time = get_next_recurrence(datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"), rem["recurrence"])
+                    next_time = get_next_recurrence(
+                        datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+                        rem["recurrence"]
+                    )
                     if next_time:
                         ws.update_cell(rem["row"], 3, next_time)
                 else:
@@ -1190,14 +1492,18 @@ async def check_missed_items_on_startup(app):
                 try:
                     sheet = get_sheet("Settings")
                     if sheet:
-                        for r in sheet.get_all_records():
+                        records = sheet.get_all_records()
+                        for r in records:
                             if r.get("Key") == "market_summary_last_sent":
                                 already_sent = r.get("Value", "") == today.isoformat()
                                 break
                 except Exception as e:
                     print(f"market_summary_last_sent check error: {e}")
                 if not already_sent:
-                    await app.bot.send_message(chat_id=YOUR_CHAT_ID, text="Missed the Monday market summary while offline — want me to send it now? (yes / no)")
+                    await app.bot.send_message(
+                        chat_id=YOUR_CHAT_ID,
+                        text="Missed the Monday market summary while offline — want me to send it now? (yes / no)"
+                    )
                     state.market_summary_pending[YOUR_CHAT_ID] = True
         except Exception as e:
             print(f"Missed market summary check error: {e}")
