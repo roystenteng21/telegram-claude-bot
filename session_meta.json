@@ -1,10 +1,10 @@
 {
   "date": "2026-05-21",
   "session": "Session 36",
-  "built": "iCloud fully removed from cal.py, routing.py, bot.py, config.py",
-  "fixed": "boot crash from get_calendar import",
-  "pending": "calendar C1-C8 live test, expense confirm options rebuild",
-  "deploy_count": 54,
+  "built": "smart_add_event direct-add with Em confirmation, get_events_for_date, events week Sunday boundary, cal/add cal routing triggers",
+  "fixed": "missing await on get_events and smart_add_event causing crashes and hallucination, icloud cleanup",
+  "pending": "expense confirm options rebuild, calendar edit flow post-write",
+  "deploy_count": 55,
   "module_count": 21,
   "modules": [
     "bills.py",

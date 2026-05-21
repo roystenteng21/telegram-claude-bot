@@ -45,7 +45,7 @@ from reminders import (
     cancel_reminder_by_keyword, check_and_fire_reminders
 )
 from cal import (
-    get_events, delete_calendar_event, is_calendar_request,
+    get_events, get_events_for_date, delete_calendar_event, is_calendar_request,
     smart_add_event
 )
 from todos import add_todo, complete_todo, delete_todo, list_todos
@@ -1186,12 +1186,54 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                    "show my tasks", "list my tasks", "pending tasks"]:
         reply = list_todos()
 
-    elif lower.startswith("add event") or lower.startswith("schedule ") or lower.startswith("create event"):
-        reply = smart_add_event(text, user_id)
+    elif (lower.startswith("add event") or lower.startswith("schedule ")
+          or lower.startswith("create event") or lower.startswith("cal ")
+          or lower.startswith("add cal ")):
+        reply = await smart_add_event(text, user_id)
     elif lower == "events today":
-        reply = get_events(1)
+        reply = await get_events(1)
     elif lower == "events week":
-        reply = get_events(7)
+        reply = await get_events(7)
+    elif re.match(r"events on .+", lower) or re.match(r"events (for|this) .+", lower):
+        date_text = re.sub(r"^events (on|for|this)\s+", "", lower).strip()
+        # Resolve to DD MMM YYYY
+        anchors = {k.lower(): v for k, v in {
+            "today": __import__('datetime').date.today().strftime("%d %b %Y"),
+            "tomorrow": (__import__('datetime').date.today() + __import__('datetime').timedelta(days=1)).strftime("%d %b %Y"),
+        }.items()}
+        if date_text in anchors:
+            resolved = anchors[date_text]
+        else:
+            # Try parsing directly
+            from datetime import date as _date
+            resolved = None
+            for fmt in ["%d %b %Y", "%d %b", "%d/%m/%Y", "%d-%m-%Y"]:
+                try:
+                    parsed_d = __import__('datetime').datetime.strptime(date_text, fmt)
+                    if fmt == "%d %b":
+                        parsed_d = parsed_d.replace(year=_date.today().year)
+                    resolved = parsed_d.strftime("%d %b %Y")
+                    break
+                except ValueError:
+                    continue
+            if not resolved:
+                # Let Haiku resolve it
+                try:
+                    from cal import _build_date_anchor_block
+                    date_block = _build_date_anchor_block()
+                    resp = client.messages.create(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=20,
+                        messages=[{"role": "user", "content":
+                            f"{date_block}\nResolve this date reference to DD MMM YYYY format only, no other text: '{date_text}'"}]
+                    )
+                    resolved = resp.content[0].text.strip()
+                except Exception:
+                    resolved = None
+        if resolved:
+            reply = await get_events_for_date(resolved)
+        else:
+            reply = f"Couldn't understand that date — try 'events on 23 May' or 'events today'."
     elif lower.startswith("delete event "):
         event_name = text[13:].strip()
         state.confirm_sessions[user_id] = {"action": "delete_event", "args": [event_name], "target": f"Delete event {event_name}?"}
@@ -1214,7 +1256,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not state.em_profile or not state.em_profile.get("version"):
             issues.append("• Profile: not loaded — reply 'reload profile' to retry")
         try:
-            await asyncio.to_thread(get_events, 1)
+            await get_events(1)
         except Exception:
             issues.append("• Google Calendar: unreachable — check GOOGLE_CREDENTIALS in Railway")
         from config import ANTHROPIC_FAILURE_THRESHOLD
@@ -1301,11 +1343,11 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         "show my calendar", "what's happening today", "what's happening tomorrow",
     ]):
         days = 7 if "week" in lower else 1
-        reply = get_events(days)
+        reply = await get_events(days)
 
     # Calendar (create)
     elif is_calendar_request(text):
-        reply = smart_add_event(text, user_id)
+        reply = await smart_add_event(text, user_id)
 
     # Claude conversation fallback
     else:

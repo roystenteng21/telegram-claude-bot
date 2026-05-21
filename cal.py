@@ -216,8 +216,6 @@ def format_calendar_confirm(parsed):
     ]
     if parsed.get("location"):
         lines.append(f"📍 {parsed['location']}")
-    lines.append("")
-    lines.append("Add it in? (yes / edit)")
     return "\n".join(lines)
 
 
@@ -272,23 +270,23 @@ async def smart_add_event(text, user_id):
     try:
         parsed = await asyncio.to_thread(parse_calendar_request, text)
     except json.JSONDecodeError:
-        return "⚠️ Couldn't parse that — try: cal Branson appointment fri 10-12pm"
+        return "⚠️ Couldn't parse that — try: cal Dentist Personal 23 May 10am"
     except Exception:
-        return "⚠️ Couldn't parse that — try: cal Branson appointment fri 10-12pm"
+        return "⚠️ Couldn't parse that — try: cal Dentist Personal 23 May 10am"
 
     if not parsed.get("title") or not parsed.get("start"):
-        return "⚠️ Couldn't parse that — try: cal Branson appointment fri 10-12pm"
+        return "⚠️ Couldn't parse that — try: cal Dentist Personal 23 May 10am"
 
     try:
         start_dt = datetime.strptime(parsed["start"], "%d %b %Y %H:%M")
         if start_dt.year < date.today().year:
-            return f"⚠️ That date looks wrong ({parsed['start']}) — can you clarify the date?"
+            return f"⚠️ That date looks wrong ({parsed['start']}) — can you clarify?"
     except Exception:
         pass
 
     parsed["calendar"] = _match_calendar_name(parsed.get("calendar", ""))
 
-    # Strip any calendar name words from title
+    # Strip calendar name words from title
     cal_words = set()
     for cal in KNOWN_CALENDARS:
         for word in cal.lower().split():
@@ -298,9 +296,34 @@ async def smart_add_event(text, user_id):
     if cleaned_title.strip():
         parsed["title"] = cleaned_title.strip()
 
-    state.calendar_confirm_sessions[user_id] = {"parsed": parsed}
-    state.session_timestamps[user_id] = datetime.now(TIMEZONE)
-    return format_calendar_confirm(parsed)
+    # Write immediately
+    write_result = await write_calendar_event(parsed)
+    if write_result.startswith("❌"):
+        return write_result
+
+    # Format summary
+    summary = format_calendar_confirm(parsed)
+
+    # Em-generated short confirmation line
+    try:
+        confirm_resp = await asyncio.to_thread(
+            lambda: client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=30,
+                messages=[{"role": "user", "content":
+                    "Generate a short natural confirmation that a calendar event was added. "
+                    "Keep it under 8 words, casual, no emoji. Vary the phrasing each time. "
+                    "Examples: 'Done, it\\'s in!', 'Added!', 'All set, it\\'s in your calendar.', 'Got it, locked in!'"}]
+            )
+        )
+        confirm_line = confirm_resp.content[0].text.strip().strip('"')
+    except Exception:
+        confirm_line = "Done, it's in!"
+
+    # Store last added event for post-write edit
+    state.calendar_last_added[user_id] = {"parsed": parsed}
+
+    return f"{summary}\n\n{confirm_line}"
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +391,17 @@ async def get_events(days=1):
     try:
         service = await asyncio.to_thread(_get_service)
         now = datetime.utcnow().isoformat() + "Z"
-        end_dt = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+
+        if days == 7:
+            # End on this week's Sunday (not 7 days from now)
+            today = date.today()
+            days_until_sunday = (6 - today.weekday()) % 7
+            if days_until_sunday == 0:
+                days_until_sunday = 7
+            end_date = today + timedelta(days=days_until_sunday)
+            end_dt = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59).isoformat() + "Z"
+        else:
+            end_dt = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
 
         all_events = []
         for cal_name, cal_id in CALENDAR_IDS.items():
@@ -390,10 +423,10 @@ async def get_events(days=1):
 
         if not all_events:
             label = "today" if days == 1 else "this week"
-            return f"📅 No events {label}"
+            return f"Nothing on {label} 👍"
 
         all_events.sort(key=lambda x: x[1] or "")
-        label = "Today's events" if days == 1 else "This week's events"
+        label = "Today" if days == 1 else "This Week"
         response = f"📅 *{label}:*\n\n"
         for summary, start_raw, cal_name in all_events:
             try:
@@ -404,6 +437,52 @@ async def get_events(days=1):
                     time_str = start_raw
             except Exception:
                 time_str = start_raw or "?"
+            response += f"• *{summary}* — {time_str} ({cal_name})\n"
+        return response
+    except Exception as e:
+        return f"⚠️ Calendar error: {str(e)}"
+
+
+async def get_events_for_date(date_str):
+    """Fetch events for a specific date. date_str format: 'DD MMM YYYY'"""
+    try:
+        target = datetime.strptime(date_str, "%d %b %Y").date()
+    except Exception:
+        return f"⚠️ Couldn't parse date: {date_str}"
+    try:
+        service = await asyncio.to_thread(_get_service)
+        time_min = datetime(target.year, target.month, target.day, 0, 0, 0).isoformat() + "Z"
+        time_max = datetime(target.year, target.month, target.day, 23, 59, 59).isoformat() + "Z"
+        all_events = []
+        for cal_name, cal_id in CALENDAR_IDS.items():
+            try:
+                result = await asyncio.to_thread(
+                    lambda cid=cal_id: service.events().list(
+                        calendarId=cid,
+                        timeMin=time_min,
+                        timeMax=time_max,
+                        singleEvents=True,
+                        orderBy="startTime"
+                    ).execute()
+                )
+                for e in result.get("items", []):
+                    start_raw = e.get("start", {}).get("dateTime") or e.get("start", {}).get("date")
+                    all_events.append((e.get("summary", "No title"), start_raw, cal_name))
+            except Exception:
+                continue
+        if not all_events:
+            return f"Nothing on {target.strftime('%a %d %b')} 👍"
+        all_events.sort(key=lambda x: x[1] or "")
+        response = f"📅 *{target.strftime('%a %d %b %Y')}:*\n\n"
+        for summary, start_raw, cal_name in all_events:
+            try:
+                if start_raw and "T" in start_raw:
+                    dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+                    time_str = dt.strftime("%I:%M%p").lstrip("0").lower()
+                else:
+                    time_str = "all day"
+            except Exception:
+                time_str = "?"
             response += f"• *{summary}* — {time_str} ({cal_name})\n"
         return response
     except Exception as e:

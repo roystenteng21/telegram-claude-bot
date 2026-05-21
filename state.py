@@ -14,11 +14,14 @@ interrupted_sessions = {}
 todo_disambig_sessions = {}
 market_summary_pending = {}
 session_timestamps = {}
-calendar_confirm_sessions = {}
 
 # --- Pending saves ---
 pending_contact_saves = {}
 pending_restaurant_saves = {}
+
+# --- Calendar ---
+calendar_confirm_sessions = {}
+calendar_last_added = {}
 
 # --- Profile + feature state ---
 em_profile = {}
@@ -41,11 +44,8 @@ manual_fx_rates = {}
 cached_fx_rates = {}
 
 # --- API health flags ---
-OAUTH_DRIVE_OK = False
 _anthropic_failure_count = 0
 _anthropic_down_notified = False
-_icloud_down = False
-_icloud_last_notified = None
 
 # --- Caches ---
 _crm_cache = None
