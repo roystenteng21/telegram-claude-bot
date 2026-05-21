@@ -2,9 +2,9 @@
   "date": "2026-05-21",
   "session": "Session 37",
   "built": "date injection in system prompt, KL timezone display, get_events_for_date UTC boundary, is_calendar_request async, apply_calendar_edit post-write flow",
-  "fixed": "missing awaits, blocking Haiku calls, dead icloud imports, wrong UTC boundaries causing missed/wrong-time events",
-  "pending": "expense confirm rebuild",
-  "deploy_count": 56,
+  "fixed": "missing awaits, blocking Haiku calls, wrong UTC boundaries, missing edit/remove cal triggers",
+  "pending": "expense confirm rebuild, bills strptime, S27 checklist",
+  "deploy_count": 57,
   "module_count": 21,
   "modules": [
     "bills.py",
