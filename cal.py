@@ -331,10 +331,10 @@ async def smart_add_event(text, user_id):
 # ---------------------------------------------------------------------------
 
 async def apply_calendar_edit(user_id, edit_text):
-    if user_id not in state.calendar_confirm_sessions:
-        return "No pending calendar event to edit."
+    if user_id not in state.calendar_last_added:
+        return "No recent calendar event to edit — add an event first."
 
-    parsed = state.calendar_confirm_sessions[user_id]["parsed"]
+    parsed = state.calendar_last_added[user_id]["parsed"]
 
     prompt = f"""The user wants to edit a calendar event field.
 Current event:
@@ -377,7 +377,11 @@ For calendar, match from: {', '.join(KNOWN_CALENDARS)}"""
         elif field == "time":
             parsed["start"] = value
 
-        state.calendar_confirm_sessions[user_id]["parsed"] = parsed
+        state.calendar_last_added[user_id]["parsed"] = parsed
+        # Re-write the updated event to Google Calendar
+        write_result = await write_calendar_event(parsed)
+        if write_result.startswith("❌"):
+            return write_result
         return format_calendar_confirm(parsed)
     except Exception:
         return "⚠️ Couldn't apply that edit — try again, e.g. 'change time to 2-4pm'"
@@ -432,7 +436,8 @@ async def get_events(days=1):
             try:
                 if "T" in start_raw:
                     dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
-                    time_str = dt.strftime("%d %b, %I:%M%p").lstrip("0").lower()
+                    dt = dt.astimezone(TIMEZONE)
+                    time_str = dt.strftime("%d %b, %-I:%M%p").lstrip("0").lower()
                 else:
                     time_str = start_raw
             except Exception:
@@ -451,8 +456,11 @@ async def get_events_for_date(date_str):
         return f"⚠️ Couldn't parse date: {date_str}"
     try:
         service = await asyncio.to_thread(_get_service)
-        time_min = datetime(target.year, target.month, target.day, 0, 0, 0).isoformat() + "Z"
-        time_max = datetime(target.year, target.month, target.day, 23, 59, 59).isoformat() + "Z"
+        import pytz
+        kl_midnight = TIMEZONE.localize(datetime(target.year, target.month, target.day, 0, 0, 0))
+        kl_eod = TIMEZONE.localize(datetime(target.year, target.month, target.day, 23, 59, 59))
+        time_min = kl_midnight.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        time_max = kl_eod.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         all_events = []
         for cal_name, cal_id in CALENDAR_IDS.items():
             try:
@@ -478,7 +486,8 @@ async def get_events_for_date(date_str):
             try:
                 if start_raw and "T" in start_raw:
                     dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
-                    time_str = dt.strftime("%I:%M%p").lstrip("0").lower()
+                    dt = dt.astimezone(TIMEZONE)
+                    time_str = dt.strftime("%-I:%M%p").lstrip("0").lower()
                 else:
                     time_str = "all day"
             except Exception:
@@ -668,7 +677,10 @@ Rules:
         matches, err, capped = await find_upcoming_events(event_query, days=days, max_results=4)
         if err:
             return err
-        cal_filter = None
+        if matches:
+            cal_filter = None
+            # Inform user we searched across all calendars
+            cal_filter_raw = None
 
     if not matches:
         return f"No upcoming event found matching '{event_query}'"
@@ -865,7 +877,7 @@ async def _apply_event_edit(meta, summary, field, value, dtstart=None, dtend=Non
 # is_calendar_request — unchanged
 # ---------------------------------------------------------------------------
 
-def is_calendar_request(text):
+async def is_calendar_request(text):
     lower = text.lower().strip()
     QUERY_TRIGGERS = [
         "what's on", "whats on", "what is on", "do i have anything",
@@ -915,11 +927,13 @@ def is_calendar_request(text):
     ]
     if any(s in lower for s in AMBIGUOUS_SIGNALS) or AT_PATTERN:
         try:
-            response = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=10,
-                messages=[{"role": "user", "content":
-                    f'Is this asking to add a calendar event? Reply YES or NO only.\n\n"{text}"'}]
+            response = await asyncio.to_thread(
+                lambda: client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=10,
+                    messages=[{"role": "user", "content":
+                        f'Is this asking to add a calendar event? Reply YES or NO only.\n\n"{text}"'}]
+                )
             )
             return response.content[0].text.strip().upper() == "YES"
         except Exception as e:

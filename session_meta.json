@@ -1,10 +1,10 @@
 {
   "date": "2026-05-21",
-  "session": "Session 36",
-  "built": "smart_add_event direct-add with Em confirmation, get_events_for_date, events week Sunday boundary, cal/add cal routing triggers",
-  "fixed": "missing await on get_events and smart_add_event causing crashes and hallucination, icloud cleanup",
-  "pending": "expense confirm options rebuild, calendar edit flow post-write",
-  "deploy_count": 55,
+  "session": "Session 37",
+  "built": "date injection in system prompt, KL timezone display, get_events_for_date UTC boundary, is_calendar_request async, apply_calendar_edit post-write flow",
+  "fixed": "missing awaits, blocking Haiku calls, dead icloud imports, wrong UTC boundaries causing missed/wrong-time events",
+  "pending": "expense confirm rebuild",
+  "deploy_count": 56,
   "module_count": 21,
   "modules": [
     "bills.py",

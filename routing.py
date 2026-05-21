@@ -46,7 +46,7 @@ from reminders import (
 )
 from cal import (
     get_events, get_events_for_date, delete_calendar_event, is_calendar_request,
-    smart_add_event
+    smart_add_event, edit_calendar_event, apply_calendar_edit
 )
 from todos import add_todo, complete_todo, delete_todo, list_todos
 from meetings import (
@@ -118,7 +118,9 @@ def build_system_prompt():
         "Foreign currency expenses show SGD amount with original currency in brackets. "
         "Receipts can be attached as photo with caption."
     )
+    today_str = date.today().strftime("%A, %d %b %Y")
     return (
+        f"## Today\nToday is {today_str}.\n\n"
         "# Em — Your Personal Assistant\n\n"
         "## Core Identity\n"
         "You're Em — a smart, focused personal assistant with a casual, warm vibe. "
@@ -619,7 +621,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             elif action == "delete_restaurant":
                 reply = delete_restaurant(args[0])
             elif action == "delete_event":
-                reply = delete_calendar_event(args[0])
+                reply = await delete_calendar_event(args[0])
             else:
                 reply = "Done."
             await send_safe(update.message, reply, parse_mode="Markdown")
@@ -1190,13 +1192,22 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
           or lower.startswith("create event") or lower.startswith("cal ")
           or lower.startswith("add cal ")):
         reply = await smart_add_event(text, user_id)
+    elif lower.startswith("edit cal ") or lower.startswith("edit event "):
+        reply = await edit_calendar_event(text, user_id)
+    elif lower.startswith("remove cal ") or lower.startswith("remove event ") or lower.startswith("cal delete "):
+        event_name = re.sub(r"^(remove cal|remove event|cal delete)\s+", "", lower).strip()
+        raw_name = re.sub(r"^(remove cal|remove event|cal delete)\s+", "", text, flags=re.IGNORECASE).strip()
+        state.confirm_sessions[user_id] = {"action": "delete_event", "args": [raw_name], "target": f"Delete event {raw_name}?"}
+        reply = f"Delete event *{raw_name}*? (yes / no)"
+    elif lower.startswith("edit ") and "calendar_last_added" and user_id in state.calendar_last_added and not lower.startswith("edit last expense") and not lower.startswith("edit expense"):
+        # Post-write edit — only fires if last action was a calendar add
+        reply = await apply_calendar_edit(user_id, text)
     elif lower == "events today":
         reply = await get_events(1)
     elif lower == "events week":
         reply = await get_events(7)
     elif re.match(r"events on .+", lower) or re.match(r"events (for|this) .+", lower):
         date_text = re.sub(r"^events (on|for|this)\s+", "", lower).strip()
-        # Resolve to DD MMM YYYY
         anchors = {k.lower(): v for k, v in {
             "today": __import__('datetime').date.today().strftime("%d %b %Y"),
             "tomorrow": (__import__('datetime').date.today() + __import__('datetime').timedelta(days=1)).strftime("%d %b %Y"),
@@ -1204,7 +1215,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if date_text in anchors:
             resolved = anchors[date_text]
         else:
-            # Try parsing directly
             from datetime import date as _date
             resolved = None
             for fmt in ["%d %b %Y", "%d %b", "%d/%m/%Y", "%d-%m-%Y"]:
@@ -1217,15 +1227,16 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 except ValueError:
                     continue
             if not resolved:
-                # Let Haiku resolve it
                 try:
                     from cal import _build_date_anchor_block
                     date_block = _build_date_anchor_block()
-                    resp = client.messages.create(
-                        model="claude-haiku-4-5-20251001",
-                        max_tokens=20,
-                        messages=[{"role": "user", "content":
-                            f"{date_block}\nResolve this date reference to DD MMM YYYY format only, no other text: '{date_text}'"}]
+                    resp = await asyncio.to_thread(
+                        lambda: client.messages.create(
+                            model="claude-haiku-4-5-20251001",
+                            max_tokens=20,
+                            messages=[{"role": "user", "content":
+                                f"{date_block}\nResolve this date reference to DD MMM YYYY format only, no other text: '{date_text}'"}]
+                        )
                     )
                     resolved = resp.content[0].text.strip()
                 except Exception:
@@ -1346,7 +1357,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = await get_events(days)
 
     # Calendar (create)
-    elif is_calendar_request(text):
+    elif await is_calendar_request(text):
         reply = await smart_add_event(text, user_id)
 
     # Claude conversation fallback
@@ -1357,6 +1368,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if len(state.conversation_histories[user_id]) > 20:
             state.conversation_histories[user_id] = state.conversation_histories[user_id][-20:]
         overseas_key = (
+            date.today().isoformat(),
             state.overseas_state.get("active"),
             state.overseas_state.get("destination"),
             state.overseas_state.get("currency"),
