@@ -305,20 +305,25 @@ async def smart_add_event(text, user_id):
     summary = format_calendar_confirm(parsed)
 
     # Em-generated short confirmation line
+    CONFIRM_LINES = [
+        "Done, it's in!", "Added!", "All set!", "Got it, locked in!",
+        "On the calendar!", "Sorted!", "Done and dusted!", "It's in!"
+    ]
     try:
         confirm_resp = await asyncio.to_thread(
             lambda: client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=30,
+                max_tokens=15,
                 messages=[{"role": "user", "content":
-                    "Generate a short natural confirmation that a calendar event was added. "
-                    "Keep it under 8 words, casual, no emoji. Vary the phrasing each time. "
-                    "Examples: 'Done, it\\'s in!', 'Added!', 'All set, it\\'s in your calendar.', 'Got it, locked in!'"}]
+                    "Reply with ONE short casual confirmation under 6 words. No emoji, no quotes, no list, just the phrase. Example: Done, it's in!"}]
             )
         )
-        confirm_line = confirm_resp.content[0].text.strip().strip('"')
+        confirm_line = confirm_resp.content[0].text.strip().strip('"').split("\n")[0]
+        if len(confirm_line) > 40 or not confirm_line:
+            raise ValueError("bad response")
     except Exception:
-        confirm_line = "Done, it's in!"
+        import random
+        confirm_line = random.choice(CONFIRM_LINES)
 
     # Store last added event for post-write edit
     state.calendar_last_added[user_id] = {"parsed": parsed}
@@ -396,16 +401,17 @@ async def get_events(days=1):
         service = await asyncio.to_thread(_get_service)
         now = datetime.utcnow().isoformat() + "Z"
 
+        import pytz
+        today = date.today()
         if days == 7:
-            # End on this week's Sunday (not 7 days from now)
-            today = date.today()
             days_until_sunday = (6 - today.weekday()) % 7
             if days_until_sunday == 0:
                 days_until_sunday = 7
             end_date = today + timedelta(days=days_until_sunday)
-            end_dt = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59).isoformat() + "Z"
         else:
-            end_dt = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+            end_date = today
+        kl_eod = TIMEZONE.localize(datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59))
+        end_dt = kl_eod.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         all_events = []
         for cal_name, cal_id in CALENDAR_IDS.items():
@@ -439,7 +445,9 @@ async def get_events(days=1):
                     dt = dt.astimezone(TIMEZONE)
                     time_str = dt.strftime("%d %b, %-I:%M%p").lstrip("0").lower()
                 else:
-                    time_str = start_raw
+                    # All-day event — format date only
+                    d = datetime.strptime(start_raw, "%Y-%m-%d")
+                    time_str = d.strftime("%a %d %b") + " (all day)"
             except Exception:
                 time_str = start_raw or "?"
             response += f"• *{summary}* — {time_str} ({cal_name})\n"
@@ -492,6 +500,54 @@ async def get_events_for_date(date_str):
                     time_str = "all day"
             except Exception:
                 time_str = "?"
+            response += f"• *{summary}* — {time_str} ({cal_name})\n"
+        return response
+    except Exception as e:
+        return f"⚠️ Calendar error: {str(e)}"
+
+
+async def get_events_for_date_range(start_date, end_date):
+    """Fetch events between two dates (date objects). Used for next week view."""
+    try:
+        import pytz
+        service = await asyncio.to_thread(_get_service)
+        kl_start = TIMEZONE.localize(datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0))
+        kl_end = TIMEZONE.localize(datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59))
+        time_min = kl_start.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        time_max = kl_end.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        all_events = []
+        for cal_name, cal_id in CALENDAR_IDS.items():
+            try:
+                result = await asyncio.to_thread(
+                    lambda cid=cal_id: service.events().list(
+                        calendarId=cid,
+                        timeMin=time_min,
+                        timeMax=time_max,
+                        singleEvents=True,
+                        orderBy="startTime"
+                    ).execute()
+                )
+                for e in result.get("items", []):
+                    start_raw = e.get("start", {}).get("dateTime") or e.get("start", {}).get("date")
+                    all_events.append((e.get("summary", "No title"), start_raw, cal_name))
+            except Exception:
+                continue
+        if not all_events:
+            return f"Nothing on next week 👍"
+        all_events.sort(key=lambda x: x[1] or "")
+        label = f"Next Week ({start_date.strftime('%d %b')} – {end_date.strftime('%d %b')})"
+        response = f"📅 *{label}:*\n\n"
+        for summary, start_raw, cal_name in all_events:
+            try:
+                if start_raw and "T" in start_raw:
+                    dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+                    dt = dt.astimezone(TIMEZONE)
+                    time_str = dt.strftime("%a %d %b, %-I:%M%p").lstrip("0").lower()
+                else:
+                    d = datetime.strptime(start_raw, "%Y-%m-%d")
+                    time_str = d.strftime("%a %d %b") + " (all day)"
+            except Exception:
+                time_str = start_raw or "?"
             response += f"• *{summary}* — {time_str} ({cal_name})\n"
         return response
     except Exception as e:

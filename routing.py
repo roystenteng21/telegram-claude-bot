@@ -45,8 +45,10 @@ from reminders import (
     cancel_reminder_by_keyword, check_and_fire_reminders
 )
 from cal import (
-    get_events, get_events_for_date, delete_calendar_event, is_calendar_request,
-    smart_add_event, edit_calendar_event, apply_calendar_edit
+    get_events, get_events_for_date, get_events_for_date_range,
+    delete_calendar_event, is_calendar_request,
+    smart_add_event, edit_calendar_event, apply_calendar_edit,
+    find_upcoming_events, _fmt_event_row
 )
 from todos import add_todo, complete_todo, delete_todo, list_todos
 from meetings import (
@@ -334,6 +336,12 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     text = update.message.text.strip()
+    # Text shortcut expansion — word-boundary replacement
+    _SHORTCUTS = {"del": "delete"}
+    _words = text.split()
+    if _words and _words[0].lower() in _SHORTCUTS:
+        _words[0] = _SHORTCUTS[_words[0].lower()]
+        text = " ".join(_words)
     lower = text.lower()
 
     # ── DND intercept ─────────────────────────────────────────────────────────
@@ -810,7 +818,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif (lower.startswith("delete ") and not lower.startswith("delete event")
           and not lower.startswith("delete expense") and not lower.startswith("delete bill")
           and not lower.startswith("delete restaurant") and not lower.startswith("delete last")
-          and not lower.startswith("delete todo") and not lower.startswith("remove todo")):
+          and not lower.startswith("delete todo") and not lower.startswith("remove todo")
+          and not lower.startswith("delete cal ")):
         name = text[7:].strip()
         _, record = find_row(name)
         if not record:
@@ -824,7 +833,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = search_contacts(text[7:])
 
     elif (lower.startswith("edit ") and not lower.startswith("edit last expense")
-          and not lower.startswith("edit expense")):
+          and not lower.startswith("edit expense")
+          and not lower.startswith("edit cal ")
+          and not lower.startswith("edit event ")):
         name = text[5:].strip()
         _, record = find_row(name)
         if not record:
@@ -1194,11 +1205,21 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = await smart_add_event(text, user_id)
     elif lower.startswith("edit cal ") or lower.startswith("edit event "):
         reply = await edit_calendar_event(text, user_id)
-    elif lower.startswith("remove cal ") or lower.startswith("remove event ") or lower.startswith("cal delete "):
-        event_name = re.sub(r"^(remove cal|remove event|cal delete)\s+", "", lower).strip()
-        raw_name = re.sub(r"^(remove cal|remove event|cal delete)\s+", "", text, flags=re.IGNORECASE).strip()
-        state.confirm_sessions[user_id] = {"action": "delete_event", "args": [raw_name], "target": f"Delete event {raw_name}?"}
-        reply = f"Delete event *{raw_name}*? (yes / no)"
+    elif (lower.startswith("remove cal ") or lower.startswith("remove event ")
+          or lower.startswith("cal delete ") or lower.startswith("delete cal ")
+          or lower.startswith("del cal ") or lower.startswith("del event ")):
+        raw_name = re.sub(r"^(remove cal|remove event|cal delete|delete cal|del cal|del event)\s+", "", text, flags=re.IGNORECASE).strip()
+        matches, err, _ = await find_upcoming_events(raw_name)
+        if err:
+            reply = err
+        elif not matches:
+            reply = f"❌ No upcoming event found matching '{raw_name}'"
+        else:
+            meta, summary, dtstart, dtend = matches[0]
+            row = _fmt_event_row(summary, meta.get("cal_name", ""), dtstart, dtend)
+            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [meta], "target": row}
+            touch_session(user_id)
+            reply = f"Found *{summary}* — {row.split('|', 1)[1].strip() if '|' in row else ''}\nDelete this event? (yes / no)"
     elif lower.startswith("edit ") and "calendar_last_added" and user_id in state.calendar_last_added and not lower.startswith("edit last expense") and not lower.startswith("edit expense"):
         # Post-write edit — only fires if last action was a calendar add
         reply = await apply_calendar_edit(user_id, text)
@@ -1206,6 +1227,13 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         reply = await get_events(1)
     elif lower == "events week":
         reply = await get_events(7)
+    elif lower in ("events next week", "next week events", "what's on next week", "whats on next week"):
+        # Monday to Sunday of next week
+        today = date.today()
+        days_until_monday = (7 - today.weekday()) % 7 or 7
+        next_monday = today + timedelta(days=days_until_monday)
+        next_sunday = next_monday + timedelta(days=6)
+        reply = await get_events_for_date_range(next_monday, next_sunday)
     elif re.match(r"events on .+", lower) or re.match(r"events (for|this) .+", lower):
         date_text = re.sub(r"^events (on|for|this)\s+", "", lower).strip()
         anchors = {k.lower(): v for k, v in {
@@ -1245,10 +1273,19 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = await get_events_for_date(resolved)
         else:
             reply = f"Couldn't understand that date — try 'events on 23 May' or 'events today'."
-    elif lower.startswith("delete event "):
-        event_name = text[13:].strip()
-        state.confirm_sessions[user_id] = {"action": "delete_event", "args": [event_name], "target": f"Delete event {event_name}?"}
-        reply = f"Delete event *{event_name}*? (yes / no)"
+    elif lower.startswith("delete event ") or lower.startswith("del event "):
+        raw_name = re.sub(r"^(delete event|del event)\s+", "", text, flags=re.IGNORECASE).strip()
+        matches, err, _ = await find_upcoming_events(raw_name)
+        if err:
+            reply = err
+        elif not matches:
+            reply = f"❌ No upcoming event found matching '{raw_name}'"
+        else:
+            meta, summary, dtstart, dtend = matches[0]
+            row = _fmt_event_row(summary, meta.get("cal_name", ""), dtstart, dtend)
+            state.confirm_sessions[user_id] = {"action": "delete_event", "args": [meta], "target": row}
+            touch_session(user_id)
+            reply = f"Found *{summary}* — {row.split('|', 1)[1].strip() if '|' in row else ''}\nDelete this event? (yes / no)"
 
     elif lower in ("em whats pending", "em what's pending", "em pending", "whats pending"):
         reply = get_pending_backlog()
