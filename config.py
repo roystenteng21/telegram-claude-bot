@@ -8,12 +8,10 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 SHEET_ID = os.getenv("SHEET_ID")
-ICLOUD_USERNAME = os.getenv("ICLOUD_USERNAME")
-ICLOUD_PASSWORD = os.getenv("ICLOUD_PASSWORD")
 AVIATIONSTACK_API_KEY = os.getenv("AVIATIONSTACK_API_KEY", "")
 EXCHANGE_RATE_API_KEY = os.getenv("EXCHANGE_RATE_API_KEY", "")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-YOUR_CHAT_ID = int(os.getenv("YOUR_CHAT_ID"))
+YOUR_CHAT_ID = int(os.getenv("YOUR_CHAT_ID", "281095850"))
 RAILWAY_DEPLOYMENT_ID = os.getenv("RAILWAY_DEPLOYMENT_ID", "")
 
 ANTHROPIC_FAILURE_THRESHOLD = 3
@@ -214,15 +212,11 @@ DEV_NOTES_CONTENT = [
     ["Handoff Rule", "Start of every session: (1) Read the Em Session Brief uploaded by Roysten — this is the sole source of truth. Do not read the Em Management Sheet or Google Drive. (2) Identify the relevant module(s) from the brief's architecture section. (3) Ask Roysten to upload only those module file(s). Never request files beyond what the task requires. Never start building without completing steps 1–2 and receiving Roysten's explicit go-ahead. Session is not closed and no brief is generated until Roysten confirms the deploy succeeded.", "2026-05-02"],
     ["Handoff — What To Upload", "Pre-modularisation: upload bot.py. Post-modularisation: upload only the module file(s) relevant to the session task. Claude identifies the right module(s) from the Module Registry. If a session touches routing logic, also upload routing.py.", "2026-05-01"],
     ["Handoff — Mid-Session Context", "If a session ends mid-build (not deployed): log exactly what was completed, what is half-built, and what the next step is in the Em Log Pending field. The next session picks up from that exact point — no re-explaining required.", "2026-05-01"],
-    ["Deploy Flow — Pre-Modularisation", "Download bot.py from Claude chat → save to ~/telegram-claude-bot/bot.py → python ~/telegram-claude-bot/deploy.py 'commit msg' 'Session N' 'built' 'fixed' 'pending' → Railway auto-deploys, Em Log + Module Registry auto-updated.", "2026-05-01"],
-    ["Deploy Flow — Post-Modularisation", "Download changed module file(s) from Claude chat → save to ~/telegram-claude-bot/ → python ~/telegram-claude-bot/deploy.py 'commit msg' 'Session N' 'built' 'fixed' 'pending' → deploy.py copies all 20 module files, commits, pushes → Railway auto-deploys, Em Log + Module Registry auto-updated.", "2026-05-01"],
+    ["Deploy Flow — Post-Modularisation", "Download changed module file(s) from Claude chat → save to ~/telegram-claude-bot/ → python ~/telegram-claude-bot/deploy.py 'commit msg' 'Session N' 'built' 'fixed' 'pending' → deploy.py copies all module files, commits, pushes → Railway auto-deploys, Em Log + Module Registry auto-updated.", "2026-05-01"],
     ["Modularisation — Status", "S22 — DONE. 20 modules deployed. Import layer hierarchy defined and locked. Module Registry tab populated.", "2026-05-01"],
     ["Modularisation — Files", "config.py · clients.py · state.py · sheets.py · helpers.py · crm.py · expenses.py · fx.py · reminders.py · cal.py · todos.py · meetings.py · bills.py · restaurants.py · stocks.py · trips.py · sessions.py · routing.py · infrastructure.py · bot.py", "2026-05-01"],
     ["Modularisation — Cross-Feature Rule", "Only permitted cross-feature import: meetings.py → crm.find_row (one-way). All other cross-feature calls go through routing.py dispatch. No feature module calls another feature module's handler functions.", "2026-05-01"],
-    ["Roadmap — Session 9", "DONE. Trips schema migration + AviationStack strip (−307 lines).", "2026-04-30"],
-    ["Roadmap — Session 10", "DONE. deploy.py built. Repo: roystenteng21/telegram-claude-bot. Token: 90-day ghp_ (no daily reset).", "2026-04-30"],
-    ["Roadmap — Sessions 11–21", "DONE. All reliability, efficiency, and completeness work completed. All backlog items resolved. Full audit passed S22a.", "2026-05-01"],
-    ["Roadmap — Session 22", "DONE. Modularisation complete. Split bot.py into 20 modules. deploy.py updated. All 91 tests pass.", "2026-05-01"],
+    ["Calendar — Backend", "Switched from iCloud CalDAV to Google Calendar API in Session 33. caldav library removed. ICLOUD_USERNAME/ICLOUD_PASSWORD env vars deprecated and removed from config.py in Session 36.", "2026-05-21"],
 ]
 
 EM_LOG_HEADERS_BACKLOG = ["Priority", "Item", "Stage", "Notes", "Added", "Status"]

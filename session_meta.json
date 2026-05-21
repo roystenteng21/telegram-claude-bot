@@ -1,10 +1,10 @@
 {
-  "date": "2026-05-20",
+  "date": "2026-05-21",
   "session": "Session 36",
-  "built": "routing.py get_calendar import removed",
-  "fixed": "boot crash on cal import",
+  "built": "iCloud fully removed from cal.py, routing.py, bot.py, config.py",
+  "fixed": "boot crash from get_calendar import",
   "pending": "calendar C1-C8 live test, expense confirm options rebuild",
-  "deploy_count": 53,
+  "deploy_count": 54,
   "module_count": 21,
   "modules": [
     "bills.py",

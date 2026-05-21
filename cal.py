@@ -500,11 +500,6 @@ async def delete_calendar_event(summary_or_meta):
 # Daily iCloud check — replaced with Google Calendar connectivity check
 # ---------------------------------------------------------------------------
 
-async def check_icloud_daily(app):
-    # No-op — Google Calendar has no equivalent downtime pattern
-    pass
-
-
 # ---------------------------------------------------------------------------
 # Edit existing calendar event
 # ---------------------------------------------------------------------------

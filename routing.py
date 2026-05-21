@@ -46,7 +46,7 @@ from reminders import (
 )
 from cal import (
     get_events, delete_calendar_event, is_calendar_request,
-    smart_add_event, check_icloud_daily
+    smart_add_event
 )
 from todos import add_todo, complete_todo, delete_todo, list_todos
 from meetings import (
@@ -1216,7 +1216,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             await asyncio.to_thread(get_events, 1)
         except Exception:
-            issues.append("• iCloud Calendar: unreachable — check ICLOUD_USERNAME / ICLOUD_PASSWORD in Railway")
+            issues.append("• Google Calendar: unreachable — check GOOGLE_CREDENTIALS in Railway")
         from config import ANTHROPIC_FAILURE_THRESHOLD
         if state._anthropic_failure_count >= ANTHROPIC_FAILURE_THRESHOLD:
             issues.append("• Anthropic API: repeated failures detected — check API key or Anthropic status page")
