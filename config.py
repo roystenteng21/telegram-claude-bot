@@ -188,6 +188,16 @@ BILL_REMINDER_GREETINGS = [
 # --- Dates ---
 DATE_FORMATS = ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y", "%d %B %Y"]
 
+# --- Text Shortcuts ---
+# Word-boundary replacements applied before routing. Add new shortcuts here only.
+TEXT_SHORTCUTS = {
+    "del": "delete",
+    "fc": "food court",
+    "tmr": "tomorrow",
+    "tml": "tomorrow",
+    "appt": "appointment",
+}
+
 # --- Em Log / Dev Notes ---
 DEV_NOTES_CONTENT = [
     ["Section", "Content", "Last Updated"],

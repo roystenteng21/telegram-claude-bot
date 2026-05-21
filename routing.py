@@ -9,7 +9,7 @@ from telegram.ext import ContextTypes
 import state
 from config import (
     EXPENSE_CATEGORIES, EXPENSE_CARDS, YOUR_CHAT_ID, TIMEZONE,
-    AVIATIONSTACK_API_KEY
+    AVIATIONSTACK_API_KEY, TEXT_SHORTCUTS
 )
 from clients import client, drive_service
 from sheets import get_sheet, get_pending_backlog, append_bug_to_backlog
@@ -336,11 +336,10 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     text = update.message.text.strip()
-    # Text shortcut expansion — word-boundary replacement
-    _SHORTCUTS = {"del": "delete"}
+    # Text shortcut expansion — first word only, word-boundary replacement
     _words = text.split()
-    if _words and _words[0].lower() in _SHORTCUTS:
-        _words[0] = _SHORTCUTS[_words[0].lower()]
+    if _words and _words[0].lower() in TEXT_SHORTCUTS:
+        _words[0] = TEXT_SHORTCUTS[_words[0].lower()]
         text = " ".join(_words)
     lower = text.lower()
 

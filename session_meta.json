@@ -1,10 +1,10 @@
 {
   "date": "2026-05-21",
   "session": "Session 37",
-  "built": "get_events KL end-of-day boundary, all-day event formatting, events next week routing, delete event find-first with details, del shortcut, delete cal trigger",
-  "fixed": "edit cal shadowed by CRM edit, delete confirm timeout, Haiku confirmation leaking, UTC boundary in get_events",
+  "built": "TEXT_SHORTCUTS in config.py, del/fc/tmr/appt shortcuts, events next week, get_events_for_date_range, KL end-of-day boundary, all-day event format, edit cal shadow fix, delete find-first with event details, Haiku confirm fix",
+  "fixed": "del shortcut inline replaced with config.py TEXT_SHORTCUTS",
   "pending": "expense confirm rebuild, bills strptime, S27 checklist",
-  "deploy_count": 58,
+  "deploy_count": 59,
   "module_count": 21,
   "modules": [
     "bills.py",
