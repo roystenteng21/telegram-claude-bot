@@ -277,6 +277,10 @@ async def smart_add_event(text, user_id):
     if not parsed.get("title") or not parsed.get("start"):
         return "⚠️ Couldn't parse that — try: cal Dentist Personal 23 May 10am"
 
+    GENERIC_TITLES = {"event", "appointment", "meeting", "cal", "calendar", "add", "new"}
+    if parsed.get("title", "").strip().lower() in GENERIC_TITLES:
+        return "What's the event called? Give me a title, date and time — e.g. cal Dentist 5 Jun 10am"
+
     try:
         start_dt = datetime.strptime(parsed["start"], "%d %b %Y %H:%M")
         if start_dt.year < date.today().year:
@@ -854,13 +858,16 @@ async def _apply_event_edit(meta, summary, field, value, dtstart=None, dtend=Non
                     return "⚠️ Couldn't parse that time — use HH:MM format e.g. 18:30"
                 new_start_iso = f"{existing_date}T{new_time.strftime('%H:%M')}:00"
                 event["start"] = {"dateTime": new_start_iso, "timeZone": str(TIMEZONE)}
+                # C9: if new start >= existing end, preserve original duration and shift end
                 existing_end = event.get("end", {}).get("dateTime", "")
                 if existing_end:
                     try:
                         end_dt = datetime.fromisoformat(existing_end.replace("Z", "+00:00"))
                         new_start_dt = datetime.fromisoformat(new_start_iso)
                         if new_start_dt >= end_dt.replace(tzinfo=None):
-                            return "⚠️ New start time is at or after the existing end time — clarify the range"
+                            duration = end_dt.replace(tzinfo=None) - existing_dt.replace(tzinfo=None)
+                            new_end_dt = new_start_dt + duration
+                            event["end"] = {"dateTime": new_end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": str(TIMEZONE)}
                     except Exception:
                         pass
 

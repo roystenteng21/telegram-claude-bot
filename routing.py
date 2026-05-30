@@ -838,7 +838,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
         name = text[5:].strip()
         _, record = find_row(name)
         if not record:
-            reply = f"❌ No contact found for '{name}'"
+            # R12: no CRM contact — fall through to calendar edit
+            reply = await edit_calendar_event(text, user_id)
         else:
             state.edit_sessions[user_id] = {"name": record.get("Name"), "step": "choose_field"}
             reply = (
@@ -1198,6 +1199,10 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                    "show my tasks", "list my tasks", "pending tasks"]:
         reply = list_todos()
 
+    elif lower in ("add cal", "cal", "add event", "create event"):
+        reply = "What's the event? Give me a title, date and time — e.g. cal Dentist 5 Jun 10am"
+    elif lower in ("edit cal", "edit event"):
+        reply = "Which event do you want to edit?"
     elif (lower.startswith("add event") or lower.startswith("schedule ")
           or lower.startswith("create event") or lower.startswith("cal ")
           or lower.startswith("add cal ")):

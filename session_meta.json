@@ -1,10 +1,10 @@
 {
-  "date": "2026-05-21",
-  "session": "Session 37",
-  "built": "TEXT_SHORTCUTS in config.py, del/fc/tmr/appt shortcuts, events next week, get_events_for_date_range, KL end-of-day boundary, all-day event format, edit cal shadow fix, delete find-first with event details, Haiku confirm fix",
-  "fixed": "del shortcut inline replaced with config.py TEXT_SHORTCUTS",
-  "pending": "expense confirm rebuild, bills strptime, S27 checklist",
-  "deploy_count": 59,
+  "date": "2026-05-30",
+  "session": "Session 38",
+  "built": "fixed",
+  "fixed": "edit cal bare trigger, add cal bare trigger, edit fallthrough to cal, start-time duration shift, generic title prompt",
+  "pending": "pending",
+  "deploy_count": 60,
   "module_count": 21,
   "modules": [
     "bills.py",
