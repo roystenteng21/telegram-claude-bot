@@ -79,6 +79,3 @@ _app_ref = None
 # --- Drive folders ---
 DRIVE_FOLDERS = {}
 RECEIPTS_FOLDER_ID = ""
-
-# --- Calendar last added ---
-calendar_last_added = {}

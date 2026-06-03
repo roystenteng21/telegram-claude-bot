@@ -349,103 +349,74 @@ async def smart_add_event(text, user_id):
         import random
         confirm_line = random.choice(CONFIRM_LINES)
 
-    # Store last added event for post-write edit
-    state.calendar_last_added[user_id] = {"parsed": parsed, "event_id": event_id, "cal_id": cal_id}
+    # Fix E: async overlap check — fire-and-warn, non-blocking
+    asyncio.create_task(_check_overlap_and_notify(parsed, event_id, cal_id))
 
     return f"{summary}\n\n{confirm_line}"
 
 
-# ---------------------------------------------------------------------------
-# Apply inline edit during confirm session
-# ---------------------------------------------------------------------------
-
-async def apply_calendar_edit(user_id, edit_text):
-    if user_id not in state.calendar_last_added:
-        return "No recent calendar event to edit — add an event first."
-
-    stored = state.calendar_last_added[user_id]
-    parsed = stored["parsed"]
-    event_id = stored.get("event_id")
-    cal_id = stored.get("cal_id")
-
-    if not event_id or not cal_id:
-        return "No recent calendar event to edit — add an event first."
-
-    prompt = f"""The user wants to edit a calendar event field.
-Current event:
-- title: {parsed.get('title')}
-- calendar: {parsed.get('calendar')}
-- start: {parsed.get('start')}
-- end: {parsed.get('end')}
-- location: {parsed.get('location', '')}
-
-User edit request: "{edit_text}"
-
-{_build_date_anchor_block()}
-
-Respond ONLY with a JSON object — no other text:
-{{
-  "field": "title|calendar|start|end|location",
-  "value": "new value"
-}}
-
-For start/end use format: DD MMM YYYY HH:MM
-For calendar, match from: {', '.join(KNOWN_CALENDARS)}"""
-
+async def _check_overlap_and_notify(parsed, new_event_id, new_cal_id):
+    """Background task: check for same-day time clashes after event write. Sends follow-up if clash found."""
     try:
-        response = await asyncio.to_thread(
-            lambda: client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=100,
-                messages=[{"role": "user", "content": prompt}]
-            )
-        )
-        raw = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-        edit = json.loads(raw)
-        field = edit.get("field", "")
-        value = edit.get("value", "")
-
-        if not field or not value:
-            return "⚠️ Couldn't apply that edit — try again, e.g. 'change time to 2-4pm'"
-
-        if field == "calendar":
-            value = _match_calendar_name(value)
-        if field in ("start", "end", "title", "location", "notes", "calendar"):
-            parsed[field] = value
-        elif field == "time":
-            field = "start"
-            parsed["start"] = value
-
-        state.calendar_last_added[user_id]["parsed"] = parsed
-
-        # Patch existing event instead of inserting a new one
+        import pytz
+        from config import YOUR_CHAT_ID
+        new_title = parsed.get("title", "Event")
         try:
-            start = datetime.strptime(parsed["start"], "%d %b %Y %H:%M")
-            end = datetime.strptime(parsed["end"], "%d %b %Y %H:%M")
-        except Exception as e:
-            return f"❌ Date parse error: {e}"
+            new_start = datetime.strptime(parsed["start"], "%d %b %Y %H:%M")
+            new_end = datetime.strptime(parsed["end"], "%d %b %Y %H:%M")
+        except Exception:
+            return
 
-        patch_body = {
-            "summary": parsed.get("title", "Event"),
-            "start": {"dateTime": start.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": str(TIMEZONE)},
-            "end": {"dateTime": end.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": str(TIMEZONE)},
-        }
-        if parsed.get("location"):
-            patch_body["location"] = parsed["location"]
-        if parsed.get("notes"):
-            patch_body["description"] = parsed["notes"]
+        day_start = TIMEZONE.localize(datetime(new_start.year, new_start.month, new_start.day, 0, 0, 0))
+        day_end = TIMEZONE.localize(datetime(new_start.year, new_start.month, new_start.day, 23, 59, 59))
+        time_min = day_start.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        time_max = day_end.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         service = await asyncio.to_thread(_get_service)
-        await asyncio.to_thread(
-            lambda: service.events().patch(
-                calendarId=cal_id,
-                eventId=event_id,
-                body=patch_body
-            ).execute()
-        )
-        return format_calendar_confirm(parsed)
-    except Exception:
-        return "⚠️ Couldn't apply that edit — try again, e.g. 'change time to 2-4pm'"
+        clashes = []
+        for cal_name, cal_id in CALENDAR_IDS.items():
+            try:
+                result = await asyncio.to_thread(
+                    lambda cid=cal_id: service.events().list(
+                        calendarId=cid,
+                        timeMin=time_min,
+                        timeMax=time_max,
+                        singleEvents=True,
+                        orderBy="startTime"
+                    ).execute()
+                )
+                for e in result.get("items", []):
+                    if e.get("id") == new_event_id:
+                        continue
+                    e_start_raw = e.get("start", {}).get("dateTime")
+                    e_end_raw = e.get("end", {}).get("dateTime")
+                    if not e_start_raw or not e_end_raw:
+                        continue
+                    try:
+                        e_start = datetime.fromisoformat(e_start_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+                        e_end = datetime.fromisoformat(e_end_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except Exception:
+                        continue
+                    # Overlap: new_start < e_end AND new_end > e_start
+                    if new_start < e_end and new_end > e_start:
+                        e_summary = e.get("summary", "Unknown event")
+                        e_start_fmt = e_start.strftime("%-I:%M%p").lstrip("0").lower()
+                        e_end_fmt = e_end.strftime("%-I:%M%p").lstrip("0").lower()
+                        clashes.append(f"*{e_summary}* ({e_start_fmt}–{e_end_fmt}, {cal_name})")
+            except Exception:
+                continue
+
+        if clashes and state._app_ref:
+            new_start_fmt = new_start.strftime("%-I:%M%p").lstrip("0").lower()
+            new_end_fmt = new_end.strftime("%-I:%M%p").lstrip("0").lower()
+            clash_list = "\n".join(f"• {c}" for c in clashes)
+            msg = (
+                f"⚠️ Heads up — *{new_title}* ({new_start_fmt}–{new_end_fmt}) clashes with:\n"
+                f"{clash_list}"
+            )
+            await state._app_ref.bot.send_message(chat_id=YOUR_CHAT_ID, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        print(f"_check_overlap_and_notify error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +680,11 @@ async def edit_calendar_event(text, user_id, expand_search=False, matched_meta=N
 
     # C1: strip "delete" to prevent confusion with delete flow
     clean_text = re.sub(r'\bdelete\b', '', text, flags=re.IGNORECASE).strip()
+
+    # Fix A: expand TEXT_SHORTCUTS before Haiku parse to avoid event_query corruption
+    from config import TEXT_SHORTCUTS
+    for shortcut, expansion in TEXT_SHORTCUTS.items():
+        clean_text = re.sub(r'\b' + re.escape(shortcut) + r'\b', expansion, clean_text, flags=re.IGNORECASE)
 
     date_block = _build_date_anchor_block()
     known_cals = ", ".join(KNOWN_CALENDARS)

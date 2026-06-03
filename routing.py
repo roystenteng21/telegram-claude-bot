@@ -47,7 +47,7 @@ from reminders import (
 from cal import (
     get_events, get_events_for_date, get_events_for_date_range,
     delete_calendar_event, is_calendar_request,
-    smart_add_event, edit_calendar_event, apply_calendar_edit,
+    smart_add_event, edit_calendar_event,
     find_upcoming_events, _fmt_event_row, _match_calendar_name,
     _resolve_date_anchors, KNOWN_CALENDARS
 )
@@ -1397,9 +1397,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             state.confirm_sessions[user_id] = {"action": "delete_event", "args": [meta], "target": row}
             touch_session(user_id)
             reply = f"Found *{summary}* — {row.split('|', 1)[1].strip() if '|' in row else ''}\nDelete this event? (yes / no)"
-    elif lower.startswith("edit ") and user_id in state.calendar_last_added and not lower.startswith("edit last expense") and not lower.startswith("edit expense"):
-        # Post-write edit — only fires if last action was a calendar add
-        reply = await apply_calendar_edit(user_id, text)
     elif lower == "events today":
         reply = await get_events(1)
     elif lower == "events week":
