@@ -277,53 +277,6 @@ async def write_calendar_event(parsed):
 # smart_add_event — parse + store in confirm session (no immediate write)
 # ---------------------------------------------------------------------------
 
-async def _check_overlaps(new_start: datetime, new_end: datetime) -> list:
-    """Check all calendars for events overlapping new_start–new_end on the same day.
-    Returns list of (summary, cal_name, dtstart, dtend) tuples for overlapping events.
-    Queries are run in parallel across all calendars, window narrowed to single day.
-    """
-    try:
-        service = await asyncio.to_thread(_get_service)
-        day_start = new_start.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = new_start.replace(hour=23, minute=59, second=59, microsecond=0)
-        time_min = day_start.strftime("%Y-%m-%dT%H:%M:%S") + "+08:00"
-        time_max = day_end.strftime("%Y-%m-%dT%H:%M:%S") + "+08:00"
-
-        async def fetch_cal(cal_name, cal_id):
-            try:
-                result = await asyncio.to_thread(
-                    lambda: service.events().list(
-                        calendarId=cal_id,
-                        timeMin=time_min,
-                        timeMax=time_max,
-                        singleEvents=True,
-                        orderBy="startTime"
-                    ).execute()
-                )
-                overlaps = []
-                for e in result.get("items", []):
-                    start_raw = e.get("start", {}).get("dateTime")
-                    end_raw = e.get("end", {}).get("dateTime")
-                    if not start_raw or not end_raw:
-                        continue
-                    try:
-                        e_start = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).replace(tzinfo=None)
-                        e_end = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).replace(tzinfo=None)
-                    except Exception:
-                        continue
-                    # Overlap: new event starts before existing ends AND new event ends after existing starts
-                    if new_start < e_end and new_end > e_start:
-                        overlaps.append((e.get("summary", "Untitled"), cal_name, start_raw, end_raw))
-                return overlaps
-            except Exception:
-                return []
-
-        results = await asyncio.gather(*[fetch_cal(cn, cid) for cn, cid in CALENDAR_IDS.items()])
-        return [item for sublist in results for item in sublist]
-    except Exception:
-        return []
-
-
 async def smart_add_event(text, user_id):
     try:
         parsed = await asyncio.to_thread(parse_calendar_request, text)
@@ -357,31 +310,6 @@ async def smart_add_event(text, user_id):
     cleaned_title = " ".join(w for w in title_words if w.lower() not in cal_words)
     if cleaned_title.strip():
         parsed["title"] = cleaned_title.strip()
-
-    # Check for overlapping events before writing
-    try:
-        new_start_dt = datetime.strptime(parsed["start"], "%d %b %Y %H:%M")
-        new_end_dt = datetime.strptime(parsed["end"], "%d %b %Y %H:%M")
-        overlaps = await _check_overlaps(new_start_dt, new_end_dt)
-        if overlaps:
-            overlap_lines = ["⚠️ This event overlaps with:"]
-            for ov_summary, ov_cal, ov_start, ov_end in overlaps:
-                try:
-                    s = datetime.fromisoformat(ov_start.replace("Z", "+00:00"))
-                    e = datetime.fromisoformat(ov_end.replace("Z", "+00:00"))
-                    time_str = f"{s.strftime('%I:%M%p').lstrip('0').lower()} – {e.strftime('%I:%M%p').lstrip('0').lower()}"
-                except Exception:
-                    time_str = ""
-                overlap_lines.append(f"• *{ov_summary}* — {ov_cal} | {time_str}")
-            overlap_lines.append("\nAdd anyway? (yes / no)")
-            state.calendar_confirm_sessions[user_id] = {
-                "step": "overlap_confirm",
-                "parsed": parsed,
-            }
-            state.session_timestamps[user_id] = datetime.now(TIMEZONE)
-            return "\n".join(overlap_lines)
-    except Exception:
-        pass  # Overlap check failure is non-fatal — proceed with write
 
     # Write immediately
     write_result = await write_calendar_event(parsed)
@@ -747,7 +675,7 @@ async def delete_calendar_event(summary_or_meta):
 # Edit existing calendar event
 # ---------------------------------------------------------------------------
 
-async def edit_calendar_event(text, user_id, expand_search=False):
+async def edit_calendar_event(text, user_id, expand_search=False, matched_meta=None, matched_summary=None, matched_dtstart=None, matched_dtend=None):
     """Parse 'edit cal [event] [field] [value]' and apply the change."""
 
     # C1: strip "delete" to prevent confusion with delete flow
@@ -812,6 +740,10 @@ Rules:
         return "⚠️ Couldn't parse that — try: edit cal Branson time 11am"
 
     has_change = (field and value) or date_val or time_range_val
+
+    # If called from awaiting_edit_field with a stored event, skip re-search
+    if matched_meta and has_change:
+        return await _apply_event_edit(matched_meta, matched_summary, field, value, matched_dtstart, matched_dtend, date_val=date_val, time_range_val=time_range_val)
 
     # Search first — need to know match count before deciding flow
     days = 365 if expand_search else 90

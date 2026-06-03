@@ -1,11 +1,11 @@
 {
   "date": "2026-06-03",
   "session": "Session 38",
-  "built": "built",
-  "fixed": "edit cal search first then prompt, overlap collision warning with yes/no, broken pipe retry, edi/ad/delet shortcuts, _apply_event_edit no-change guard",
+  "built": "fixed",
+  "fixed": "overlap check removed, edit_calendar_event skips re-search when matched_meta provided",
   "pending": "pending",
-  "deploy_count": 63,
-  "module_count": 21,
+  "deploy_count": 64,
+  "module_count": 20,
   "modules": [
     "bills.py",
     "bot.py",
@@ -15,7 +15,6 @@
     "crm.py",
     "expenses.py",
     "fx.py",
-    "handlers.py",
     "helpers.py",
     "infrastructure.py",
     "meetings.py",

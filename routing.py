@@ -48,7 +48,7 @@ from cal import (
     get_events, get_events_for_date, get_events_for_date_range,
     delete_calendar_event, is_calendar_request,
     smart_add_event, edit_calendar_event, apply_calendar_edit,
-    find_upcoming_events, _fmt_event_row, complete_smart_add
+    find_upcoming_events, _fmt_event_row
 )
 from todos import add_todo, complete_todo, delete_todo, list_todos
 from meetings import (
@@ -757,18 +757,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text("Cancelled.")
             return
 
-        if step == "overlap_confirm":
-            parsed = cs.get("parsed", {})
-            del state.calendar_confirm_sessions[user_id]
-            state.session_timestamps.pop(user_id, None)
-            if lower in ["yes", "y"]:
-                reply = await complete_smart_add(parsed, user_id)
-            else:
-                title = parsed.get("title", "event")
-                reply = f"Cancelled — *{title}* not added."
-            await send_safe(update.message, reply, parse_mode="Markdown")
-            return
-
         if step == "awaiting_edit_field":
             # User replied with field to edit — use stored matched event if available
             matched_meta = cs.get("matched_meta")
@@ -778,10 +766,13 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             del state.calendar_confirm_sessions[user_id]
             state.session_timestamps.pop(user_id, None)
             if matched_meta:
-                # Reconstruct edit command and apply directly using stored event
+                # Parse the field reply using Haiku, then apply directly to stored event
                 event_query = cs.get("event_query", "")
                 reconstructed = f"edit cal {event_query} {text.strip()}"
-                reply = await edit_calendar_event(reconstructed, user_id)
+                reply = await edit_calendar_event(reconstructed, user_id, matched_meta=matched_meta, matched_summary=matched_summary, matched_dtstart=matched_dtstart, matched_dtend=matched_dtend)
+                # Clear any spurious session created by the re-search
+                state.calendar_confirm_sessions.pop(user_id, None)
+                state.session_timestamps.pop(user_id, None)
             else:
                 event_query = cs.get("event_query", "")
                 cal_filter = cs.get("cal_filter", "")
