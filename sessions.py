@@ -57,6 +57,10 @@ async def check_session_timeouts(user_id, update):
     if user_id in state.recon_sessions:
         del state.recon_sessions[user_id]
         expired = True
+    if user_id in state.calendar_confirm_sessions:
+        await update.message.reply_text(SESSION_TIMEOUT_MESSAGES["calendar_confirm"])
+        del state.calendar_confirm_sessions[user_id]
+        expired = True
     state.session_timestamps.pop(user_id, None)
     return expired
 
@@ -65,6 +69,8 @@ def get_active_session_label(user_id):
         return "expense confirmation"
     if user_id in state.expense_sessions:
         return "expense entry"
+    if user_id in state.calendar_confirm_sessions:
+        return "calendar edit"
     if user_id in state.meeting_sessions:
         return "meeting recap"
     if user_id in state.edit_sessions:

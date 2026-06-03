@@ -1,5 +1,6 @@
 import re
 import json
+import threading
 from datetime import date, datetime, timedelta
 import asyncio
 import state
@@ -28,19 +29,16 @@ KNOWN_CALENDARS = list(CALENDAR_IDS.keys())
 # Google Calendar service (cached — build() fetches discovery doc over HTTP)
 # ---------------------------------------------------------------------------
 
-_service_cache = None
+_service_lock = threading.Lock()
 
 def _get_service():
-    global _service_cache
-    if _service_cache is not None:
-        return _service_cache
+    """Build a new Calendar service per call — avoids shared state across threads."""
     creds_json = json.loads(os.environ["GOOGLE_CREDENTIALS"])
     creds = service_account.Credentials.from_service_account_info(
         creds_json,
         scopes=["https://www.googleapis.com/auth/calendar"]
     )
-    _service_cache = build("calendar", "v3", credentials=creds)
-    return _service_cache
+    return build("calendar", "v3", credentials=creds)
 
 
 def _get_calendar_id(name):
@@ -228,7 +226,7 @@ async def write_calendar_event(parsed):
         start = datetime.strptime(parsed["start"], "%d %b %Y %H:%M")
         end = datetime.strptime(parsed["end"], "%d %b %Y %H:%M")
     except Exception as e:
-        return f"❌ Date parse error: {e}"
+        return f"❌ Date parse error: {e}", None, None
 
     cal_name = parsed.get("calendar", "Personal")
     cal_id = _get_calendar_id(cal_name)
@@ -243,11 +241,12 @@ async def write_calendar_event(parsed):
     if parsed.get("notes"):
         event_body["description"] = parsed["notes"]
 
+    created_event = None
     try:
         service = await asyncio.to_thread(_get_service)
         for attempt in range(2):
             try:
-                await asyncio.to_thread(
+                created_event = await asyncio.to_thread(
                     lambda: service.events().insert(calendarId=cal_id, body=event_body).execute()
                 )
                 break
@@ -256,11 +255,13 @@ async def write_calendar_event(parsed):
                     await asyncio.sleep(1)
                     service = await asyncio.to_thread(_get_service)
                 else:
-                    return "❌ Couldn't add event: connection error — try again"
+                    return "❌ Couldn't add event: connection error — try again", None, None
             except Exception as e:
-                return f"❌ Couldn't add event: {str(e)}"
+                return f"❌ Couldn't add event: {str(e)}", None, None
     except Exception as e:
-        return f"❌ Couldn't add event: {str(e)}"
+        return f"❌ Couldn't add event: {str(e)}", None, None
+
+    event_id = created_event.get("id") if created_event else None
 
     try:
         start_fmt = f"{start.strftime('%a %d %b %Y')}, {start.strftime('%I:%M%p').lstrip('0').lower()} – {end.strftime('%I:%M%p').lstrip('0').lower()}"
@@ -270,7 +271,7 @@ async def write_calendar_event(parsed):
     reply = f"✅ *{parsed.get('title')}* added to {cal_name}\n{start_fmt}"
     if parsed.get("location"):
         reply += f"\n📍 {parsed['location']}"
-    return reply
+    return reply, event_id, cal_id
 
 
 # ---------------------------------------------------------------------------
@@ -301,18 +302,26 @@ async def smart_add_event(text, user_id):
 
     parsed["calendar"] = _match_calendar_name(parsed.get("calendar", ""))
 
-    # Strip calendar name words from title
+    # Strip calendar name words and TEXT_SHORTCUTS expansions from title
+    from config import TEXT_SHORTCUTS
     cal_words = set()
     for cal in KNOWN_CALENDARS:
         for word in cal.lower().split():
             cal_words.add(word)
+    # Also add expanded forms of TEXT_SHORTCUTS that map to calendar-related words
+    for shortcut, expansion in TEXT_SHORTCUTS.items():
+        if expansion.lower() in cal_words or any(expansion.lower() in cal.lower() for cal in KNOWN_CALENDARS):
+            cal_words.add(shortcut.lower())
+            cal_words.add(expansion.lower())
+    # Always strip routing prefix words
+    cal_words.update({"cal", "add", "new", "create"})
     title_words = parsed.get("title", "").split()
     cleaned_title = " ".join(w for w in title_words if w.lower() not in cal_words)
     if cleaned_title.strip():
         parsed["title"] = cleaned_title.strip()
 
     # Write immediately
-    write_result = await write_calendar_event(parsed)
+    write_result, event_id, cal_id = await write_calendar_event(parsed)
     if write_result.startswith("❌"):
         return write_result
 
@@ -341,7 +350,7 @@ async def smart_add_event(text, user_id):
         confirm_line = random.choice(CONFIRM_LINES)
 
     # Store last added event for post-write edit
-    state.calendar_last_added[user_id] = {"parsed": parsed}
+    state.calendar_last_added[user_id] = {"parsed": parsed, "event_id": event_id, "cal_id": cal_id}
 
     return f"{summary}\n\n{confirm_line}"
 
@@ -350,23 +359,17 @@ async def smart_add_event(text, user_id):
 # Apply inline edit during confirm session
 # ---------------------------------------------------------------------------
 
-async def complete_smart_add(parsed, user_id):
-    """Write event after overlap confirmation — same flow as end of smart_add_event."""
-    write_result = await write_calendar_event(parsed)
-    if write_result.startswith("❌"):
-        return write_result
-    summary = format_calendar_confirm(parsed)
-    CONFIRM_LINES = ["Done, it's in!", "Added!", "All set!", "Got it, locked in!", "On the calendar!", "Sorted!", "It's in!"]
-    import random
-    confirm_line = random.choice(CONFIRM_LINES)
-    state.calendar_last_added[user_id] = {"parsed": parsed}
-    return f"{summary}\n\n{confirm_line}"
-
 async def apply_calendar_edit(user_id, edit_text):
     if user_id not in state.calendar_last_added:
         return "No recent calendar event to edit — add an event first."
 
-    parsed = state.calendar_last_added[user_id]["parsed"]
+    stored = state.calendar_last_added[user_id]
+    parsed = stored["parsed"]
+    event_id = stored.get("event_id")
+    cal_id = stored.get("cal_id")
+
+    if not event_id or not cal_id:
+        return "No recent calendar event to edit — add an event first."
 
     prompt = f"""The user wants to edit a calendar event field.
 Current event:
@@ -402,18 +405,44 @@ For calendar, match from: {', '.join(KNOWN_CALENDARS)}"""
         field = edit.get("field", "")
         value = edit.get("value", "")
 
+        if not field or not value:
+            return "⚠️ Couldn't apply that edit — try again, e.g. 'change time to 2-4pm'"
+
         if field == "calendar":
             value = _match_calendar_name(value)
         if field in ("start", "end", "title", "location", "notes", "calendar"):
             parsed[field] = value
         elif field == "time":
+            field = "start"
             parsed["start"] = value
 
         state.calendar_last_added[user_id]["parsed"] = parsed
-        # Re-write the updated event to Google Calendar
-        write_result = await write_calendar_event(parsed)
-        if write_result.startswith("❌"):
-            return write_result
+
+        # Patch existing event instead of inserting a new one
+        try:
+            start = datetime.strptime(parsed["start"], "%d %b %Y %H:%M")
+            end = datetime.strptime(parsed["end"], "%d %b %Y %H:%M")
+        except Exception as e:
+            return f"❌ Date parse error: {e}"
+
+        patch_body = {
+            "summary": parsed.get("title", "Event"),
+            "start": {"dateTime": start.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": str(TIMEZONE)},
+            "end": {"dateTime": end.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": str(TIMEZONE)},
+        }
+        if parsed.get("location"):
+            patch_body["location"] = parsed["location"]
+        if parsed.get("notes"):
+            patch_body["description"] = parsed["notes"]
+
+        service = await asyncio.to_thread(_get_service)
+        await asyncio.to_thread(
+            lambda: service.events().patch(
+                calendarId=cal_id,
+                eventId=event_id,
+                body=patch_body
+            ).execute()
+        )
         return format_calendar_confirm(parsed)
     except Exception:
         return "⚠️ Couldn't apply that edit — try again, e.g. 'change time to 2-4pm'"
@@ -739,7 +768,23 @@ Rules:
     if not event_query:
         return "⚠️ Couldn't parse that — try: edit cal Branson time 11am"
 
+    # Fix 6b: regex override for calendar field — deterministic, bypasses Haiku ambiguity
+    # Matches "calendar <cal_name>" anywhere in clean_text after stripping event_query
+    cal_pattern = re.compile(r'\bcalendar\s+(.+)$', re.IGNORECASE)
+    cal_match = cal_pattern.search(clean_text)
+    if cal_match:
+        candidate = cal_match.group(1).strip()
+        matched_cal = _match_calendar_name(candidate)
+        # Only override if candidate loosely matches a known calendar
+        if any(candidate.lower() in c.lower() or c.lower() in candidate.lower() for c in KNOWN_CALENDARS):
+            field = "calendar"
+            value = matched_cal
+
     has_change = (field and value) or date_val or time_range_val
+
+    # Fix 6: if matched_meta provided but has_change=False, re-prompt instead of re-searching
+    if matched_meta and not has_change:
+        return f"⚠️ Couldn't parse that — what would you like to change for *{matched_summary}*?\n(time / date / calendar / location / title)"
 
     # If called from awaiting_edit_field with a stored event, skip re-search
     if matched_meta and has_change:

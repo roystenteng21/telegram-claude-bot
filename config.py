@@ -106,6 +106,7 @@ SESSION_TIMEOUT_MESSAGES = {
     "receipt_confirm": "Session timed out — nothing was logged. Send the receipt again when ready.",
     "edit": "Session timed out — nothing was changed.",
     "meeting": "Meeting recap session timed out.",
+    "calendar_confirm": "Session timed out — nothing was changed.",
 }
 
 # --- Stocks ---

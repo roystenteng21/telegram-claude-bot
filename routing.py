@@ -48,7 +48,8 @@ from cal import (
     get_events, get_events_for_date, get_events_for_date_range,
     delete_calendar_event, is_calendar_request,
     smart_add_event, edit_calendar_event, apply_calendar_edit,
-    find_upcoming_events, _fmt_event_row
+    find_upcoming_events, _fmt_event_row, _match_calendar_name,
+    _resolve_date_anchors, KNOWN_CALENDARS
 )
 from todos import add_todo, complete_todo, delete_todo, list_todos
 from meetings import (
@@ -758,7 +759,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         if step == "awaiting_edit_field":
-            # User replied with field to edit — use stored matched event if available
             matched_meta = cs.get("matched_meta")
             matched_summary = cs.get("matched_summary", "")
             matched_dtstart = cs.get("matched_dtstart")
@@ -766,13 +766,101 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             del state.calendar_confirm_sessions[user_id]
             state.session_timestamps.pop(user_id, None)
             if matched_meta:
-                # Parse the field reply using Haiku, then apply directly to stored event
-                event_query = cs.get("event_query", "")
-                reconstructed = f"edit cal {event_query} {text.strip()}"
-                reply = await edit_calendar_event(reconstructed, user_id, matched_meta=matched_meta, matched_summary=matched_summary, matched_dtstart=matched_dtstart, matched_dtend=matched_dtend)
-                # Clear any spurious session created by the re-search
-                state.calendar_confirm_sessions.pop(user_id, None)
-                state.session_timestamps.pop(user_id, None)
+                # Dedicated short-reply parser — avoids Haiku confusing field reply with event_query
+                reply_lower = text.strip().lower()
+                field = ""
+                value = ""
+                date_val = ""
+                time_range_val = ""
+
+                # Calendar field — deterministic regex against known calendars
+                cal_pattern = re.compile(r'^calendar\s+(.+)$', re.IGNORECASE)
+                cal_m = cal_pattern.match(text.strip())
+                if cal_m:
+                    candidate = cal_m.group(1).strip()
+                    if any(candidate.lower() in c.lower() or c.lower() in candidate.lower() for c in KNOWN_CALENDARS):
+                        field = "calendar"
+                        value = _match_calendar_name(candidate)
+
+                # Time range — HH:MM-HH:MM or Xpm-Ypm patterns
+                if not field:
+                    tr_m = re.search(r'(\d{1,2}(?::\d{2})?(?:am|pm)?)\s*(?:to|-)\s*(\d{1,2}(?::\d{2})?(?:am|pm)?)', reply_lower)
+                    if tr_m:
+                        # Parse both times to HH:MM 24h
+                        def _parse_time(t):
+                            t = t.strip()
+                            for fmt in ["%I:%M%p", "%I%p", "%H:%M"]:
+                                try:
+                                    return datetime.strptime(t, fmt).strftime("%H:%M")
+                                except Exception:
+                                    pass
+                            return None
+                        t1 = _parse_time(tr_m.group(1))
+                        t2 = _parse_time(tr_m.group(2))
+                        if t1 and t2:
+                            time_range_val = f"{t1}-{t2}"
+
+                # Single time — "time 8pm" or just "8pm"
+                if not field and not time_range_val:
+                    time_m = re.search(r'\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b', reply_lower)
+                    if time_m:
+                        try:
+                            raw_t = time_m.group(1).replace(" ", "")
+                            for fmt in ["%I:%M%p", "%I%p"]:
+                                try:
+                                    field = "start"
+                                    value = datetime.strptime(raw_t, fmt).strftime("%H:%M")
+                                    break
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                # Date — "date 23 may" or "23 may"
+                if not field and not date_val:
+                    from cal import _resolve_date_anchors
+                    anchors = _resolve_date_anchors()
+                    for label, resolved in anchors.items():
+                        if label in reply_lower:
+                            date_val = resolved
+                            break
+                    if not date_val:
+                        date_m = re.search(r'\b(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*(?:\s+\d{4})?)\b', reply_lower)
+                        if date_m:
+                            try:
+                                raw_d = date_m.group(1).strip()
+                                for fmt in ["%d %b %Y", "%d %B %Y", "%d %b", "%d %B"]:
+                                    try:
+                                        d = datetime.strptime(raw_d, fmt)
+                                        if fmt in ("%d %b", "%d %B"):
+                                            d = d.replace(year=date.today().year)
+                                        date_val = d.strftime("%d %b %Y")
+                                        break
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+
+                # Title — "title [new name]"
+                if not field:
+                    title_m = re.match(r'^title\s+(.+)$', text.strip(), re.IGNORECASE)
+                    if title_m:
+                        field = "title"
+                        value = title_m.group(1).strip()
+
+                # Location — "location [place]"
+                if not field:
+                    loc_m = re.match(r'^location\s+(.+)$', text.strip(), re.IGNORECASE)
+                    if loc_m:
+                        field = "location"
+                        value = loc_m.group(1).strip()
+
+                has_change = (field and value) or date_val or time_range_val
+                if has_change:
+                    from cal import _apply_event_edit
+                    reply = await _apply_event_edit(matched_meta, matched_summary, field, value, matched_dtstart, matched_dtend, date_val=date_val, time_range_val=time_range_val)
+                else:
+                    reply = f"⚠️ Couldn't parse that — what would you like to change for *{matched_summary}*?\n(time / date / calendar / location / title)"
             else:
                 event_query = cs.get("event_query", "")
                 cal_filter = cs.get("cal_filter", "")
@@ -1309,7 +1397,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             state.confirm_sessions[user_id] = {"action": "delete_event", "args": [meta], "target": row}
             touch_session(user_id)
             reply = f"Found *{summary}* — {row.split('|', 1)[1].strip() if '|' in row else ''}\nDelete this event? (yes / no)"
-    elif lower.startswith("edit ") and "calendar_last_added" and user_id in state.calendar_last_added and not lower.startswith("edit last expense") and not lower.startswith("edit expense"):
+    elif lower.startswith("edit ") and user_id in state.calendar_last_added and not lower.startswith("edit last expense") and not lower.startswith("edit expense"):
         # Post-write edit — only fires if last action was a calendar add
         reply = await apply_calendar_edit(user_id, text)
     elif lower == "events today":
@@ -1490,30 +1578,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif await is_calendar_request(text):
         reply = await smart_add_event(text, user_id)
 
-    # Claude conversation fallback
+    # No handler matched
     else:
-        if user_id not in state.conversation_histories:
-            state.conversation_histories[user_id] = []
-        state.conversation_histories[user_id].append({"role": "user", "content": text})
-        if len(state.conversation_histories[user_id]) > 20:
-            state.conversation_histories[user_id] = state.conversation_histories[user_id][-20:]
-        overseas_key = (
-            date.today().isoformat(),
-            state.overseas_state.get("active"),
-            state.overseas_state.get("destination"),
-            state.overseas_state.get("currency"),
-        )
-        if state._system_prompt_cache is None or state._system_prompt_overseas_key != overseas_key:
-            state._system_prompt_cache = build_system_prompt()
-            state._system_prompt_overseas_key = overseas_key
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
-            system=state._system_prompt_cache,
-            messages=state.conversation_histories[user_id]
-        )
-        reply = response.content[0].text
-        state.conversation_histories[user_id].append({"role": "assistant", "content": reply})
+        reply = "That's not something I can do right now."
 
     if not reply:
         reply = "Not sure what you mean — try rephrasing, or say 'help' to see what I can do."
