@@ -1,10 +1,10 @@
 {
   "date": "2026-06-03",
   "session": "Session 38",
-  "built": "fixed",
-  "fixed": "delete success message now shows event title",
+  "built": "built",
+  "fixed": "edit cal search first then prompt, overlap collision warning with yes/no, broken pipe retry, edi/ad/delet shortcuts, _apply_event_edit no-change guard",
   "pending": "pending",
-  "deploy_count": 62,
+  "deploy_count": 63,
   "module_count": 21,
   "modules": [
     "bills.py",

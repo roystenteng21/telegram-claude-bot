@@ -245,9 +245,20 @@ async def write_calendar_event(parsed):
 
     try:
         service = await asyncio.to_thread(_get_service)
-        await asyncio.to_thread(
-            lambda: service.events().insert(calendarId=cal_id, body=event_body).execute()
-        )
+        for attempt in range(2):
+            try:
+                await asyncio.to_thread(
+                    lambda: service.events().insert(calendarId=cal_id, body=event_body).execute()
+                )
+                break
+            except BrokenPipeError:
+                if attempt == 0:
+                    await asyncio.sleep(1)
+                    service = await asyncio.to_thread(_get_service)
+                else:
+                    return "❌ Couldn't add event: connection error — try again"
+            except Exception as e:
+                return f"❌ Couldn't add event: {str(e)}"
     except Exception as e:
         return f"❌ Couldn't add event: {str(e)}"
 
@@ -265,6 +276,53 @@ async def write_calendar_event(parsed):
 # ---------------------------------------------------------------------------
 # smart_add_event — parse + store in confirm session (no immediate write)
 # ---------------------------------------------------------------------------
+
+async def _check_overlaps(new_start: datetime, new_end: datetime) -> list:
+    """Check all calendars for events overlapping new_start–new_end on the same day.
+    Returns list of (summary, cal_name, dtstart, dtend) tuples for overlapping events.
+    Queries are run in parallel across all calendars, window narrowed to single day.
+    """
+    try:
+        service = await asyncio.to_thread(_get_service)
+        day_start = new_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = new_start.replace(hour=23, minute=59, second=59, microsecond=0)
+        time_min = day_start.strftime("%Y-%m-%dT%H:%M:%S") + "+08:00"
+        time_max = day_end.strftime("%Y-%m-%dT%H:%M:%S") + "+08:00"
+
+        async def fetch_cal(cal_name, cal_id):
+            try:
+                result = await asyncio.to_thread(
+                    lambda: service.events().list(
+                        calendarId=cal_id,
+                        timeMin=time_min,
+                        timeMax=time_max,
+                        singleEvents=True,
+                        orderBy="startTime"
+                    ).execute()
+                )
+                overlaps = []
+                for e in result.get("items", []):
+                    start_raw = e.get("start", {}).get("dateTime")
+                    end_raw = e.get("end", {}).get("dateTime")
+                    if not start_raw or not end_raw:
+                        continue
+                    try:
+                        e_start = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+                        e_end = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except Exception:
+                        continue
+                    # Overlap: new event starts before existing ends AND new event ends after existing starts
+                    if new_start < e_end and new_end > e_start:
+                        overlaps.append((e.get("summary", "Untitled"), cal_name, start_raw, end_raw))
+                return overlaps
+            except Exception:
+                return []
+
+        results = await asyncio.gather(*[fetch_cal(cn, cid) for cn, cid in CALENDAR_IDS.items()])
+        return [item for sublist in results for item in sublist]
+    except Exception:
+        return []
+
 
 async def smart_add_event(text, user_id):
     try:
@@ -299,6 +357,31 @@ async def smart_add_event(text, user_id):
     cleaned_title = " ".join(w for w in title_words if w.lower() not in cal_words)
     if cleaned_title.strip():
         parsed["title"] = cleaned_title.strip()
+
+    # Check for overlapping events before writing
+    try:
+        new_start_dt = datetime.strptime(parsed["start"], "%d %b %Y %H:%M")
+        new_end_dt = datetime.strptime(parsed["end"], "%d %b %Y %H:%M")
+        overlaps = await _check_overlaps(new_start_dt, new_end_dt)
+        if overlaps:
+            overlap_lines = ["⚠️ This event overlaps with:"]
+            for ov_summary, ov_cal, ov_start, ov_end in overlaps:
+                try:
+                    s = datetime.fromisoformat(ov_start.replace("Z", "+00:00"))
+                    e = datetime.fromisoformat(ov_end.replace("Z", "+00:00"))
+                    time_str = f"{s.strftime('%I:%M%p').lstrip('0').lower()} – {e.strftime('%I:%M%p').lstrip('0').lower()}"
+                except Exception:
+                    time_str = ""
+                overlap_lines.append(f"• *{ov_summary}* — {ov_cal} | {time_str}")
+            overlap_lines.append("\nAdd anyway? (yes / no)")
+            state.calendar_confirm_sessions[user_id] = {
+                "step": "overlap_confirm",
+                "parsed": parsed,
+            }
+            state.session_timestamps[user_id] = datetime.now(TIMEZONE)
+            return "\n".join(overlap_lines)
+    except Exception:
+        pass  # Overlap check failure is non-fatal — proceed with write
 
     # Write immediately
     write_result = await write_calendar_event(parsed)
@@ -338,6 +421,18 @@ async def smart_add_event(text, user_id):
 # ---------------------------------------------------------------------------
 # Apply inline edit during confirm session
 # ---------------------------------------------------------------------------
+
+async def complete_smart_add(parsed, user_id):
+    """Write event after overlap confirmation — same flow as end of smart_add_event."""
+    write_result = await write_calendar_event(parsed)
+    if write_result.startswith("❌"):
+        return write_result
+    summary = format_calendar_confirm(parsed)
+    CONFIRM_LINES = ["Done, it's in!", "Added!", "All set!", "Got it, locked in!", "On the calendar!", "Sorted!", "It's in!"]
+    import random
+    confirm_line = random.choice(CONFIRM_LINES)
+    state.calendar_last_added[user_id] = {"parsed": parsed}
+    return f"{summary}\n\n{confirm_line}"
 
 async def apply_calendar_edit(user_id, edit_text):
     if user_id not in state.calendar_last_added:
@@ -716,17 +811,9 @@ Rules:
     if not event_query:
         return "⚠️ Couldn't parse that — try: edit cal Branson time 11am"
 
-    # C2: if no field/value and no date/time_range, prompt for what to edit
     has_change = (field and value) or date_val or time_range_val
-    if not has_change:
-        state.calendar_confirm_sessions[user_id] = {
-            "step": "awaiting_edit_field",
-            "event_query": event_query,
-            "cal_filter": cal_filter_raw,
-        }
-        state.session_timestamps[user_id] = datetime.now(TIMEZONE)
-        return f"What would you like to edit for *{event_query}*?\n(time / date / calendar / location / title)"
 
+    # Search first — need to know match count before deciding flow
     days = 365 if expand_search else 90
     matches, err, capped = await find_upcoming_events(event_query, cal_filter=cal_filter, days=days, max_results=4)
     if err:
@@ -739,7 +826,6 @@ Rules:
             return err
         if matches:
             cal_filter = None
-            # Inform user we searched across all calendars
             cal_filter_raw = None
 
     if not matches:
@@ -760,15 +846,33 @@ Rules:
             "time_range_val": time_range_val,
             "event_query": event_query,
             "capped": capped,
+            "awaiting_field": not has_change,
         }
         state.session_timestamps[user_id] = datetime.now(TIMEZONE)
         return "\n".join(lines)
+
+    # Single match — if no change specified, prompt for field
+    meta_single, summary_single, dtstart_single, dtend_single = matches[0]
+    if not has_change:
+        state.calendar_confirm_sessions[user_id] = {
+            "step": "awaiting_edit_field",
+            "event_query": event_query,
+            "cal_filter": cal_filter_raw,
+            "matched_meta": meta_single,
+            "matched_summary": summary_single,
+            "matched_dtstart": dtstart_single,
+            "matched_dtend": dtend_single,
+        }
+        state.session_timestamps[user_id] = datetime.now(TIMEZONE)
+        return f"What would you like to edit for *{summary_single}*?\n(time / date / calendar / location / title)"
 
     meta, summary, dtstart, dtend = matches[0]
     return await _apply_event_edit(meta, summary, field, value, dtstart, dtend, date_val=date_val, time_range_val=time_range_val)
 
 async def _apply_event_edit(meta, summary, field, value, dtstart=None, dtend=None, date_val="", time_range_val=""):
     """Apply a single field edit to an existing Google Calendar event."""
+    if not field and not date_val and not time_range_val:
+        return "⚠️ No changes specified — what would you like to edit?\n(time / date / calendar / location / title)"
     try:
         service = await asyncio.to_thread(_get_service)
         event = await asyncio.to_thread(
