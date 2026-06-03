@@ -1276,6 +1276,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = f"❌ No upcoming event found matching '{raw_name}'"
         else:
             meta, summary, dtstart, dtend = matches[0]
+            meta["summary"] = summary
+            meta["dtstart"] = dtstart
             row = _fmt_event_row(summary, meta.get("cal_name", ""), dtstart, dtend)
             state.confirm_sessions[user_id] = {"action": "delete_event", "args": [meta], "target": row}
             touch_session(user_id)
@@ -1344,6 +1346,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = f"❌ No upcoming event found matching '{raw_name}'"
         else:
             meta, summary, dtstart, dtend = matches[0]
+            meta["summary"] = summary
+            meta["dtstart"] = dtstart
             row = _fmt_event_row(summary, meta.get("cal_name", ""), dtstart, dtend)
             state.confirm_sessions[user_id] = {"action": "delete_event", "args": [meta], "target": row}
             touch_session(user_id)

@@ -1,10 +1,10 @@
 {
   "date": "2026-06-03",
   "session": "Session 38",
-  "built": "built",
-  "fixed": "calendar_confirm_sessions handler, edit cal bare fix, delete temporal word strip, start-time duration shift, generic title prompt",
+  "built": "fixed",
+  "fixed": "delete success message now shows event title",
   "pending": "pending",
-  "deploy_count": 61,
+  "deploy_count": 62,
   "module_count": 21,
   "modules": [
     "bills.py",
