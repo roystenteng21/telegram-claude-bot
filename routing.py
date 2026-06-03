@@ -380,7 +380,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── Session timeouts ──────────────────────────────────────────────────────
     if any(user_id in s for s in [state.expense_sessions, state.delete_sessions, state.portfolio_delete_sessions,
                                     state.confirm_sessions, state.receipt_confirm_sessions, state.edit_sessions,
-                                    state.meeting_sessions, state.pending_restaurant_saves]):
+                                    state.meeting_sessions, state.pending_restaurant_saves,
+                                    state.calendar_confirm_sessions]):
         if is_session_expired(user_id):
             await check_session_timeouts(user_id, update)
             return
@@ -395,7 +396,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                           state.edit_sessions, state.confirm_sessions, state.delete_sessions,
                           state.portfolio_delete_sessions, state.excel_import_sessions,
                           state.pending_restaurant_saves, state.pending_contact_saves,
-                          state.todo_disambig_sessions]:
+                          state.todo_disambig_sessions, state.calendar_confirm_sessions]:
                     d.pop(user_id, None)
                 state.session_timestamps.pop(user_id, None)
                 del state.interrupted_sessions[user_id]
@@ -744,6 +745,57 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 await update.message.reply_text("All unmatched items reviewed ✅")
         return
 
+    # ── Calendar confirm session (edit field prompt + multi-match picker) ────────
+    if user_id in state.calendar_confirm_sessions:
+        touch_session(user_id)
+        cs = state.calendar_confirm_sessions[user_id]
+        step = cs.get("step")
+
+        if lower in ["cancel", "nevermind", "nvm"]:
+            del state.calendar_confirm_sessions[user_id]
+            state.session_timestamps.pop(user_id, None)
+            await update.message.reply_text("Cancelled.")
+            return
+
+        if step == "awaiting_edit_field":
+            # User replied with field to edit e.g. "time" — reconstruct edit command
+            event_query = cs.get("event_query", "")
+            cal_filter = cs.get("cal_filter", "")
+            cal_part = f" {cal_filter}" if cal_filter else ""
+            reconstructed = f"edit cal {event_query}{cal_part} {text.strip()}"
+            del state.calendar_confirm_sessions[user_id]
+            state.session_timestamps.pop(user_id, None)
+            reply = await edit_calendar_event(reconstructed, user_id)
+            await send_safe(update.message, reply, parse_mode="Markdown")
+            return
+
+        if step == "pick_edit":
+            if text.strip().isdigit():
+                idx = int(text.strip()) - 1
+                matches = cs.get("edit_matches", [])
+                if 0 <= idx < len(matches):
+                    meta, summary, dtstart, dtend = matches[idx]
+                    field = cs.get("field")
+                    value = cs.get("value")
+                    date_val = cs.get("date_val")
+                    time_range_val = cs.get("time_range_val")
+                    del state.calendar_confirm_sessions[user_id]
+                    state.session_timestamps.pop(user_id, None)
+                    from cal import _apply_event_edit
+                    reply = await _apply_event_edit(meta, summary, field, value, dtstart, dtend, date_val=date_val, time_range_val=time_range_val)
+                    await send_safe(update.message, reply, parse_mode="Markdown")
+                else:
+                    await update.message.reply_text("Invalid number — pick from the list or 'cancel'.")
+            elif cs.get("capped") and lower == "more":
+                event_query = cs.get("event_query", "")
+                del state.calendar_confirm_sessions[user_id]
+                state.session_timestamps.pop(user_id, None)
+                reply = await edit_calendar_event(f"edit cal {event_query} expand", user_id)
+                await send_safe(update.message, reply, parse_mode="Markdown")
+            else:
+                await update.message.reply_text("Reply with a number to pick an event, or 'cancel'.")
+            return
+
     # ── Trip setup session (awaiting missing fields only) ─────────────────────
     if state.overseas_state.get("_trip_setup"):
         ts = state.overseas_state["_trip_setup"]
@@ -834,7 +886,9 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif (lower.startswith("edit ") and not lower.startswith("edit last expense")
           and not lower.startswith("edit expense")
           and not lower.startswith("edit cal ")
-          and not lower.startswith("edit event ")):
+          and not lower.startswith("edit event ")
+          and lower != "edit cal"
+          and lower != "edit event"):
         name = text[5:].strip()
         _, record = find_row(name)
         if not record:
@@ -1213,6 +1267,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
           or lower.startswith("cal delete ") or lower.startswith("delete cal ")
           or lower.startswith("del cal ") or lower.startswith("del event ")):
         raw_name = re.sub(r"^(remove cal|remove event|cal delete|delete cal|del cal|del event)\s+", "", text, flags=re.IGNORECASE).strip()
+        # Strip trailing temporal words before title search
+        raw_name = re.sub(r"\b(today|tomorrow|yesterday|next week|this week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}\s+\w+|\d{1,2}/\d{1,2})\b", "", raw_name, flags=re.IGNORECASE).strip()
         matches, err, _ = await find_upcoming_events(raw_name)
         if err:
             reply = err
@@ -1279,6 +1335,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = f"Couldn't understand that date — try 'events on 23 May' or 'events today'."
     elif lower.startswith("delete event ") or lower.startswith("del event "):
         raw_name = re.sub(r"^(delete event|del event)\s+", "", text, flags=re.IGNORECASE).strip()
+        # Strip trailing temporal words before title search
+        raw_name = re.sub(r"\b(today|tomorrow|yesterday|next week|this week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}\s+\w+|\d{1,2}/\d{1,2})\b", "", raw_name, flags=re.IGNORECASE).strip()
         matches, err, _ = await find_upcoming_events(raw_name)
         if err:
             reply = err

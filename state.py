@@ -14,14 +14,11 @@ interrupted_sessions = {}
 todo_disambig_sessions = {}
 market_summary_pending = {}
 session_timestamps = {}
+calendar_confirm_sessions = {}
 
 # --- Pending saves ---
 pending_contact_saves = {}
 pending_restaurant_saves = {}
-
-# --- Calendar ---
-calendar_confirm_sessions = {}
-calendar_last_added = {}
 
 # --- Profile + feature state ---
 em_profile = {}
@@ -46,6 +43,8 @@ cached_fx_rates = {}
 # --- API health flags ---
 _anthropic_failure_count = 0
 _anthropic_down_notified = False
+_icloud_down = False
+_icloud_last_notified = None
 
 # --- Caches ---
 _crm_cache = None
@@ -80,3 +79,6 @@ _app_ref = None
 # --- Drive folders ---
 DRIVE_FOLDERS = {}
 RECEIPTS_FOLDER_ID = ""
+
+# --- Calendar last added ---
+calendar_last_added = {}
