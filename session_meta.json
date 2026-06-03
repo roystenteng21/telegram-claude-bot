@@ -1,10 +1,10 @@
 {
   "date": "2026-06-03",
   "session": "Session 39",
-  "built": "complete_smart_add removed, write_calendar_event thread-safe, apply_calendar_edit patches not inserts, calendar_confirm_sessions timeout+interrupt guard, dead string literal, awaiting_edit_field dedicated parser, calendar regex override, TEXT_SHORTCUTS title strip, no Claude fallback",
+  "built": "complete_smart_add removed, write_calendar_event thread-safe, apply_calendar_edit patches not inserts, calendar_confirm_sessions timeout+interrupt guard, dead string literal, awaiting_edit_field dedicated parser, calendar regex override, TEXT_SHORTCUTS title strip",
   "fixed": "re-search bug, segfault on concurrent cal calls, duplicate event on post-write edit, session timeout silent, calendar field edit broken",
-  "pending": "pending",
-  "deploy_count": 65,
+  "pending": "cal.py full audit next session",
+  "deploy_count": 66,
   "module_count": 20,
   "modules": [
     "bills.py",

@@ -1578,9 +1578,30 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif await is_calendar_request(text):
         reply = await smart_add_event(text, user_id)
 
-    # No handler matched
+    # Claude conversation fallback
     else:
-        reply = "That's not something I can do right now."
+        if user_id not in state.conversation_histories:
+            state.conversation_histories[user_id] = []
+        state.conversation_histories[user_id].append({"role": "user", "content": text})
+        if len(state.conversation_histories[user_id]) > 20:
+            state.conversation_histories[user_id] = state.conversation_histories[user_id][-20:]
+        overseas_key = (
+            date.today().isoformat(),
+            state.overseas_state.get("active"),
+            state.overseas_state.get("destination"),
+            state.overseas_state.get("currency"),
+        )
+        if state._system_prompt_cache is None or state._system_prompt_overseas_key != overseas_key:
+            state._system_prompt_cache = build_system_prompt()
+            state._system_prompt_overseas_key = overseas_key
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=state._system_prompt_cache,
+            messages=state.conversation_histories[user_id]
+        )
+        reply = response.content[0].text
+        state.conversation_histories[user_id].append({"role": "assistant", "content": reply})
 
     if not reply:
         reply = "Not sure what you mean — try rephrasing, or say 'help' to see what I can do."
