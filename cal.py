@@ -1,10 +1,10 @@
 import re
 import json
-import threading
 from datetime import date, datetime, timedelta
 import asyncio
+import pytz
 import state
-from config import TIMEZONE, YOUR_CHAT_ID
+from config import TIMEZONE, YOUR_CHAT_ID, TEXT_SHORTCUTS
 from clients import client
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -28,8 +28,6 @@ KNOWN_CALENDARS = list(CALENDAR_IDS.keys())
 # ---------------------------------------------------------------------------
 # Google Calendar service (cached — build() fetches discovery doc over HTTP)
 # ---------------------------------------------------------------------------
-
-_service_lock = threading.Lock()
 
 def _get_service():
     """Build a new Calendar service per call — avoids shared state across threads."""
@@ -189,6 +187,8 @@ Rules:
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
     )
+    if not response.content:
+        raise ValueError("Empty response from Haiku")
     raw = response.content[0].text.strip()
     clean = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(clean)
@@ -275,14 +275,12 @@ async def write_calendar_event(parsed):
 
 
 # ---------------------------------------------------------------------------
-# smart_add_event — parse + store in confirm session (no immediate write)
+# smart_add_event — parse then write immediately
 # ---------------------------------------------------------------------------
 
 async def smart_add_event(text, user_id):
     try:
         parsed = await asyncio.to_thread(parse_calendar_request, text)
-    except json.JSONDecodeError:
-        return "⚠️ Couldn't parse that — try: cal Dentist Personal 23 May 10am"
     except Exception:
         return "⚠️ Couldn't parse that — try: cal Dentist Personal 23 May 10am"
 
@@ -303,7 +301,6 @@ async def smart_add_event(text, user_id):
     parsed["calendar"] = _match_calendar_name(parsed.get("calendar", ""))
 
     # Strip calendar name words and TEXT_SHORTCUTS expansions from title
-    from config import TEXT_SHORTCUTS
     cal_words = set()
     for cal in KNOWN_CALENDARS:
         for word in cal.lower().split():
@@ -358,8 +355,6 @@ async def smart_add_event(text, user_id):
 async def _check_overlap_and_notify(parsed, new_event_id, new_cal_id):
     """Background task: check for same-day time clashes after event write. Sends follow-up if clash found."""
     try:
-        import pytz
-        from config import YOUR_CHAT_ID
         new_title = parsed.get("title", "Event")
         try:
             new_start = datetime.strptime(parsed["start"], "%d %b %Y %H:%M")
@@ -428,7 +423,6 @@ async def get_events(days=1):
         service = await asyncio.to_thread(_get_service)
         now = datetime.utcnow().isoformat() + "Z"
 
-        import pytz
         today = date.today()
         if days == 7:
             days_until_sunday = (6 - today.weekday()) % 7
@@ -491,7 +485,6 @@ async def get_events_for_date(date_str):
         return f"⚠️ Couldn't parse date: {date_str}"
     try:
         service = await asyncio.to_thread(_get_service)
-        import pytz
         kl_midnight = TIMEZONE.localize(datetime(target.year, target.month, target.day, 0, 0, 0))
         kl_eod = TIMEZONE.localize(datetime(target.year, target.month, target.day, 23, 59, 59))
         time_min = kl_midnight.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -536,7 +529,6 @@ async def get_events_for_date(date_str):
 async def get_events_for_date_range(start_date, end_date):
     """Fetch events between two dates (date objects). Used for next week view."""
     try:
-        import pytz
         service = await asyncio.to_thread(_get_service)
         kl_start = TIMEZONE.localize(datetime(start_date.year, start_date.month, start_date.day, 0, 0, 0))
         kl_end = TIMEZONE.localize(datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59))
@@ -668,10 +660,6 @@ async def delete_calendar_event(summary_or_meta):
 
 
 # ---------------------------------------------------------------------------
-# Daily iCloud check — replaced with Google Calendar connectivity check
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Edit existing calendar event
 # ---------------------------------------------------------------------------
 
@@ -682,7 +670,6 @@ async def edit_calendar_event(text, user_id, expand_search=False, matched_meta=N
     clean_text = re.sub(r'\bdelete\b', '', text, flags=re.IGNORECASE).strip()
 
     # Fix A: expand TEXT_SHORTCUTS before Haiku parse to avoid event_query corruption
-    from config import TEXT_SHORTCUTS
     for shortcut, expansion in TEXT_SHORTCUTS.items():
         clean_text = re.sub(r'\b' + re.escape(shortcut) + r'\b', expansion, clean_text, flags=re.IGNORECASE)
 
@@ -946,26 +933,6 @@ async def _apply_event_edit(meta, summary, field, value, dtstart=None, dtend=Non
                     return "⚠️ End time can't be before or equal to start time — try again"
                 event["end"] = {"dateTime": new_end_iso, "timeZone": str(TIMEZONE)}
 
-            elif field == "time_range":
-                # Legacy path: time_range in field (pre-C5 sessions stored this way)
-                existing_start = event.get("start", {}).get("dateTime", "")
-                try:
-                    existing_dt = datetime.fromisoformat(existing_start.replace("Z", "+00:00"))
-                    existing_date = existing_dt.strftime("%Y-%m-%d")
-                except Exception:
-                    return "⚠️ Couldn't read existing event date"
-                try:
-                    parts = value.split("-")
-                    if len(parts) != 2:
-                        raise ValueError("expected HH:MM-HH:MM")
-                    new_start_dt = datetime.strptime(parts[0].strip(), "%H:%M")
-                    new_end_dt = datetime.strptime(parts[1].strip(), "%H:%M")
-                except Exception:
-                    return "⚠️ Couldn't parse that time range — try: edit cal Jet time 18:30-21:30"
-                if new_end_dt <= new_start_dt:
-                    return "⚠️ End time can't be before or equal to start time — try again"
-                event["start"] = {"dateTime": f"{existing_date}T{new_start_dt.strftime('%H:%M')}:00", "timeZone": str(TIMEZONE)}
-                event["end"] = {"dateTime": f"{existing_date}T{new_end_dt.strftime('%H:%M')}:00", "timeZone": str(TIMEZONE)}
 
             elif field == "location":
                 event["location"] = value

@@ -91,6 +91,17 @@ from infrastructure import (
 )
 
 
+
+def _parse_time_str(t):
+    """Parse a time string like '8pm', '8:30pm', '20:30' to HH:MM 24h format."""
+    t = t.strip()
+    for fmt in ["%I:%M%p", "%I%p", "%H:%M"]:
+        try:
+            return datetime.strptime(t, fmt).strftime("%H:%M")
+        except Exception:
+            pass
+    return None
+
 def build_system_prompt():
     profile_notes = ""
     if state.em_profile:
@@ -382,7 +393,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     if any(user_id in s for s in [state.expense_sessions, state.delete_sessions, state.portfolio_delete_sessions,
                                     state.confirm_sessions, state.receipt_confirm_sessions, state.edit_sessions,
                                     state.meeting_sessions, state.pending_restaurant_saves,
-                                    state.calendar_confirm_sessions]):
+                                    state.calendar_confirm_sessions, state.recon_sessions]):
         if is_session_expired(user_id):
             await check_session_timeouts(user_id, update)
             return
@@ -773,8 +784,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 date_val = ""
                 time_range_val = ""
 
-                # Calendar field — deterministic regex against known calendars
-                cal_pattern = re.compile(r'^calendar\s+(.+)$', re.IGNORECASE)
+                # Calendar field — deterministic regex against known calendars (cal or calendar prefix)
+                cal_pattern = re.compile(r'^(?:calendar|cal)\s+(.+)$', re.IGNORECASE)
                 cal_m = cal_pattern.match(text.strip())
                 if cal_m:
                     candidate = cal_m.group(1).strip()
@@ -786,17 +797,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 if not field:
                     tr_m = re.search(r'(\d{1,2}(?::\d{2})?(?:am|pm)?)\s*(?:to|-)\s*(\d{1,2}(?::\d{2})?(?:am|pm)?)', reply_lower)
                     if tr_m:
-                        # Parse both times to HH:MM 24h
-                        def _parse_time(t):
-                            t = t.strip()
-                            for fmt in ["%I:%M%p", "%I%p", "%H:%M"]:
-                                try:
-                                    return datetime.strptime(t, fmt).strftime("%H:%M")
-                                except Exception:
-                                    pass
-                            return None
-                        t1 = _parse_time(tr_m.group(1))
-                        t2 = _parse_time(tr_m.group(2))
+                        t1 = _parse_time_str(tr_m.group(1))
+                        t2 = _parse_time_str(tr_m.group(2))
                         if t1 and t2:
                             time_range_val = f"{t1}-{t2}"
 
@@ -818,7 +820,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
                 # Date — "date 23 may" or "23 may"
                 if not field and not date_val:
-                    from cal import _resolve_date_anchors
                     anchors = _resolve_date_anchors()
                     for label, resolved in anchors.items():
                         if label in reply_lower:
@@ -872,12 +873,17 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         if step == "pick_edit":
             awaiting_field = cs.get("awaiting_field", False)
-            if text.strip().isdigit():
-                idx = int(text.strip()) - 1
+            # Support combined input: '1 calendar personal' or '1 8pm'
+            pick_text = text.strip()
+            pick_parts = pick_text.split(None, 1)
+            pick_num_str = pick_parts[0] if pick_parts else ""
+            pick_extra = pick_parts[1].strip() if len(pick_parts) > 1 else ""
+            if pick_num_str.isdigit():
+                idx = int(pick_num_str) - 1
                 matches = cs.get("edit_matches", [])
                 if 0 <= idx < len(matches):
                     meta, summary, dtstart, dtend = matches[idx]
-                    if awaiting_field:
+                    if awaiting_field and not pick_extra:
                         # No change specified yet — prompt for field now
                         state.calendar_confirm_sessions[user_id] = {
                             "step": "awaiting_edit_field",
@@ -888,7 +894,17 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
                             "matched_dtstart": dtstart,
                             "matched_dtend": dtend,
                         }
+                        state.session_timestamps[user_id] = datetime.now(TIMEZONE)  # timestamp fix
                         await update.message.reply_text(f"What would you like to edit for *{summary}*?\n(time / date / calendar / location / title)", parse_mode="Markdown")
+                    elif awaiting_field and pick_extra:
+                        # Combined pick+edit: pass extra text through dedicated parser inline
+                        del state.calendar_confirm_sessions[user_id]
+                        state.session_timestamps.pop(user_id, None)
+                        from cal import _apply_event_edit
+                        reply = await edit_calendar_event(f"edit cal {summary} {pick_extra}", user_id,
+                            matched_meta=meta, matched_summary=summary,
+                            matched_dtstart=dtstart, matched_dtend=dtend)
+                        await send_safe(update.message, reply, parse_mode="Markdown")
                     else:
                         field = cs.get("field")
                         value = cs.get("value")
@@ -1020,7 +1036,8 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif lower == "cancel":
         for d in [state.edit_sessions, state.excel_import_sessions, state.confirm_sessions,
-                  state.delete_sessions, state.receipt_confirm_sessions]:
+                  state.delete_sessions, state.receipt_confirm_sessions,
+                  state.calendar_confirm_sessions]:
             d.pop(user_id, None)
         state.session_timestamps.pop(user_id, None)
         reply = "Cancelled."
@@ -1108,9 +1125,6 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif lower.startswith("search meetings ") or lower.startswith("find meeting "):
         query = text[16:] if lower.startswith("search meetings ") else text[13:]
         reply = search_meeting_notes(query.strip())
-    elif lower == "cancel" and user_id in state.meeting_sessions:
-        del state.meeting_sessions[user_id]
-        reply = "Recap cancelled."
     elif is_meeting_start(text):
         event_name = extract_event_name(text)
         state.meeting_sessions[user_id] = {"step": "collecting", "event_name": event_name, "notes": []}
@@ -1383,7 +1397,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
           or lower.startswith("del cal ") or lower.startswith("del event ")):
         raw_name = re.sub(r"^(remove cal|remove event|cal delete|delete cal|del cal|del event)\s+", "", text, flags=re.IGNORECASE).strip()
         # Strip trailing temporal words before title search
-        raw_name = re.sub(r"\b(today|tomorrow|yesterday|next week|this week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}\s+\w+|\d{1,2}/\d{1,2})\b", "", raw_name, flags=re.IGNORECASE).strip()
+        raw_name = _strip_temporal_words(raw_name)
         matches, err, _ = await find_upcoming_events(raw_name)
         if err:
             reply = err
@@ -1411,19 +1425,18 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif re.match(r"events on .+", lower) or re.match(r"events (for|this) .+", lower):
         date_text = re.sub(r"^events (on|for|this)\s+", "", lower).strip()
         anchors = {k.lower(): v for k, v in {
-            "today": __import__('datetime').date.today().strftime("%d %b %Y"),
-            "tomorrow": (__import__('datetime').date.today() + __import__('datetime').timedelta(days=1)).strftime("%d %b %Y"),
+            "today": date.today().strftime("%d %b %Y"),
+            "tomorrow": (date.today() + timedelta(days=1)).strftime("%d %b %Y"),
         }.items()}
         if date_text in anchors:
             resolved = anchors[date_text]
         else:
-            from datetime import date as _date
             resolved = None
             for fmt in ["%d %b %Y", "%d %b", "%d/%m/%Y", "%d-%m-%Y"]:
                 try:
-                    parsed_d = __import__('datetime').datetime.strptime(date_text, fmt)
+                    parsed_d = datetime.strptime(date_text, fmt)
                     if fmt == "%d %b":
-                        parsed_d = parsed_d.replace(year=_date.today().year)
+                        parsed_d = parsed_d.replace(year=date.today().year)
                     resolved = parsed_d.strftime("%d %b %Y")
                     break
                 except ValueError:
@@ -1450,7 +1463,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif lower.startswith("delete event ") or lower.startswith("del event "):
         raw_name = re.sub(r"^(delete event|del event)\s+", "", text, flags=re.IGNORECASE).strip()
         # Strip trailing temporal words before title search
-        raw_name = re.sub(r"\b(today|tomorrow|yesterday|next week|this week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}\s+\w+|\d{1,2}/\d{1,2})\b", "", raw_name, flags=re.IGNORECASE).strip()
+        raw_name = _strip_temporal_words(raw_name)
         matches, err, _ = await find_upcoming_events(raw_name)
         if err:
             reply = err
@@ -1602,9 +1615,17 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     if not reply:
         reply = "Not sure what you mean — try rephrasing, or say 'help' to see what I can do."
-    if reply:
-        await send_safe(update.message, reply, parse_mode="Markdown")
+    await send_safe(update.message, reply, parse_mode="Markdown")
 
+
+
+def _strip_temporal_words(text):
+    """Strip trailing temporal/date words from an event name before title search."""
+    return re.sub(
+        r"\b(today|tomorrow|yesterday|next week|this week|monday|tuesday|wednesday|"
+        r"thursday|friday|saturday|sunday|\d{1,2}\s+\w+|\d{1,2}/\d{1,2})\b",
+        "", text, flags=re.IGNORECASE
+    ).strip()
 
 def _handle_restaurant_save_result(result, user_id):
     """Helper to parse restaurant save signals and set up pending session."""
