@@ -878,6 +878,7 @@ async def _apply_event_edit(meta, summary, field, value, dtstart=None, dtend=Non
                 new_cal_id = _get_calendar_id(new_cal_name)
                 event.pop("id", None)
                 event.pop("etag", None)
+                event.pop("iCalUID", None)
                 await asyncio.to_thread(
                     lambda: service.events().insert(calendarId=new_cal_id, body=event).execute()
                 )

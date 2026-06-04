@@ -871,6 +871,27 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await send_safe(update.message, reply, parse_mode="Markdown")
             return
 
+        if step == "pick_delete":
+            if text.strip().isdigit():
+                idx = int(text.strip()) - 1
+                matches = cs.get("delete_matches", [])
+                if 0 <= idx < len(matches):
+                    meta, summary, dtstart, dtend = matches[idx]
+                    del state.calendar_confirm_sessions[user_id]
+                    state.session_timestamps.pop(user_id, None)
+                    meta["summary"] = summary
+                    meta["dtstart"] = dtstart
+                    row = _fmt_event_row(summary, meta.get("cal_name", ""), dtstart, dtend)
+                    state.confirm_sessions[user_id] = {"action": "delete_event", "args": [meta], "target": row}
+                    touch_session(user_id)
+                    reply = f"Found *{summary}* — {row.split('|', 1)[1].strip() if '|' in row else ''}\nDelete this event? (yes / no)"
+                else:
+                    reply = "Invalid number — pick from the list or 'cancel'."
+                await send_safe(update.message, reply, parse_mode="Markdown")
+            else:
+                await update.message.reply_text("Reply with a number to pick an event, or 'cancel'.")
+            return
+
         if step == "pick_edit":
             awaiting_field = cs.get("awaiting_field", False)
             # Support combined input: '1 calendar personal' or '1 8pm'
@@ -1403,6 +1424,16 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = err
         elif not matches:
             reply = f"❌ No upcoming event found matching '{raw_name}'"
+        elif len(matches) > 1:
+            lines = ["Found multiple matching events — which one to delete?\n"]
+            for i, (meta, summary, dtstart, dtend) in enumerate(matches, 1):
+                lines.append(f"{i}. {_fmt_event_row(summary, meta.get('cal_name', ''), dtstart, dtend)}")
+            state.calendar_confirm_sessions[user_id] = {
+                "step": "pick_delete",
+                "delete_matches": matches,
+            }
+            state.session_timestamps[user_id] = datetime.now(TIMEZONE)
+            reply = "\n".join(lines)
         else:
             meta, summary, dtstart, dtend = matches[0]
             meta["summary"] = summary
@@ -1469,6 +1500,16 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             reply = err
         elif not matches:
             reply = f"❌ No upcoming event found matching '{raw_name}'"
+        elif len(matches) > 1:
+            lines = ["Found multiple matching events — which one to delete?\n"]
+            for i, (meta, summary, dtstart, dtend) in enumerate(matches, 1):
+                lines.append(f"{i}. {_fmt_event_row(summary, meta.get('cal_name', ''), dtstart, dtend)}")
+            state.calendar_confirm_sessions[user_id] = {
+                "step": "pick_delete",
+                "delete_matches": matches,
+            }
+            state.session_timestamps[user_id] = datetime.now(TIMEZONE)
+            reply = "\n".join(lines)
         else:
             meta, summary, dtstart, dtend = matches[0]
             meta["summary"] = summary
