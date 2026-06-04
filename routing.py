@@ -778,7 +778,11 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
             state.session_timestamps.pop(user_id, None)
             if matched_meta:
                 # Dedicated short-reply parser — avoids Haiku confusing field reply with event_query
-                reply_lower = text.strip().lower()
+                # Expand TEXT_SHORTCUTS before any parsing (e.g. appt→appointment)
+                parsed_text = text.strip()
+                for shortcut, expansion in TEXT_SHORTCUTS.items():
+                    parsed_text = re.sub(r'\b' + re.escape(shortcut) + r'\b', expansion, parsed_text, flags=re.IGNORECASE)
+                reply_lower = parsed_text.lower()
                 field = ""
                 value = ""
                 date_val = ""
@@ -786,7 +790,7 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
                 # Calendar field — deterministic regex against known calendars (cal or calendar prefix)
                 cal_pattern = re.compile(r'^(?:calendar|cal)\s+(.+)$', re.IGNORECASE)
-                cal_m = cal_pattern.match(text.strip())
+                cal_m = cal_pattern.match(parsed_text)
                 if cal_m:
                     candidate = cal_m.group(1).strip()
                     if any(candidate.lower() in c.lower() or c.lower() in candidate.lower() for c in KNOWN_CALENDARS):
@@ -844,14 +848,14 @@ async def _handle_message_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
                 # Title — "title [new name]"
                 if not field:
-                    title_m = re.match(r'^title\s+(.+)$', text.strip(), re.IGNORECASE)
+                    title_m = re.match(r'^title\s+(.+)$', parsed_text, re.IGNORECASE)
                     if title_m:
                         field = "title"
                         value = title_m.group(1).strip()
 
                 # Location — "location [place]"
                 if not field:
-                    loc_m = re.match(r'^location\s+(.+)$', text.strip(), re.IGNORECASE)
+                    loc_m = re.match(r'^location\s+(.+)$', parsed_text, re.IGNORECASE)
                     if loc_m:
                         field = "location"
                         value = loc_m.group(1).strip()
